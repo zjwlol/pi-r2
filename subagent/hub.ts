@@ -3,18 +3,37 @@
  *
  * Modeled on oh-my-pi's IrcBus/IrcBridge:
  *  - `send` never blocks on the recipient producing anything.
- *  - Recipient blocked in `irc wait`  -> message resolves the wait directly.
- *  - Recipient mid-run                -> injected as a steering message at its next step boundary.
+ *  - Recipient blocked in `irc wait`  -> message resolves the wait directly (a broadcast leg never does).
+ *  - Recipient mid-run                -> from its owner, the main agent, the user or one of its own
+ *                                        subagents (and subagent results): injected as a steering message
+ *                                        at its next step boundary, extending a run that was about to end.
+ *                                        From anyone else (peer messages, broadcast legs, notices): held by
+ *                                        the hub and handed to pi only at a tool-step boundary; whatever is
+ *                                        still held when the run ends gets a turn of its own AFTER the
+ *                                        run's result is out (see `holdsAtStop`), so it can never replace
+ *                                        or join that result. (An owner whose turn ended while it waits
+ *                                        for its subagents is not continued by such items alone either.)
  *  - Recipient idle (finished)        -> woken with a new turn; its final text is relayed back to the sender
- *                                        (unless it already replied via irc during that turn).
- *  - Messages to `parent` land in the main session (steer if busy, new turn if idle).
+ *                                        (unless it already replied via irc during that turn; a failed turn
+ *                                        always reports). The relay is flagged `relay`: an answer, never a
+ *                                        wake source, so it draws no relay itself (no ping-pong).
+ *  - `all` (main agent and user only) -> one leg per agent, flagged `broadcast`: quiet (no reply relay except
+ *                                        for the user's `/irc all`, never ends a wait). Subagents cannot
+ *                                        broadcast.
+ *  - Messages to `parent` land in the main session (steer if busy, new turn if idle); what pi has not
+ *    put into the transcript yet is tracked (`parentBacklog`) so a parent `irc wait` never blocks in
+ *    front of it (an entry pi dropped stops short-circuiting waits after a few of them).
+ *  - Message bodies are escaped inside the `<irc>` envelope (`escapeEnvelope`), so agent-authored text
+ *    cannot close it or forge another sender.
  *
  * Nesting: a child whose agent has `spawns` (and depth < MAX_DEPTH) gets its own `task` tool. Its
  * subagents ("grandchildren") live in the same map (ids are unique hub-wide) with `ownerId` = the
  * spawning child. A nested agent's settled result is routed to its owner as an incoming message of
  * kind "result" (same delivery rules as above, minus the reply relay), and an owner does not settle
- * while any of its subagents is active: when its turn ends it blocks until the next result/message
- * arrives and continues with it.
+ * while any of its subagents still owes it something (`owedSubagents`: its initial result, or the
+ * reply to a wake the owner started): when its turn ends it blocks until the next result/message
+ * arrives and continues with it. A subagent that is merely busy with a turn of its own after its
+ * result (a held peer message, a broadcast leg, another agent's wake) does not keep its owner waiting.
  *
  * IRC addressing: for a nested child `parent` means its owner and `main` the main agent; for a
  * top-level child `parent` (or `main`) is the main agent. Internally the main agent's id is PARENT_ID.
@@ -55,6 +74,7 @@ import {
 	childUserPrompt,
 	type DoneInfo,
 	type DoneStatus,
+	escapeEnvelope,
 	formatPeer,
 	formatSpawnFeedback,
 	formatTaskResult,
@@ -108,13 +128,20 @@ export type ChildStatus = "pending" | "running" | "idle" | "failed" | "aborted";
  * "irc": a message sent with the irc tool. "result": a nested subagent's settled result for its owner.
  * "notice": hub-generated information (e.g. a follow-up run merged worktree changes into the
  * recipient's checkout); nothing is relayed back, and it never wakes or resumes a child on its own: an
- * idle or blocked child reads it with its next run / continuation.
+ * idle or blocked child reads it with its next run / continuation, a running one at its next tool step
+ * (never as an extra turn of a run that was ending).
  */
 export type MessageKind = "irc" | "result" | "notice";
 
-/** Incoming items whose recipient's reply is relayed back to the sender (irc messages only). */
+/**
+ * Incoming items whose recipient's reply is relayed back to the sender: irc messages, except relayed
+ * replies (an answer is never a wake source, or two idle agents would ping-pong forever) and broadcast
+ * legs (every woken agent would answer the broadcaster, mostly to say it was not for it). The user's
+ * `/irc all` keeps the relay: those replies only show in the transcript.
+ */
 function expectsReply(m: IrcMessage): boolean {
-	return m.kind === undefined || m.kind === "irc";
+	if (m.kind !== undefined && m.kind !== "irc") return false;
+	return !m.relay && !(m.broadcast && m.from !== USER_ID);
 }
 
 export interface IrcMessage {
@@ -127,6 +154,10 @@ export interface IrcMessage {
 	ts: number;
 	/** For "result". */
 	done?: DoneInfo;
+	/** Automatic relay of a wake turn's reply (or of its failure / kill): draws no relay itself. */
+	relay?: boolean;
+	/** One leg of an `all` broadcast: no reply relay (except the user's), never ends a wait, never extends a finishing run. */
+	broadcast?: boolean;
 }
 
 export type ParentEvent = { kind: "message"; msg: IrcMessage } | { kind: "done"; done: DoneInfo };
@@ -230,12 +261,23 @@ export interface Child {
 	done?: DoneInfo;
 	/** Messages that arrived while the agent had no live step to inject into. */
 	inbox: IrcMessage[];
-	/** Who woke the current run (gets the run's final text relayed back). */
+	/**
+	 * Peer messages, broadcast legs and notices that arrived mid-run (`holdsAtStop`): handed to pi at the
+	 * next tool-step boundary, returned by `irc wait`, or given a turn of their own after the run settled.
+	 */
+	held: IrcMessage[];
+	/** Tool results of the current turn so far all asked to end the run (pi's `terminate`); undefined = no tool ended yet. */
+	batchTerminates?: boolean;
+	/** Who woke the current run and is still owed its reply (cleared when the run settles). */
 	wakeSender?: string;
 	/** Recipients this child messaged during the current run. */
 	sentDuringRun: Set<string>;
-	/** Messages injected with session.steer() during the current prompt (pruned after each prompt). */
-	steered: Array<{ msg: IrcMessage; text: string }>;
+	/**
+	 * Messages injected as steering during the current prompt (pruned after each prompt). `direct`: put
+	 * into pi's agent queue by the hub itself (`flushHeld`), so the session does not list it; such an
+	 * entry is dropped as soon as pi consumed it.
+	 */
+	steered: Array<{ msg: IrcMessage; text: string; direct?: boolean }>;
 	/** session.steer() calls not yet enqueued (steer awaits input handlers before queueing). */
 	steersInFlight: Set<Promise<void>>;
 	/** Waiting for a run permit (MAX_RUNNING runs already active at its depth). */
@@ -300,7 +342,7 @@ export interface ChildHooks {
 	/** Extra custom tools for the child's session (e.g. a `yield` tool); also added to a `tools` allowlist. */
 	tools?(child: Child): ToolDefinition[];
 	/**
-	 * Settle point: a run is about to deliver its result (no subagents active, nothing queued). May
+	 * Settle point: a run is about to deliver its result (no subagent owes it anything, nothing queued). May
 	 * rewrite status/output (e.g. merge worktree changes, validate structured output), or return
 	 * `{ retry }` to prompt the child again instead of settling (e.g. "you must call yield").
 	 */
@@ -440,34 +482,89 @@ function previewArgs(args: any): string {
 	return flat.length > 120 ? `${flat.slice(0, 120)}…` : flat;
 }
 
+/** Inverse of `escapeEnvelope` (prompts.ts). */
+function unescapeEnvelope(text: string): string {
+	return text.replace(/&lt;(\/?)(task-result|output|preview|error|irc|data|merge-summary)\b/g, "<$1$2");
+}
+
+// Model-facing lines around an `<irc>` block (`frameIncoming`); `parseIrcFrames` recognises exactly these.
+const howToReply = (from: string) => `reply with irc send (to: "${from}")`;
+/** Mid-run message from the recipient's owner, the main agent or the user: it steers. */
+const steeringHeader = (from: string) =>
+	`[Message received while you were working. Read it and adjust your plan accordingly before continuing. If a response is expected, ${howToReply(from)}; no one replies on your behalf.]`;
+/** Mid-run message from anyone else: information or a question, not an instruction. */
+const peerHeader = (from: string) =>
+	`[Message from peer \`${from}\` received while you were working. If a response is expected, ${howToReply(from)}; you may finish your current step first. No one replies on your behalf.]`;
+/** Wake turn: the final text is relayed, unless the agent already messaged the sender this turn (`settleRun`). */
+const wakeFooter = (from: string, structured: boolean) =>
+	`Reply with irc send (to: "${from}"), or just answer: your final reply this turn is delivered to \`${from}\` automatically${structured ? " (if you call `yield` this turn, its data is delivered instead)" : ""} unless you already messaged \`${from}\` this turn.`;
+const relayFooter = (from: string) => `This is \`${from}\`'s reply; nothing is sent back automatically — use irc send if you need to answer.`;
+const broadcastFooter = (from: string) =>
+	`This is a broadcast from \`${from}\` to every agent; nothing is sent back automatically. Only if it needs an answer from you, ${howToReply(from)}.`;
+
 /**
  * Framing of an incoming item for a child. `from` is already mapped to the recipient's view.
  *  steer:    injected mid-run (or folded into the next prompt)
  *  wake:     starts a new turn of an idle agent; its reply is relayed to the sender
  *  wait:     returned from `irc wait`
  *  continue: resumes an owner whose turn ended while its subagents were active (no relay)
- * Results never use the wake framing (nothing is relayed back to a subagent).
+ * Results never use the wake framing (nothing is relayed back to a subagent). Irc messages:
+ *  - body escaped, so it cannot close the envelope or open a forged one;
+ *  - steer / continue: the "adjust your plan" header only for `parent` / `main` / `user`; a peer's
+ *    message gets the peer header. Both say how to reply (plain text reaches nobody mid-run);
+ *  - wake: the relay promise, conditional on not having messaged the sender this turn;
+ *  - relayed replies and broadcast legs (except the user's): a footer saying that nothing is sent back,
+ *    in every mode but `wait`.
  */
 function frameIncoming(msg: IrcMessage, from: string, mode: "steer" | "wake" | "wait" | "continue", structured = false): string {
 	if (msg.kind === "result") {
 		return mode === "steer" ? `[Subagent \`${from}\` settled while you were working.]\n${msg.body}` : msg.body;
 	}
-	if (msg.kind === "notice") return `[Notice from \`${from}\`.]\n${msg.body}`;
-	const block = `<irc from="${from}">\n${msg.body}\n</irc>`;
-	if (mode === "steer" || mode === "continue") {
-		return `[Message received while you were working. Read it and adjust your plan accordingly before continuing.]\n${block}`;
-	}
-	if (mode === "wake") {
-		const via = structured ? ` (if you call \`yield\` this turn, its data is delivered instead)` : "";
-		return `${block}\n\nYour final reply this turn is delivered to \`${from}\` automatically${via}.`;
-	}
-	return block;
+	if (msg.kind === "notice") return `[Notice from \`${from}\`.]\n${escapeEnvelope(msg.body)}`;
+	const block = `<irc from="${from}">\n${escapeEnvelope(msg.body)}\n</irc>`;
+	if (mode === "wait") return block;
+	if (msg.relay) return `${block}\n\n${relayFooter(from)}`;
+	if (msg.broadcast && !expectsReply(msg)) return `${block}\n\n${broadcastFooter(from)}`;
+	if (mode === "wake") return `${block}\n\n${wakeFooter(from, structured)}`;
+	const steering = from === PARENT_ID || from === MAIN_ALIAS || from === USER_ID;
+	return `${steering ? steeringHeader(from) : peerHeader(from)}\n${block}`;
 }
 
+/**
+ * The `<irc>` frames of a user-message text that consists ONLY of what `frameIncoming` emits for irc
+ * messages (steer / continue header or wake / relay / broadcast footer included; several frames joined
+ * by a blank line, as in a continuation), with bodies unescaped. `undefined` for anything else (the
+ * task prompt, results, notices, leftover text), so callers keep their plain rendering.
+ */
+export function parseIrcFrames(text: string): { from: string; body: string }[] | undefined {
+	const frames: { from: string; body: string }[] = [];
+	const close = "\n</irc>";
+	let rest = text;
+	while (true) {
+		const open = /^(?:\[Message [^\n]*\]\n)?<irc from="([^"\n]*)">\n/.exec(rest);
+		if (!open) return undefined;
+		const from = open[1]!;
+		// Bodies are escaped, so the first closing tag is the frame's own.
+		const end = rest.indexOf(close, open[0].length);
+		if (end < 0) return undefined;
+		frames.push({ from, body: unescapeEnvelope(rest.slice(open[0].length, end)) });
+		rest = rest.slice(end + close.length);
+		for (const footer of [wakeFooter(from, false), wakeFooter(from, true), relayFooter(from), broadcastFooter(from)]) {
+			if (!rest.startsWith(`\n\n${footer}`)) continue;
+			rest = rest.slice(footer.length + 2);
+			break;
+		}
+		if (!rest) return frames;
+		if (!rest.startsWith("\n\n")) return undefined;
+		rest = rest.slice(2);
+	}
+}
+
+/** An event as the main agent reads it (message bodies escaped like in `frameIncoming`). */
 export function formatParentEvent(ev: ParentEvent): string {
-	if (ev.kind === "message" && ev.msg.kind === "notice") return `[Notice from \`${ev.msg.from}\`.]\n${ev.msg.body}`;
+	if (ev.kind === "message" && ev.msg.kind === "notice") return `[Notice from \`${ev.msg.from}\`.]\n${escapeEnvelope(ev.msg.body)}`;
 	if (ev.kind === "message") {
-		return `<irc from="${ev.msg.from}">\n${ev.msg.body}\n</irc>\nReply with the irc tool (op: "send", to: "${ev.msg.from}") if a response is needed.`;
+		return `<irc from="${ev.msg.from}">\n${escapeEnvelope(ev.msg.body)}\n</irc>\nReply with the irc tool (op: "send", to: "${ev.msg.from}") if a response is needed.`;
 	}
 	return formatTaskResult(ev.done);
 }
@@ -490,6 +587,17 @@ export function subtreeActive(c: Child | undefined): boolean {
 	return !!c && (isActive(c) || activeDescendants(c).length > 0);
 }
 
+/**
+ * Active agents below `owner` that still owe it something: their initial run has not settled (its
+ * result goes up the chain to `owner`), or their current wake turn was started by `owner` (its reply
+ * is relayed to it). An agent that already reported and is busy with a turn of its own (a held peer
+ * message, a broadcast leg, someone else's wake) is active but sends `owner` nothing more, so every
+ * owner-facing "is a subagent still running?" check uses this, not `activeDescendants`.
+ */
+export function owedSubagents(owner: Child): Child[] {
+	return activeDescendants(owner).filter((c) => !c.initialSettled || c.wakeSender === owner.id);
+}
+
 /** All agents below `c`. */
 export function descendants(c: Child, out: Child[] = []): Child[] {
 	for (const o of c.owned) {
@@ -497,6 +605,21 @@ export function descendants(c: Child, out: Child[] = []): Child[] {
 		descendants(o, out);
 	}
 	return out;
+}
+
+/** `950`, `1.2K`, `160K`, `1M` (omp formatNumber). */
+function fmtCount(n: number): string {
+	if (n < 1000) return `${Math.round(n)}`;
+	if (n < 10_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}K`;
+	if (n < 1_000_000) return `${Math.round(n / 1000)}K`;
+	return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+/** Context fill of `c`'s last good response: `ctx 160K/1M`, `ctx 160K` without a known window, "" before the first one. */
+function contextPart(c: Child): string {
+	const tokens = c.usage.contextTokens;
+	if (!(tokens > 0)) return "";
+	return c.contextWindow ? `ctx ${fmtCount(tokens)}/${fmtCount(c.contextWindow)}` : `ctx ${fmtCount(tokens)}`;
 }
 
 /** One-line status of an agent (irc list, /agents). */
@@ -509,6 +632,7 @@ export function describeChild(c: Child): string {
 		u.toolCount ? `${u.toolCount} tools` : "",
 		u.requests ? `${u.requests} req` : "",
 		u.cost || nested ? `$${u.cost.toFixed(2)}${nested ? ` (+${nested.toFixed(2)})` : ""}` : "",
+		contextPart(c),
 		elapsed,
 		c.modelLabel,
 	].filter(Boolean);
@@ -521,6 +645,22 @@ export function describeChild(c: Child): string {
 /** `describeChild` rows for `list` in tree order, nested agents indented under their owner. */
 export function describeTree(list: Child[]): string[] {
 	return list.map((c) => `${c.depth > 1 ? `${"  ".repeat(c.depth - 1)}↳ ` : ""}${describeChild(c)}`);
+}
+
+/**
+ * Progress row of a still-active agent, for a timed-out parent `irc wait` (so a looping agent or one
+ * near its context limit shows without polling): `` - `Id` ⟨agent⟩ — 5m12s · 90 req · $1.84 · ctx 160K/1M ``.
+ * Duration of the current run first; zero parts are left out; a run waiting for a slot says `queued`.
+ */
+export function describeProgress(c: Child, now = Date.now()): string {
+	const u = c.usage;
+	const parts = [
+		c.status === "pending" ? "queued" : c.runStartedAt ? fmtDuration(now - c.runStartedAt) : "",
+		u.requests ? `${u.requests} req` : "",
+		u.cost > 0 ? (u.cost < 0.005 ? "<$0.01" : `$${u.cost.toFixed(2)}`) : "",
+		contextPart(c),
+	].filter(Boolean);
+	return `- \`${c.id}\` ⟨${c.agent.name}⟩${parts.length ? ` — ${parts.join(" · ")}` : ""}`;
 }
 
 /** Latest result text of `c`: its structured data when the last settled run yielded, else its latest assistant text. */
@@ -570,6 +710,18 @@ export class AgentHub {
 	hooks: ChildHooks = {};
 	private childWaiters = new Map<string, ChildWaiter[]>();
 	private parentWaiters: ParentWaiter[] = [];
+	/**
+	 * Events handed to pi for the main session that have not reached its transcript yet: while the main
+	 * agent runs, pi injects them only after its current tool batch (one per step in pi's default
+	 * steering mode), so a parent `irc wait` started in between must not block in front of them.
+	 * `hits`: waits the entry already cut short (see `queuedForParent`).
+	 */
+	private parentBacklog: Array<{ ev: ParentEvent; hits: number }> = [];
+	/**
+	 * `task` calls still validating their items, per spawner (PARENT_ID or a child id): their agents are
+	 * not registered yet, so a wait issued in the same tool batch lets them finish first (`spawnsSettled`).
+	 */
+	private spawnsInFlight = new Map<string, Set<Promise<void>>>();
 	private changeListeners = new Set<() => void>();
 	/**
 	 * One permit pool per depth level. With a single shared pool, owners holding every permit while
@@ -581,6 +733,8 @@ export class AgentHub {
 	 * guarantee its subagents can run.)
 	 */
 	private pools = new Map<number, Semaphore>();
+	/** Spawners (PARENT_ID or a child id) whose spawn feedback already carried the `irc` lifecycle reference. */
+	private lifecycleShown = new Set<string>();
 
 	constructor(private readonly pi: ExtensionAPI) {}
 
@@ -694,14 +848,89 @@ export class AgentHub {
 		for (let n = 2; ; n++) if (!this.taken(`${base}-${n}`)) return `${base}-${n}`;
 	}
 
+	/**
+	 * Exact resolution of a per-item `model`: `provider/id` with a known provider resolves through the
+	 * registry for that provider only; anything else by exact id among the available models (the
+	 * owner's/parent's provider first when several carry it). The model must have configured credentials.
+	 */
+	private findExactModel(
+		want: string,
+		reg: ExtensionContext["modelRegistry"],
+		fallback: Model<any> | undefined,
+	): { model?: Model<any>; reason?: string } {
+		const slash = want.indexOf("/");
+		const provider = slash > 0 ? want.slice(0, slash) : "";
+		let found: Model<any> | undefined;
+		if (provider && reg.getAll().some((m) => m.provider === provider)) {
+			found = reg.find(provider, want.slice(slash + 1));
+		} else {
+			const exact = reg.getAvailable().filter((m) => m.id === want);
+			found = exact.find((m) => m.provider === fallback?.provider) ?? exact[0];
+		}
+		if (found && !reg.hasConfiguredAuth(found)) return { reason: `no credentials for provider "${found.provider}"` };
+		return { model: found };
+	}
+
+	/** Up to 3 available models whose `provider/id` contains the requested text (or its id / pre-`:` part). */
+	private nearModels(want: string, reg: ExtensionContext["modelRegistry"], fallback: Model<any> | undefined): string[] {
+		const needles = new Set<string>();
+		const colon = want.lastIndexOf(":");
+		for (const text of colon > 0 ? [want, want.slice(0, colon)] : [want]) {
+			const t = text.trim().toLowerCase();
+			const slash = t.indexOf("/");
+			for (const n of slash > 0 ? [t, t.slice(slash + 1)] : [t]) if (n) needles.add(n);
+		}
+		const slash = want.indexOf("/");
+		const provider = slash > 0 ? want.slice(0, slash) : undefined;
+		const rank = (m: Model<any>) => (m.provider === provider ? 0 : m.provider === fallback?.provider ? 1 : 2);
+		return reg
+			.getAvailable()
+			.filter((m) => {
+				const selector = `${m.provider}/${m.id}`.toLowerCase();
+				return [...needles].some((n) => selector.includes(n));
+			})
+			.sort((a, b) => rank(a) - rank(b))
+			.slice(0, 3)
+			.map((m) => `${m.provider}/${m.id}`);
+	}
+
+	/**
+	 * Model for a spawn. A per-item `model` (non-blank) resolves exactly or throws (a per-item failure in
+	 * `spawnTasks`): it never runs on another model. An optional `:level` suffix is split off only when
+	 * the full string does not resolve, and is returned as `thinking`. Without a per-item `model` the
+	 * agent's frontmatter model applies, matched leniently, with the owner's/parent's model (+ warning)
+	 * when it is not found.
+	 */
 	private resolveModel(
 		spec: SpawnSpec,
 		ctx: ExtensionContext,
 		fallback: Model<any> | undefined,
-	): { model: Model<any> | undefined; warning?: string } {
-		const want = spec.model ?? spec.agent.model;
-		if (!want) return { model: fallback };
+	): { model: Model<any> | undefined; warning?: string; thinking?: string } {
 		const reg = ctx.modelRegistry;
+		const requested = spec.model?.trim();
+		if (requested) {
+			let res = this.findExactModel(requested, reg, fallback);
+			let thinking: string | undefined;
+			if (!res.model) {
+				const colon = requested.lastIndexOf(":");
+				const level = colon > 0 ? requested.slice(colon + 1).trim().toLowerCase() : "";
+				const base = colon > 0 ? requested.slice(0, colon).trim() : "";
+				if (base && THINKING_LEVELS.includes(level)) {
+					res = this.findExactModel(base, reg, fallback);
+					thinking = level;
+				}
+			}
+			if (!res.model) {
+				const near = this.nearModels(requested, reg, fallback);
+				throw new Error(
+					`model "${requested}" is not available${res.reason ? ` (${res.reason})` : ""}${near.length ? `; near matches: ${near.join(", ")}` : ""}. ` +
+						"Use the exact provider/model-id[:level]; if that model is unavailable, report it instead of substituting another or dropping `model`",
+				);
+			}
+			return { model: res.model, thinking };
+		}
+		const want = spec.agent.model;
+		if (!want) return { model: fallback };
 		let found: Model<any> | undefined;
 		const slash = want.indexOf("/");
 		if (slash > 0) found = reg.find(want.slice(0, slash), want.slice(slash + 1));
@@ -734,13 +963,24 @@ export class AgentHub {
 		const owner = spec.owner;
 		if (owner && owner.depth >= MAX_DEPTH) throw new Error(`nesting limit reached (max depth ${MAX_DEPTH})`);
 		if (owner?.status === "aborted") throw new Error(`${owner.id} was aborted`);
-		const { model, warning } = this.resolveModel(spec, ctx, owner ? owner.model : ctx.model);
+		const { model, warning: modelWarning, thinking: modelThinking } = this.resolveModel(spec, ctx, owner ? owner.model : ctx.model);
 		if (!model) throw new Error("No model available for subagent.");
 		const id = this.uniqueId(spec.name);
-		const thinkingRaw = spec.thinking ?? spec.agent.thinking;
-		const thinking = (
-			thinkingRaw && THINKING_LEVELS.includes(thinkingRaw) ? thinkingRaw : (owner?.thinking ?? this.pi.getThinkingLevel())
-		) as ThinkingLevel;
+		// Item `thinking` > the item model's `:level` suffix > the agent's `thinking` > owner / session level.
+		const level = (v?: string) => {
+			const l = v?.trim().toLowerCase();
+			return l && THINKING_LEVELS.includes(l) ? l : undefined;
+		};
+		const thinking = (level(spec.thinking) ??
+			modelThinking ??
+			level(spec.agent.thinking) ??
+			owner?.thinking ??
+			this.pi.getThinkingLevel()) as ThinkingLevel;
+		const badThinking = level(spec.thinking) ? "" : (spec.thinking?.trim() ?? "");
+		const thinkingWarning = badThinking
+			? `thinking "${badThinking}" is not a level (${THINKING_LEVELS.join("|")}); using ${thinking}`
+			: undefined;
+		const warning = [modelWarning, thinkingWarning].filter(Boolean).join("; ") || undefined;
 		let projectTrusted = owner?.projectTrusted ?? false;
 		if (!owner) {
 			try {
@@ -773,6 +1013,7 @@ export class AgentHub {
 			activity: [],
 			initialSettled: false,
 			inbox: [],
+			held: [],
 			sentDuringRun: new Set(),
 			steered: [],
 			steersInFlight: new Set(),
@@ -793,8 +1034,40 @@ export class AgentHub {
 	 * Body of every `task` tool call (main agent and spawning children): validate items against the
 	 * caller's spawn policy (+ `hooks.validate`, e.g. output schema / git repo checks) and spawn the
 	 * valid ones. `owner` = the calling child (nested spawn). Relative item `cwd`s resolve against `opts.cwd`.
+	 * The call is tracked as in flight from this (synchronous) point until it returns, see `spawnsSettled`.
 	 */
-	async spawnTasks(
+	spawnTasks(
+		params: { context?: string; tasks?: Array<Record<string, any>> },
+		ctx: ExtensionContext,
+		opts: { policy: SpawnPolicy; cwd: string; owner?: Child },
+	): Promise<TaskCallOutcome> {
+		const spawner = opts.owner?.id ?? PARENT_ID;
+		const call = this.spawnTasksNow(params, ctx, opts);
+		const settled = call.then(
+			() => {},
+			() => {},
+		);
+		const calls = this.spawnsInFlight.get(spawner) ?? new Set<Promise<void>>();
+		this.spawnsInFlight.set(spawner, calls);
+		calls.add(settled);
+		void settled.then(() => {
+			calls.delete(settled);
+			if (calls.size === 0 && this.spawnsInFlight.get(spawner) === calls) this.spawnsInFlight.delete(spawner);
+		});
+		return call;
+	}
+
+	/**
+	 * Resolves once every `task` call of `spawner` (PARENT_ID or a child id) that was in flight has
+	 * registered its agents. A wait in the same tool batch as a `task` call would otherwise validate
+	 * `from`, or look for running agents, before the spawn it is meant for exists.
+	 */
+	async spawnsSettled(spawner: string): Promise<void> {
+		const calls = this.spawnsInFlight.get(spawner);
+		if (calls?.size) await Promise.all([...calls]);
+	}
+
+	private async spawnTasksNow(
 		params: { context?: string; tasks?: Array<Record<string, any>> },
 		ctx: ExtensionContext,
 		opts: { policy: SpawnPolicy; cwd: string; owner?: Child },
@@ -867,7 +1140,11 @@ export class AgentHub {
 			warning: warnings.get(c.id),
 			tags: [c.isolated ? "isolated" : "", c.schema ? "structured" : ""].filter(Boolean),
 		}));
-		return { children, failures, text: formatSpawnFeedback(spawned, failures), isError: children.length === 0 };
+		// The `irc` lifecycle reference rides each spawner's first spawn result only.
+		const spawnerId = owner?.id ?? PARENT_ID;
+		const lifecycle = children.length > 0 && !this.lifecycleShown.has(spawnerId);
+		if (lifecycle) this.lifecycleShown.add(spawnerId);
+		return { children, failures, text: formatSpawnFeedback(spawned, failures, { lifecycle }), isError: children.length === 0 };
 	}
 
 	/** Spawn policy for a child's own `task` tool; undefined = no task tool (depth limit or no `spawns`). */
@@ -986,15 +1263,41 @@ export class AgentHub {
 				child.runningTools.delete(ev.toolCallId);
 				child.lastTool = act;
 			}
+			// pi ends the run after a batch whose every result asks for it (e.g. a lone `yield`).
+			if (!ev.parentToolCallId) {
+				child.batchTerminates = child.batchTerminates !== false && (ev.result as { terminate?: boolean } | undefined)?.terminate === true;
+			}
 			if (ev.isError) this.pushActivity(child, `✗ ${ev.toolName} failed`);
 			this.changed();
+		} else if (ev.type === "turn_end") {
+			// pi polls its steering queue right after this event (the emit is awaited and this runs inside it).
+			// After a tool batch the run goes on whatever is queued, so held messages can join it now; after a
+			// turn without tool calls (or a terminating batch) anything queued would extend the finished run.
+			const work = ev.toolResults.length > 0 && child.batchTerminates !== true;
+			child.batchTerminates = undefined;
+			if (work) this.flushHeld(child);
+		} else if (ev.type === "message_start" && (ev.message as any).role === "user") {
+			// pi consumed a steer the hub queued directly (flushHeld).
+			if (child.steered.some((s) => s.direct)) {
+				const content = (ev.message as any).content;
+				const text =
+					typeof content === "string"
+						? content
+						: (Array.isArray(content) ? content : [])
+								.filter((p: any) => p?.type === "text")
+								.map((p: any) => p.text)
+								.join("");
+				child.steered = child.steered.filter((s) => !(s.direct && s.text === text));
+			}
 		} else if (ev.type === "message_end" && (ev.message as any).role === "assistant") {
 			const msg = ev.message as any;
 			child.usage.requests++;
 			const u = msg.usage;
-			if (u) {
-				child.usage.contextTokens =
-					u.totalTokens || (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+			// A failed or aborted response carries zero or partial usage: keep the last good figure (pi's own
+			// context estimate skips those too).
+			if (u && msg.stopReason !== "error" && msg.stopReason !== "aborted") {
+				const total = u.totalTokens || (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+				if (total > 0) child.usage.contextTokens = total;
 			}
 			// Tokens/cost are taken from the session entry (appended right after this event), see scheduleUsageSync.
 			const text = (msg.content ?? [])
@@ -1118,10 +1421,10 @@ export class AgentHub {
 		void this.route(owner, msg).catch(() => {});
 	}
 
-	/** Status line about an owner's subagents, appended to results it receives. */
+	/** Status line about an owner's subagents, appended to results it receives (only those that still owe it something count). */
 	private subagentNote(owner: Child): string {
 		if (owner.owned.length === 0) return "";
-		const active = activeDescendants(owner);
+		const active = owedSubagents(owner);
 		if (active.length === 0) return "All your subagents have settled.";
 		const n = active.length;
 		return `${n} subagent${n === 1 ? "" : "s"} still running (${active.map((c) => c.id).join(", ")}); ${n === 1 ? "its result is" : "their results are"} delivered as they finish.`;
@@ -1167,9 +1470,10 @@ export class AgentHub {
 	}
 
 	/**
-	 * The owner's turn ended while its subagents are active: pause WITHOUT a permit until an inbox item
-	 * arrives (a result or message), every subagent has settled, or the owner is killed; then take a
-	 * permit again. Returns the inbox items to continue with (empty = nothing arrived / killed).
+	 * The owner's turn ended while subagents still owe it something (`owedSubagents`): pause WITHOUT a
+	 * permit until an inbox item arrives (a result or message), none of them owes it anything any more,
+	 * or the owner is killed; then take a permit again. Returns the inbox items to continue with (empty
+	 * = nothing arrived / killed).
 	 */
 	private async awaitSubagents(child: Child): Promise<IrcMessage[]> {
 		child.blocked = true;
@@ -1177,7 +1481,7 @@ export class AgentHub {
 		await new Promise<void>((resolve) => {
 			child.unblock = () => {
 				// Notices wait for the continuation; they do not resume a paused owner on their own.
-				if (child.inbox.some((m) => m.kind !== "notice") || child.status === "aborted" || activeDescendants(child).length === 0) {
+				if (child.inbox.some((m) => m.kind !== "notice") || child.status === "aborted" || owedSubagents(child).length === 0) {
 					child.unblock = undefined;
 					resolve();
 				}
@@ -1195,14 +1499,18 @@ export class AgentHub {
 	 * runs (released while blocked on its subagents).
 	 *
 	 * After each prompt:
-	 *  1. subagent results unread or subagents still active -> continue the same purpose (blocking
-	 *     for the next result first if nothing is queued); nothing settles yet
+	 *  0. whatever pi did not consume (unsent steers, held messages) becomes a queued message again
+	 *  1. subagent results unread or subagents still owing one (`owedSubagents`) -> continue the same
+	 *     purpose (blocking for the next result first if nothing but held-back items is queued);
+	 *     nothing settles yet
 	 *  2. settle point (`settleRun`, after the optional `hooks.beforeSettle`)
 	 *  3. messages that arrived meanwhile -> new turn whose reply goes to the first sender
 	 */
 	private async runLoop(child: Child, firstText: string, purpose: Purpose): Promise<void> {
 		child.status = "pending";
 		child.finishedAt = undefined;
+		// Known from the start, so a kill while the run still queues for a permit can tell the waker.
+		child.wakeSender = purpose.kind === "reply" ? purpose.to : undefined;
 		if (!(await this.acquirePermit(child))) return;
 		try {
 			if ((child.status as ChildStatus) === "aborted" || !child.session) return;
@@ -1240,22 +1548,32 @@ export class AgentHub {
 					const q = session.clearQueue();
 					leftovers = [...q.steering, ...q.followUp];
 				} catch {}
-				let queued = child.inbox.splice(0);
-				const steeredResult = child.steered.some((s) => s.msg.kind === "result" && leftovers.includes(s.text));
+				// Steers pi never consumed are messages again, and so is everything still held: they get the
+				// continuation below or, once this run has reported, a turn of their own (wake framing, relay).
+				const unsent = child.steered.filter((s) => s.direct || leftovers.includes(s.text)).map((s) => s.msg);
+				leftovers = leftovers.filter((t) => !child.steered.some((s) => s.text === t));
 				child.steered = [];
+				child.batchTerminates = undefined;
+				let queued = [...unsent, ...child.held.splice(0), ...child.inbox.splice(0)];
 
 				const output = session.getLastAssistantText() ?? "";
 				const error = thrown ?? this.lastAssistantError(child);
 				child.error = error;
 				child.runningTools.clear();
 
-				// 1. An owner is not done while its subagents work or their results are unread.
-				if (steeredResult || queued.some((m) => m.kind === "result") || activeDescendants(child).length > 0) {
-					if (leftovers.length === 0 && queued.length === 0) {
-						queued = await this.awaitSubagents(child);
+				// 1. An owner is not done while subagents still owe it a result or reply, or their results are unread.
+				if (queued.some((m) => m.kind === "result") || owedSubagents(child).length > 0) {
+					let resume = true;
+					if (leftovers.length === 0 && queued.every((m) => this.holdsAtStop(child, m))) {
+						// Nothing queued, or only what must not extend a turn that ended (peer messages, broadcast
+						// legs, notices): those are parked. They ride along if a result or steering message resumes
+						// the owner; otherwise they get their own turn after its result (step 3).
+						const arrived = await this.awaitSubagents(child);
 						if ((child.status as ChildStatus) === "aborted") return;
+						queued = [...queued, ...arrived];
+						resume = arrived.some((m) => m.kind !== "notice");
 					}
-					if (leftovers.length > 0 || queued.length > 0) {
+					if (resume) {
 						text = this.continuation(child, leftovers, queued);
 						this.hooks.resume?.(child);
 						continue;
@@ -1291,17 +1609,20 @@ export class AgentHub {
 				}
 				this.settleRun(child, current, status, finalOutput, child.error, extra, notice);
 
-				// 3. Follow-ups that arrived during the run. Notices alone don't start a turn: they stay queued
-				// for the next run (an idle child's inbox is folded into its next prompt).
+				// 3. Follow-ups that arrived during the run (or were held back from it: peer messages, broadcast
+				// legs). Notices alone don't start a turn: they stay queued for the next run (an idle child's
+				// inbox is folded into its next prompt).
 				if (leftovers.length === 0 && queued.every((m) => m.kind === "notice")) {
 					child.inbox.unshift(...queued);
 					break;
 				}
+				// One reply goes to one waker, so only the first sender's messages carry the relay promise; the
+				// others are told to answer with irc send.
+				const firstIrc = queued.find(expectsReply);
 				text = [
 					...leftovers,
-					...queued.map((m) => this.formatIncoming(child, m, expectsReply(m) ? "wake" : "continue")),
+					...queued.map((m) => this.formatIncoming(child, m, firstIrc && expectsReply(m) && m.from === firstIrc.from ? "wake" : "continue")),
 				].join("\n\n");
-				const firstIrc = queued.find(expectsReply);
 				current = firstIrc ? { kind: "reply", to: firstIrc.from } : { kind: "none" };
 				child.sentDuringRun.clear();
 			}
@@ -1313,7 +1634,11 @@ export class AgentHub {
 		}
 	}
 
-	/** Deliver a run's result: the initial result goes to the owner; a follow-up reply to its sender. */
+	/**
+	 * Deliver a run's result: the initial result goes to the owner; a follow-up reply to its sender,
+	 * flagged as a relay. A turn that completed after the child already messaged the sender relays
+	 * nothing (it would repeat the answer); a failed turn always reports, leading with the failure.
+	 */
 	private settleRun(
 		child: Child,
 		purpose: Purpose,
@@ -1323,6 +1648,7 @@ export class AgentHub {
 		extra?: DoneExtra,
 		notice?: { body?: string; to?: string; replyNote?: string },
 	): void {
+		child.wakeSender = undefined;
 		if (purpose.kind === "initial") {
 			// The result (incl. e.g. its merge summary) goes to the owner anyway.
 			child.finishedAt = Date.now();
@@ -1330,12 +1656,21 @@ export class AgentHub {
 			return;
 		}
 		child.done = this.makeDone(child, status, output, extra);
-		const relayTo = purpose.kind === "reply" && !child.sentDuringRun.has(purpose.to) ? purpose.to : undefined;
+		const messaged = purpose.kind === "reply" && child.sentDuringRun.has(purpose.to);
+		const relayTo = purpose.kind === "reply" && (!messaged || error) ? purpose.to : undefined;
 		const noticeTo = notice?.to ?? child.ownerId;
 		if (relayTo) {
-			const reply = error && !output ? `(failed: ${error})` : output || "(no reply)";
+			const reply = error
+				? [
+						`(failed: ${error})`,
+						output,
+						messaged ? `(\`${child.id}\` messaged you earlier in this turn, but that was not its answer; nothing further was sent.)` : "",
+					]
+						.filter(Boolean)
+						.join("\n\n")
+				: output || "(no reply)";
 			const extra = relayTo === noticeTo ? (notice?.body ?? notice?.replyNote) : (notice?.replyNote ?? notice?.body);
-			void this.deliver(child.id, relayTo, extra ? `${reply}\n\n${extra}` : reply).catch(() => {});
+			void this.deliver(child.id, relayTo, extra ? `${reply}\n\n${extra}` : reply, { relay: true }).catch(() => {});
 		}
 		if (notice?.body && relayTo !== noticeTo) this.sendNotice(child, notice.body, noticeTo);
 	}
@@ -1366,26 +1701,33 @@ export class AgentHub {
 		return this.deliver(from, this.resolveAddress(this.children.get(from), to), body);
 	}
 
-	/** `send` with an internal recipient id (no alias resolution). */
-	private async deliver(from: string, to: string, body: string): Promise<string> {
+	/** `send` with an internal recipient id (no alias resolution). `flags` mark automatic relays and broadcast legs. */
+	private async deliver(from: string, to: string, body: string, flags: { relay?: boolean; broadcast?: boolean } = {}): Promise<string> {
 		if (to === from) throw new Error("Cannot send a message to yourself.");
 		const sender = this.children.get(from);
-		if (sender) sender.sentDuringRun.add(to);
 
 		if (to === "all") {
+			// A subagent's broadcast would wake every live agent for news that is almost never theirs.
+			if (sender) throw new Error('Only the main agent can broadcast. Message the one agent that can answer (irc send, to: "<id>").');
 			const targets = this.broadcastTargets(from);
 			const receipts = await Promise.all(
 				targets.map((t) =>
-					this.deliver(from, t, body).then(
+					this.deliver(from, t, body, { broadcast: true }).then(
 						(r) => `- ${t}: ${r}`,
 						(e) => `- ${t}: failed — ${e.message}`,
 					),
 				),
 			);
-			return targets.length ? `Broadcast to ${targets.length} agent(s):\n${receipts.join("\n")}` : "No agents to broadcast to.";
+			if (targets.length === 0) return "No agents to broadcast to.";
+			// Only the user's legs keep the reply relay (those replies just show in the transcript).
+			const quiet = from === USER_ID ? "" : "; a broadcast draws no automatic replies";
+			return `Broadcast to ${targets.length} agent(s)${quiet}:\n${receipts.join("\n")}`;
 		}
 
+		if (sender) sender.sentDuringRun.add(to);
 		const msg: IrcMessage = { kind: "irc", from, to, body, ts: Date.now() };
+		if (flags.relay) msg.relay = true;
+		if (flags.broadcast) msg.broadcast = true;
 		if (to === PARENT_ID) {
 			this.notifyParent({ kind: "message", msg });
 			return sender && sender.ownerId !== PARENT_ID ? "delivered to the main agent" : "delivered to parent";
@@ -1401,24 +1743,54 @@ export class AgentHub {
 		return this.route(child, msg);
 	}
 
-	/**
-	 * "all": the main agent and the user reach every agent; a child reaches its roster (its parent,
-	 * siblings, and own subagents).
-	 */
+	/** "all": the main agent and the user reach every live agent. Subagents cannot broadcast (`deliver` refuses). */
 	private broadcastTargets(from: string): string[] {
-		const me = this.children.get(from);
-		const live = [...this.children.values()].filter((c) => c.id !== from && c.status !== "aborted");
-		if (!me) return live.map((c) => c.id);
-		const targets = live.filter((c) => c.ownerId === me.ownerId || c.ownerId === me.id).map((c) => c.id);
-		const owner = this.children.get(me.ownerId);
-		if (me.ownerId === PARENT_ID) targets.unshift(PARENT_ID);
-		else if (owner && owner.status !== "aborted") targets.unshift(owner.id);
-		return targets;
+		return [...this.children.values()].filter((c) => c.id !== from && c.status !== "aborted").map((c) => c.id);
+	}
+
+	/**
+	 * Whether `msg`, arriving while `child` streams, must stay out of pi's steering queue until a
+	 * tool-step boundary. pi polls that queue after EVERY turn, also one without tool calls, and again
+	 * after the run ended, and continues with whatever it finds: the child would answer the message in
+	 * one more turn, and that answer would become the run's result (or the reply relayed to its waker).
+	 * A result answers the owner, so only the owner, the main agent, the user and the child's own
+	 * subagents (its results included) may extend a run; a peer message, any broadcast leg and a notice
+	 * wait for a tool step or get a turn of their own once the result is out (oh-my-pi irc-bridge `peerMessage`).
+	 */
+	private holdsAtStop(child: Child, msg: IrcMessage): boolean {
+		if (msg.kind === "result") return false;
+		if (msg.kind === "notice" || msg.broadcast) return true;
+		if (msg.from === child.ownerId || msg.from === PARENT_ID || msg.from === USER_ID) return false;
+		const sender = this.children.get(msg.from);
+		return !(sender && this.isDescendant(sender, child.id));
+	}
+
+	/**
+	 * Hand `child`'s held messages to pi at a tool-step boundary (its `turn_end`, see `onChildEvent`):
+	 * the poll that follows continues the run anyway. Queued synchronously through the agent, as ONE
+	 * steering message, so that poll is the one that takes it: `session.steer()` enqueues a few ticks
+	 * later and could miss it, and in pi's default one-at-a-time mode a message behind another queued
+	 * one would only be taken a turn later, possibly the last. In that case they stay held.
+	 */
+	private flushHeld(child: Child): void {
+		const session = child.session;
+		if (!session || child.held.length === 0 || child.status !== "running") return;
+		try {
+			const agent = session.agent;
+			if (session.steeringMode !== "all" && agent.hasQueuedMessages()) return;
+			const msgs = child.held.splice(0);
+			const text = msgs.map((m) => this.formatIncoming(child, m, "steer")).join("\n\n");
+			for (const msg of msgs) child.steered.push({ msg, text, direct: true });
+			agent.steer({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+		} catch {
+			// Not queued: the entries stay in `steered` and are recovered as messages after the prompt (runLoop).
+		}
 	}
 
 	/** Route an incoming item (message or subagent result) to a child according to its state. */
 	private async route(child: Child, msg: IrcMessage): Promise<string> {
-		const waiters = this.childWaiters.get(child.id);
+		// A broadcast leg never ends a wait; it arrives after the wait returned.
+		const waiters = msg.broadcast ? undefined : this.childWaiters.get(child.id);
 		const wi = waiters?.findIndex((w) => !w.from || w.from === msg.from) ?? -1;
 		if (waiters && wi >= 0) {
 			const [w] = waiters.splice(wi, 1);
@@ -1426,6 +1798,10 @@ export class AgentHub {
 			return "delivered (recipient was waiting)";
 		}
 		if (child.session?.isStreaming) {
+			if (this.holdsAtStop(child, msg)) {
+				child.held.push(msg);
+				return "queued; it reads it at its next tool step, or in a turn of its own once its current run has reported";
+			}
 			const text = this.formatIncoming(child, msg, "steer");
 			child.steered.push({ msg, text });
 			const p = child.session.steer(text);
@@ -1470,6 +1846,7 @@ export class AgentHub {
 			w!.resolve(ev);
 			return;
 		}
+		this.parentBacklog.push({ ev, hits: 0 });
 		this.pi.sendMessage(
 			{
 				customType: ev.kind === "done" ? RESULT_MESSAGE_TYPE : IRC_MESSAGE_TYPE,
@@ -1479,6 +1856,47 @@ export class AgentHub {
 			},
 			{ triggerTurn: true, deliverAs: "steer" },
 		);
+	}
+
+	/**
+	 * A `task-result` / `irc` message of the main session started (pi put it into the transcript): it is
+	 * no longer queued behind a wait. pi keeps `details` by identity; equal content is the fallback.
+	 */
+	markParentDelivered(details: unknown, content?: unknown): void {
+		if (this.parentBacklog.length === 0) return;
+		let i = this.parentBacklog.findIndex((e) => e.ev === details);
+		if (i < 0 && typeof content === "string") i = this.parentBacklog.findIndex((e) => formatParentEvent(e.ev) === content);
+		if (i >= 0) this.parentBacklog.splice(i, 1);
+	}
+
+	/**
+	 * Events already handed to pi for the main session but not in its transcript yet (see
+	 * `parentBacklog`), for a parent `irc wait` that returns at once because of them: every call counts
+	 * as one wait cut short by each returned entry. pi delivers one queued message per step, so an entry
+	 * at queue position p is in the transcript after p + 1 such waits at the latest; one that has cut
+	 * short more than that was dropped by pi without ending the run (its dequeue key clears the queue)
+	 * and is forgotten here, so the next wait blocks normally.
+	 */
+	queuedForParent(filter: (ev: ParentEvent) => boolean = () => true): ParentEvent[] {
+		this.parentBacklog = this.parentBacklog.filter((e, position) => e.hits <= position + 1);
+		const matching = this.parentBacklog.filter((e) => filter(e.ev));
+		for (const e of matching) e.hits++;
+		return matching.map((e) => e.ev);
+	}
+
+	/** The main agent's run settled: nothing stays queued behind a wait (an entry pi dropped must not linger). */
+	clearParentBacklog(): void {
+		this.parentBacklog = [];
+	}
+
+	/** Calls `fn` once when agent `id` and its subtree are no longer active (checked on every hub change). Returns unsubscribe. */
+	onInactive(id: string, fn: () => void): () => void {
+		const off = this.onChange(() => {
+			if (subtreeActive(this.children.get(id))) return;
+			off();
+			fn();
+		});
+		return off;
 	}
 
 	private notifyUser(msg: IrcMessage): void {
@@ -1522,10 +1940,23 @@ export class AgentHub {
 		});
 	}
 
+	/**
+	 * Take a message that is already here for `child` (held mid-run, or in its inbox), optionally only
+	 * `from` one sender. Broadcast legs never count: they arrive after a wait, not through it.
+	 */
+	takeArrived(child: Child, from?: string): IrcMessage | undefined {
+		for (const list of [child.held, child.inbox]) {
+			const idx = list.findIndex((m) => !m.broadcast && (!from || m.from === from));
+			if (idx >= 0) return list.splice(idx, 1)[0];
+		}
+		return undefined;
+	}
+
+	/** Block child `id` until a message arrives (optionally only `from` one sender); one that is already here is returned at once. */
 	waitForChild(id: string, from: string | undefined, timeoutMs: number, signal?: AbortSignal): Promise<IrcMessage | null> {
 		const child = this.children.get(id);
-		const idx = child?.inbox.findIndex((m) => !from || m.from === from) ?? -1;
-		if (child && idx >= 0) return Promise.resolve(child.inbox.splice(idx, 1)[0]!);
+		const arrived = child && this.takeArrived(child, from);
+		if (arrived) return Promise.resolve(arrived);
 		return new Promise((resolve, reject) => {
 			let timer: NodeJS.Timeout | undefined;
 			const list = this.childWaiters.get(id) ?? [];
@@ -1563,7 +1994,7 @@ export class AgentHub {
 		try {
 			pending = child.session?.getSteeringMessages?.() ?? [];
 		} catch {}
-		return child.steered.some((s) => pending.includes(s.text) && (!from || s.msg.from === from));
+		return child.steered.some((s) => (s.direct || pending.includes(s.text)) && (!from || s.msg.from === from));
 	}
 
 	/**
@@ -1571,7 +2002,10 @@ export class AgentHub {
 	 *  notify: deliver an aborted `<task-result>` to the owner if the initial result is still outstanding
 	 *          (used when the user kills an agent the parent is still expecting). Nested agents notify
 	 *          their owner by default unless the owner itself asked for the kill (`by`).
+	 *  by:     who asked for the kill (a child id, PARENT_ID or USER_ID); `notify` alone means the user.
 	 *  silent: never notify (cascades and disposal: the owner is going away too).
+	 * An agent killed during a wake turn tells whoever woke it that no reply is coming, unless that is
+	 * the killer or the kill is silent.
 	 * Resolves (after `hooks.dispose` ran for the whole subtree) with notes for the killer, e.g. where
 	 * unmerged worktree changes were saved. Concurrent kills of one agent share a single teardown.
 	 */
@@ -1588,6 +2022,9 @@ export class AgentHub {
 		// Mark first so this agent's own loop (e.g. blocked on its subagents) cannot settle while the subtree goes down.
 		// `finalizing` keeps it "active" for a waiting owner until the aborted result below is delivered.
 		child.finalizing = true;
+		// Set only while a wake run still owes its reply (runLoop / settleRun).
+		const waker = child.wakeSender;
+		child.wakeSender = undefined;
 		child.status = "aborted";
 		child.finishedAt = Date.now();
 		child.abort.abort();
@@ -1612,6 +2049,11 @@ export class AgentHub {
 		child.phase = undefined;
 		const notify = !opts.silent && (opts.notify === true || (child.ownerId !== PARENT_ID && opts.by !== child.ownerId));
 		this.settleInitial(child, "aborted", output, notify, info?.merge ? { merge: info.merge } : undefined);
+		const killer = opts.by ?? (opts.notify ? USER_ID : undefined);
+		if (waker && !opts.silent && waker !== killer) {
+			// A relay: an answer (that none is coming), so it draws no reply itself.
+			void this.deliver(child.id, waker, `\`${child.id}\` was killed before it replied.`, { relay: true }).catch(() => {});
+		}
 		this.changed();
 		if (info?.note) notes.push(`${child.id}: ${info.note}`);
 		return notes;
@@ -1623,11 +2065,14 @@ export class AgentHub {
 	 */
 	async disposeAll(): Promise<string[]> {
 		for (const w of this.parentWaiters.splice(0)) w.resolve(null);
+		this.parentBacklog = [];
+		this.spawnsInFlight.clear();
 		for (const p of this.pools.values()) p.rejectAll();
 		const all = [...this.children.values()];
 		const top = await Promise.all(all.filter((c) => c.ownerId === PARENT_ID).map((c) => this.kill(c.id, { silent: true }).catch(() => [])));
 		const rest = await Promise.all(all.filter((c) => c.ownerId !== PARENT_ID).map((c) => this.kill(c.id, { silent: true }).catch(() => [])));
 		this.children.clear();
+		this.lifecycleShown.clear();
 		this.changed();
 		// A cascade already reported its subtree's notes; the second pass only returns the same promises.
 		return [...new Set([...top.flat(), ...rest.flat()])];
@@ -1639,9 +2084,7 @@ export class AgentHub {
 		const selfId = child.id;
 		const nested = child.ownerId !== PARENT_ID;
 		const manages = !!child.spawns?.length;
-		const recipients = nested
-			? '"parent" (the agent that spawned you), "main" (the main agent), a peer id, or "all"'
-			: '"parent", a peer id, or "all"';
+		const recipients = nested ? '"parent" (the agent that spawned you), "main" (the main agent), or a peer id' : '"parent" or a peer id';
 		const ops = manages ? (["send", "wait", "list", "read", "kill"] as const) : (["send", "wait", "list"] as const);
 		return {
 			name: "irc",
@@ -1649,6 +2092,9 @@ export class AgentHub {
 			description:
 				`Message other agents. op "send": deliver \`message\` to \`to\` (${recipients}); never blocks on a reply. ` +
 				'op "wait": block until a message arrives (optionally only `from` one agent), up to `timeoutSec` (default 120). ' +
+				"Wait only for the answer to a question that blocks you" +
+				(manages ? " or a result of your own subagents; with nothing else to do, end your turn instead — it resumes with their results" : "") +
+				". NEVER wait for another agent's progress. " +
 				'op "list": show peers.' +
 				(manages
 					? ' op "read": full latest output + recent activity of your subagent `id`. op "kill": abort your subagent `id` (and its subagents).'
@@ -1682,12 +2128,51 @@ export class AgentHub {
 					return text([`Killed ${target.id}.`, ...notes].join("\n"));
 				}
 				const from = typeof params.from === "string" && params.from.trim() ? hub.resolveAddress(child, params.from.trim()) : undefined;
+				// A `task` call of the same tool batch may still be validating: its agents must exist before `from` is checked.
+				await hub.spawnsSettled(selfId);
+				// The agent asked must exist; the main agent and the user are always there.
+				const asked = from !== undefined && from !== PARENT_ID && from !== USER_ID ? from : undefined;
+				if (asked !== undefined && !hub.children.has(asked)) {
+					const known = [PARENT_ID, ...(nested ? [MAIN_ALIAS] : []), ...[...hub.children.keys()].filter((k) => k !== selfId && k !== child.ownerId)];
+					return text(`Unknown agent "${params.from}". Known: ${known.join(", ")}`, true);
+				}
+				// A steer still on its way into the queue counts as queued.
+				if (child.steersInFlight.size > 0) await Promise.all([...child.steersInFlight]);
 				if (hub.hasQueuedSteer(child, from)) {
 					return text("A message is already queued for you; it is delivered right after this call.");
 				}
+				const arrived = hub.takeArrived(child, from);
+				if (arrived) return text(hub.formatIncoming(child, arrived, "wait"));
+				// Nothing can come from an agent that is not running, and a wait on one ends when it stops
+				// (its reply, or the note that it was killed, resolves the wait first).
+				const target = asked !== undefined ? hub.children.get(asked) : undefined;
+				const shown = target ? hub.displayId(child, target.id) : "";
+				if (target && !subtreeActive(target)) {
+					const again = target.status === "idle" ? " Message it again (irc send) if you still need an answer." : "";
+					return text(`\`${shown}\` is ${target.status}: nothing is running that could reply.${again}`);
+				}
+				let stopped = false;
+				const gone = new AbortController();
+				const off = target
+					? hub.onInactive(target.id, () => {
+							stopped = true;
+							gone.abort();
+						})
+					: undefined;
 				const timeout = Math.max(1, params.timeoutSec ?? 120) * 1000;
-				const msg = await hub.waitForChild(selfId, from, timeout, signal);
-				return text(msg ? hub.formatIncoming(child, msg, "wait") : "No message arrived before the timeout.");
+				try {
+					const msg = await hub.waitForChild(selfId, from, timeout, signal ? AbortSignal.any([signal, gone.signal]) : gone.signal);
+					return text(
+						msg
+							? hub.formatIncoming(child, msg, "wait")
+							: "No message arrived before the timeout. Keep working on whatever is not blocked, or wait again if nothing is; NEVER use sleep to wait longer.",
+					);
+				} catch (e) {
+					if (!stopped || signal?.aborted) throw e;
+					return text(`\`${shown}\` stopped (${target?.status ?? "gone"}) without replying. Ask again, or carry on without the answer.`);
+				} finally {
+					off?.();
+				}
 			},
 		} as ToolDefinition;
 	}

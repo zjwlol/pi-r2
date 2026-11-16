@@ -201,7 +201,7 @@ export class NativeBackend {
 		};
 	}
 
-	/** Open the inline surface, send the palette and the first frame. */
+	/** Open the inline surface, send the palette (to a `program-palette` terminal only) and the first frame. */
 	start(): void {
 		if (this.#live) return;
 		this.#live = true;
@@ -324,8 +324,15 @@ export class NativeBackend {
 		return this.#recent.slice(-count);
 	}
 
+	/**
+	 * The theme palette, verb `t`: a local extension (omp retired the verb in 1513e856d5), sent only to a terminal
+	 * whose hello lists the feature `program-palette` (rsttyd). Elsewhere span tokens resolve against the
+	 * terminal's own theme.
+	 */
 	#sendPalette(force: boolean): void {
+		// Asked for either way: building the palette also refreshes the span token map (session `#palette`).
 		const palette = this.#host.palette();
+		if (!this.#cx.feature("program-palette")) return;
 		if (!palette || (!palette.dark && !palette.light)) return;
 		const serialized = JSON.stringify(palette);
 		if (!force && serialized === this.#paletteSent) return;

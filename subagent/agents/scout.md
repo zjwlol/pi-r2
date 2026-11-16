@@ -1,6 +1,6 @@
 ---
 name: scout
-description: MUST be used for exploratory codebase research, rapid code analysis, and broad pattern searches. Fast read-only scout returning compressed context for handoff.
+description: Fast scout for exploratory codebase research, rapid code analysis, and broad pattern searches; returns compressed context for handoff.
 tools: read, grep, find, ls
 thinking-level: medium
 ---

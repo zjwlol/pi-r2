@@ -12,7 +12,8 @@
  *   for 12s" head (`took` feeds the fold's sum), its turn-ending error or
  *   abort in omp's roles, and the turn's usage as omp's hover footer;
  * - a transcript Spacer draws nothing (the block gap spaces the blocks, as in
- *   omp) and a dim or warning status line is an `omp.notice.*` block: both are
+ *   omp), a dim status line is an `omp.notice.status` text and a warning line
+ *   omp's `omp.notice.warning` row (the tone's icon beside the message): all
  *   quiet, so they fold with the run around them.
  *
  * Runtime imports stay off describers.ts (it registers these first).
@@ -659,6 +660,56 @@ function quietLine(spans: readonly TspSpan[]): boolean {
 	return spans.every((sp) => sp.t.trim() === "" || (sp.s !== undefined && QUIET_TOKENS.has(sp.s.split(" ")[0]!)));
 }
 
+/** Every visible span in the warning colour (showWarning, `notify(…, "warning")`, the cache/billing notices). */
+function warningLines(lines: readonly (readonly TspSpan[])[]): boolean {
+	let seen = false;
+	for (const spans of lines) {
+		for (const sp of spans) {
+			if (sp.t.trim() === "") continue;
+			if (sp.s?.split(" ")[0] !== "warning") return false;
+			seen = true;
+		}
+	}
+	return seen;
+}
+
+/** The word pi leads a warning with: the row's icon carries it (its `aria`). */
+const WARNING_LABEL = /^\s*Warning:\s*/;
+
+/**
+ * omp's notice row (`noticeRow`, transcript-notice.ts) for warning lines: the
+ * tone colours the icon, so the message keeps its emphasis only (the warning
+ * token leaves every span) and loses pi's "Warning:" label.
+ */
+function warningRow(lines: readonly (readonly TspSpan[])[], key: string): NativeNode {
+	let message: TspSpan[] = [];
+	lines.forEach((spans, i) => {
+		if (i > 0) message.push({ t: "\n" });
+		for (const sp of spans) {
+			const rest = sp.s?.split(" ").filter((token) => token !== "warning") ?? [];
+			message.push(rest.length > 0 ? { ...sp, s: rest.join(" ") } : { t: sp.t });
+		}
+	});
+	// The blank edges go (pi's padding, a trailing empty line): the icon sits on the message's first line.
+	const visible = (sp: TspSpan) => sp.t.trim() !== "";
+	const first = message.findIndex(visible);
+	let end = message.length;
+	while (end > first + 1 && !visible(message[end - 1]!)) end--;
+	message = message.slice(first, end);
+	const unlabelled = message[0]!.t.replace(WARNING_LABEL, "");
+	// A bare "Warning:" keeps its word: the row would otherwise be an icon alone.
+	if (unlabelled !== "") message[0] = { ...message[0]!, t: unlabelled };
+	else if (message.slice(1).some(visible)) message = message.slice(message.findIndex((sp, i) => i > 0 && visible(sp)));
+	return row(
+		[
+			node("icon", { name: "warning", tone: "warning", aria: "Warning" }, undefined, "icon"),
+			text(hasStyle(message) ? message : message.map((sp) => sp.t).join(""), { wrap: "word", grow: 1 }, "text"),
+		],
+		{ role: "omp.notice.warning", tone: "warning", gap: "sm", align: "start" },
+		key,
+	);
+}
+
 function lineNode(spans: readonly TspSpan[], role: string, key: string): NativeNode {
 	if (spans.length === 0) return text("", { role }, key);
 	if (!hasStyle(spans)) return text(spans.map((sp) => sp.t).join(""), { role, wrap: "word" }, key);
@@ -669,25 +720,28 @@ function lineNode(spans: readonly TspSpan[], role: string, key: string): NativeN
  * A Text block in the transcript, drawn as the plain Text describer draws it
  * (theme colours as span tokens) without its vertical padding (the block gap
  * spaces it); a line wholly in a status colour carries a quiet notice role,
- * so pi's status, warning and cache notices fold with the run around them.
+ * so pi's status, warning and cache notices fold with the run around them:
+ * dim ones as `omp.notice.status` text, warning ones as omp's notice row
+ * (rows where the terminal has no `icon`: then they stay the quiet text).
  * Errors and anything else stay breaks.
  */
 const transcriptText: Describer = {
 	name: "TranscriptText",
 	matches: (c) => kindOf(c) === "text" && blocks.has(c),
-	fingerprint: (c) => {
+	fingerprint: (c, cx) => {
 		const a = c as Any;
 		// ThemedText rebuilds its string lazily in render(): ask for it once so `text` is current.
 		if (a.stale === true && typeof a.build === "function") {
 			a.stale = false;
 			a.setText?.(a.build());
 		}
-		return [a.text, spansThemeId()];
+		return [a.text, spansThemeId(), cx.supports("icon")];
 	},
-	build: (c) => {
+	build: (c, cx) => {
 		const raw = String((c as Any).text ?? "").replaceAll("\x1b_pi:c\x07", "");
 		if (plain(raw).trim() === "") return EMPTY_NODE;
 		const lines = raw.split("\n").map(lineToSpans);
+		if (cx.supports("icon") && warningLines(lines)) return warningRow(lines, "t");
 		const quiet = lines.every(quietLine);
 		if (lines.length === 1) return lineNode(lines[0]!, quiet ? NOTICE_ROLE : "pi.text", "t");
 		return col(

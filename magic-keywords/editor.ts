@@ -1,7 +1,9 @@
 /**
  * Editor that paints magic keywords with an animated gradient while you type
  * (oh-my-pi style shimmer: one repaint every 70 ms while a keyword is on
- * screen and the editor is focused; static gradient otherwise).
+ * screen and the editor is focused; static gradient otherwise). Each render
+ * arms at most one frame, so the chain ends by itself once the editor is no
+ * longer rendered (swapped out for a selector, replaced, ...).
  *
  * Under a TSP surface (the tsp-native extension sets `nativeMode`) the
  * terminal clocks the effect itself: `describeDecorations()` hands it the
@@ -17,7 +19,7 @@ const PERIOD_MS = 1800;
 
 const live = new Set<MagicEditor>();
 
-/** Stop every editor's animation timer (session shutdown / reload). */
+/** Cancel every editor's pending animation frame (session shutdown / reload). */
 export function stopAllEditors(): void {
 	for (const editor of live) editor.stopShimmer();
 	live.clear();
@@ -59,7 +61,7 @@ export class MagicEditor extends CustomEditor {
 	paintOptions?: () => Omit<PaintOptions, "phase">;
 	/** Set by tsp-native while a TSP surface draws this editor: no ANSI gradient, no repaint timer. */
 	nativeMode = false;
-	private timer?: ReturnType<typeof setInterval>;
+	private timer?: ReturnType<typeof setTimeout>;
 
 	override render(width: number): string[] {
 		const lines = super.render(width);
@@ -70,7 +72,7 @@ export class MagicEditor extends CustomEditor {
 		const text = this.getText();
 		const keywords = findKeywords(text);
 		const animate = keywords.length > 0 && this.focused;
-		if (animate) this.startShimmer();
+		if (animate) this.scheduleFrame();
 		else this.stopShimmer();
 		if (keywords.length === 0 || !this.paintOptions) return lines;
 
@@ -86,16 +88,21 @@ export class MagicEditor extends CustomEditor {
 		return keywordDecorations(text);
 	}
 
-	private startShimmer(): void {
+	/** Arm the next shimmer frame: one-shot, re-armed by the render it requests. */
+	private scheduleFrame(): void {
 		if (this.timer) return;
 		live.add(this);
-		this.timer = setInterval(() => this.tui.requestRender(), FRAME_MS);
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			live.delete(this);
+			this.tui.requestRender();
+		}, FRAME_MS);
 		this.timer.unref?.();
 	}
 
 	stopShimmer(): void {
 		if (!this.timer) return;
-		clearInterval(this.timer);
+		clearTimeout(this.timer);
 		this.timer = undefined;
 		live.delete(this);
 	}

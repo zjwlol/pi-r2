@@ -1097,11 +1097,15 @@ function entryIcon(entry: Any): string | undefined {
 	}
 }
 
-/** pi's row text for an entry (`user: …`, `[read: …]`, `[compaction: 12k tokens]`) as styled spans. */
+/**
+ * pi's row text for an entry (`user: …`, `[read: …]`, `[compaction: 12k tokens]`) as styled spans, on one line:
+ * pi folds `\n` and `\t` out of message text only, so a tool argument's line breaks (and any `\r`, U+2028, U+2029)
+ * are folded here, one space each (span boundaries and search hit offsets stay put).
+ */
 function entryLabel(list: Any, flat: TreeFlatNode): TspSpan[] {
 	try {
 		if (typeof list.getEntryDisplayText === "function") {
-			const spans = lineToSpans(String(list.getEntryDisplayText(flat.node, false)));
+			const spans = lineToSpans(String(list.getEntryDisplayText(flat.node, false))).map((s) => ({ ...s, t: s.t.replace(/[\r\n\t\u2028\u2029]/g, " ") }));
 			if (spans.some((s) => s.t.trim().length > 0)) return clipSpans(spans, 300);
 		}
 	} catch {
@@ -1162,7 +1166,8 @@ function treeItem(list: Any, flat: TreeFlatNode, themeId: number): PickerItem {
 	const folded = isFolded(list, id);
 	const open = folded ? false : isFoldable(list, id) ? true : undefined;
 	const active = list.activePathIds instanceof Set && list.activePathIds.has(id);
-	const label = typeof flat.node.label === "string" && flat.node.label ? flat.node.label : undefined;
+	// Folded to one line: a label's line breaks would break the badge (and the row).
+	const label = (typeof flat.node.label === "string" && oneLine(flat.node.label)) || undefined;
 	const stamp = label && list.showLabelTimestamps ? labelTimestamp(list, flat.node.labelTimestamp) : undefined;
 	const sig = `${depth}|${open}|${active}|${label ?? ""}|${stamp ?? ""}|${themeId}`;
 	const cached = treeItemCache.get(flat);
@@ -1298,7 +1303,7 @@ const treePreviews = new WeakMap<object, { sig: string; nodes: NativeChild[] }>(
 function treePreview(list: Any, flat: TreeFlatNode | undefined): NativeChild[] {
 	if (!flat) return [];
 	const entry = flat.node.entry;
-	const label = typeof flat.node.label === "string" ? flat.node.label : "";
+	const label = typeof flat.node.label === "string" ? oneLine(flat.node.label) : "";
 	const active = list.activePathIds instanceof Set && list.activePathIds.has(entry.id);
 	const leaf = entry.id === list.currentLeafId;
 	const sig = `${label}|${active}|${leaf}`;

@@ -7,8 +7,12 @@
  *
  *     ESC _ tsp ; <verb> [; <key>=<value>]* ; <body> ESC \
  *
- * Program → terminal verbs: `q` query, `o` open, `f` frame, `b` blob, `t`
- * palette, `x` close. Terminal → program: `r` reply, `e` event.
+ * Program → terminal verbs: `q` query, `o` open, `f` frame, `b` blob, `x`
+ * close. Terminal → program: `r` reply, `e` event.
+ *
+ * `t` (theme palette) is a local extension, not upstream protocol: omp removed
+ * the verb in 1513e856d5. rsttyd still applies it and says so with the hello
+ * feature `program-palette`; the backend sends it to such a terminal only.
  */
 
 export const TSP_VERSION = 1;
@@ -16,6 +20,7 @@ export const TSP_APC_ID = "tsp";
 export const TSP_DEFAULT_APC_LIMIT = 65_536;
 export const TSP_DEFAULT_CREDITS = 2;
 
+/** `t` is the local palette extension (see the file header); the rest is omp's protocol. */
 export type TspVerb = "q" | "o" | "f" | "b" | "t" | "x" | "r" | "e";
 
 export const TSP_KINDS = [
@@ -36,6 +41,7 @@ export const TSP_KINDS = [
 	"kv",
 	"table",
 	"tree",
+	"json",
 	"badge",
 	"kbd",
 	"icon",
@@ -49,6 +55,7 @@ export const TSP_KINDS = [
 	"tabs",
 	"editor",
 	"input",
+	"button",
 	"status",
 	"seg",
 	"overlay",
@@ -62,6 +69,7 @@ export const TSP_KINDS = [
 	"chart",
 	"meter",
 	"effort",
+	"shell",
 ] as const;
 
 export type TspKind = (typeof TSP_KINDS)[number];
@@ -82,6 +90,12 @@ export type TspPreview = { lines: number } | "auto";
 /** A `tool` node's body clamp while collapsed: head lines, tail lines (shell output), none, or the children's own previews. */
 export type TspToolPreview = { lines: number } | { tail: number } | "none" | "children";
 
+/**
+ * One entry of `actions.menu` or `actions.hold`: an action name (labeled from it), `"-"` a separator, a dim
+ * `{ header }`, or a row running action `id`, with its `label`, `icon` and `detail`.
+ */
+export type TspMenuEntry = string | { header: string } | { id: string; label?: string; icon?: string; detail?: string; disabled?: boolean | string; danger?: boolean };
+
 /** Props every node accepts, plus the kind-specific ones this extension uses (loosely typed). */
 export interface TspProps {
 	role?: string;
@@ -92,7 +106,8 @@ export interface TspProps {
 	title?: string;
 	aria?: string;
 	href?: string;
-	actions?: { click?: string; dblclick?: string; menu?: readonly string[] };
+	/** What a pointer does: `menu` is the right-click menu, `hold` the long-press menu on a touch screen (a desktop ignores it). */
+	actions?: { click?: string; dblclick?: string; menu?: readonly TspMenuEntry[]; hold?: readonly TspMenuEntry[] };
 	// col/row
 	gap?: TspSpace;
 	align?: string;
@@ -200,6 +215,7 @@ export interface TspClose {
 	keep: boolean;
 }
 
+/** Body of the local `t` verb (sent only to a terminal with the `program-palette` feature; not in omp's protocol any more). */
 export interface TspPalette {
 	sf: string;
 	dark?: Readonly<Record<string, string>>;

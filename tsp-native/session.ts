@@ -1,8 +1,9 @@
 /**
  * The TSP native session: detection, the hello/DA1 probe, the stdin
  * reassembly shim, the prototype patches that swap pi's row renderer for the
- * native backend, the erase/alt-screen bookkeeping around the switch, and the
- * ANSI fallback. One instance per loaded extension; the process-wide registry
+ * native backend, the erase/alt-screen bookkeeping around the switch, the
+ * DA1 sentinel that holds pi's exit drain open until in-flight acks are in,
+ * and the ANSI fallback. One instance per loaded extension; the process-wide registry
  * on `globalThis` holds the installed trampolines so `/reload` can hand a live
  * surface from the old instance to the new one.
  */
@@ -78,10 +79,15 @@ export function detect(env: NodeJS.ProcessEnv = process.env): Detection {
 
 // ── Registry (process-wide trampolines) ──────────────────────────────────
 
+/** pi-tui's `Terminal.drainInput`. */
+type DrainInput = (this: Any, maxMs?: number, idleMs?: number) => Promise<void>;
+
 interface Hooks {
 	render(tui: Any): boolean;
 	stop(tui: Any, options: Any): void;
 	input(buffer: Any, data: string): string;
+	/** Stands in for `terminal.drainInput` (pi awaits it before stopping at exit); `original` is the terminal's own. */
+	drain(terminal: Any, original: DrainInput, maxMs: number | undefined, idleMs: number | undefined): Promise<void>;
 }
 
 interface Patched {
@@ -90,6 +96,8 @@ interface Patched {
 	baseProto: Any;
 	baseStop: (this: Any, options?: Any) => void;
 	stdinProcess: (this: Any, data: unknown) => void;
+	/** The terminal instance whose `drainInput` is wrapped (see {@link wrapDrainInput}); absent until a session binds one. */
+	drain?: { terminal: Any; original: DrainInput; wrapper: DrainInput; own: boolean };
 }
 
 /** What a successor needs from an unloaded instance (duck-typed: the class comes from the old module). */
@@ -184,7 +192,45 @@ export function uninstallPatches(): void {
 	(TuiAltScreen.prototype as Any).doRender = p.altRender;
 	p.baseProto.stop = p.baseStop;
 	(StdinBuffer.prototype as Any).process = p.stdinProcess;
+	if (p.drain && p.drain.terminal.drainInput === p.drain.wrapper) {
+		if (p.drain.own) p.drain.terminal.drainInput = p.drain.original;
+		else delete p.drain.terminal.drainInput;
+	}
 	reg.patched = null;
+}
+
+/**
+ * Wrap `terminal.drainInput` with a trampoline to `registry().active` (as the prototype patches are), once per
+ * terminal instance: the wrapper lives in the registry, so a reloaded instance reuses it and `uninstallPatches`
+ * restores the terminal's own. Called wherever a session binds its terminal.
+ */
+function wrapDrainInput(terminal: Any | null): void {
+	const reg = registry();
+	const patched = reg.patched;
+	if (!patched || !terminal || typeof terminal.drainInput !== "function") return;
+	if (patched.drain) {
+		if (patched.drain.terminal === terminal && terminal.drainInput === patched.drain.wrapper) return;
+		// Another terminal (or a wrapper someone replaced): give the old one its own back first.
+		if (patched.drain.terminal.drainInput === patched.drain.wrapper) {
+			if (patched.drain.own) patched.drain.terminal.drainInput = patched.drain.original;
+			else delete patched.drain.terminal.drainInput;
+		}
+		patched.drain = undefined;
+	}
+	const original: DrainInput = terminal.drainInput;
+	const own = Object.hasOwn(terminal, "drainInput");
+	const wrapper: DrainInput = function (this: Any, maxMs?: number, idleMs?: number): Promise<void> {
+		const h = reg.active;
+		// Hooks of an instance loaded before this patch existed have no `drain`.
+		if (h && typeof h.drain === "function") return h.drain(this, original, maxMs, idleMs);
+		return original.call(this, maxMs, idleMs);
+	};
+	terminal.drainInput = wrapper;
+	patched.drain = { terminal, original, wrapper, own };
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ── Session ─────────────────────────────────────────────────────────────
@@ -249,6 +295,7 @@ export class TspSession {
 				}
 			},
 			stop: (tui, options) => this.#onStop(tui, options),
+			drain: (terminal, original, maxMs, idleMs) => this.#onDrain(terminal, original, maxMs, idleMs),
 			input: (_buffer, data) => {
 				try {
 					return this.#input.filter(data);
@@ -320,6 +367,7 @@ export class TspSession {
 		const handed = previous.surrender();
 		this.#surfaceCounter = handed.surfaceCounter;
 		this.activate();
+		wrapDrainInput(this.terminal);
 		if (handed.backend && handed.seq > 0 && this.hello) {
 			this.backend = new NativeBackend(this.#host(), this.hello, handed.backend.surfaceId, { mirror: !!process.env.PI_TSP_MIRROR });
 			this.state = "live";
@@ -462,6 +510,7 @@ export class TspSession {
 			const first = this.tui === null;
 			this.tui = tui;
 			this.terminal = tui.terminal;
+			wrapDrainInput(this.terminal);
 			if (first) {
 				const reg = registry();
 				if (reg.orphan && (reg.orphan.session as unknown) !== this) {
@@ -505,6 +554,53 @@ export class TspSession {
 			this.log("surface closed on TUI stop; will re-probe on the next render");
 		} else if (this.state === "probing") {
 			this.state = "ansi";
+		}
+	}
+
+	/**
+	 * pi's quit awaits `terminal.drainInput()` and then stops reading; pi-tui's returns after 50 ms without input.
+	 * A frame sent shortly before may be acknowledged later than that (rsttyd acks from the browser, so over the
+	 * network; rmux, SSH), and the `ack` would be typed into the shell. While the surface is live, a DA1 query is
+	 * written first: the terminal answers it after everything it sent before reading it, so draining until the
+	 * input shim sees that reply (and input has gone idle after it) takes the in-flight messages in. Bounded by
+	 * `maxMs`, as pi's drain is. A terminal without a live surface is not queried: its DA1 reply could itself leak.
+	 * The synchronous `ui.stop()` paths (external editor, suspend) cannot wait and are not covered (omp
+	 * `terminal.ts` `drainInput`, f94a57db67).
+	 */
+	async #onDrain(terminal: Any, original: DrainInput, maxMs: number | undefined, idleMs: number | undefined): Promise<void> {
+		// A terminal that isn't reading input can't hand us the reply (as in `#reprobe`).
+		const reading = !("inputHandler" in terminal) || terminal.inputHandler !== undefined;
+		const backend = this.backend;
+		if (this.#closed || terminal !== this.terminal || this.state !== "live" || !backend?.live || !reading) return original.call(terminal, maxMs, idleMs);
+		const startedAt = Date.now();
+		const endTime = startedAt + (maxMs ?? 1000);
+		const idle = idleMs ?? 50;
+		const sentinel = { answered: false };
+		this.#input.drainSentinel = () => {
+			sentinel.answered = true;
+		};
+		try {
+			terminal.write("\x1b[c");
+		} catch (error) {
+			this.#input.drainSentinel = undefined;
+			this.log(`exit drain: could not write the DA1 sentinel: ${String(error)}`);
+			return original.call(terminal, maxMs, idleMs);
+		}
+		this.log("exit drain: DA1 sentinel sent", { unacked: backend.stats().unacked });
+		try {
+			for (;;) {
+				const before = Date.now();
+				// pi's own drain (it also takes the input handler away): returns once input has been idle, or at the deadline.
+				await original.call(terminal, Math.max(0, endTime - before), idle);
+				if (sentinel.answered) break;
+				const now = Date.now();
+				if (now >= endTime) break;
+				// The reply is still out: drain again. A terminal whose drain returns at once must not spin.
+				if (now === before) await sleep(Math.min(Math.max(1, idle), endTime - now));
+			}
+		} finally {
+			this.#input.drainSentinel = undefined;
+			this.log(sentinel.answered ? "exit drain: DA1 sentinel answered" : "exit drain: no DA1 reply before the deadline", { ms: Date.now() - startedAt });
 		}
 	}
 
@@ -1015,7 +1111,7 @@ const DA1_PREFIX = /\x1b(\[(\?[\d;]*)?)?$/;
 /**
  * Sits in front of pi's StdinBuffer: reassembles `ESC _ tsp;… ESC \` messages
  * across chunks (so a split reply never reaches the editor as keys), and
- * swallows the DA1 sentinel while a probe is pending.
+ * swallows the DA1 sentinel while a probe or an exit drain is pending.
  */
 export class InputShim {
 	#session: TspSession;
@@ -1023,6 +1119,8 @@ export class InputShim {
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#pendingSince = 0;
 	probing = false;
+	/** Set while an exit drain waits for its DA1 sentinel (`TspSession` `#onDrain`): called once, on the reply. */
+	drainSentinel: (() => void) | undefined;
 
 	constructor(session: TspSession) {
 		this.#session = session;
@@ -1032,6 +1130,14 @@ export class InputShim {
 		if (this.#timer) clearTimeout(this.#timer);
 		this.#timer = undefined;
 		this.#pending = "";
+		this.#answerDrain();
+	}
+
+	/** Release a pending exit drain (its sentinel answered, or the shim is going away). */
+	#answerDrain(): void {
+		const answered = this.drainSentinel;
+		this.drainSentinel = undefined;
+		answered?.();
 	}
 
 	/** Returns the bytes pi should see; TSP messages and the sentinel are consumed. */
@@ -1046,7 +1152,7 @@ export class InputShim {
 		for (;;) {
 			const start = buf.indexOf(TSP_PREFIX);
 			if (start === -1) {
-				// A tail that could begin a TSP message (or the DA1 sentinel while probing) waits for the next chunk.
+				// A tail that could begin a TSP message (or the DA1 sentinel's reply while one is out) waits for the next chunk.
 				const hold = this.#partialTail(buf);
 				out += buf.slice(0, buf.length - hold.length);
 				this.#pending = hold;
@@ -1073,7 +1179,7 @@ export class InputShim {
 			buf = buf.slice(esc + 2);
 			this.#session.onTspMessage(message);
 		}
-		if (this.probing && out.length > 0) out = this.#consumeSentinel(out);
+		if ((this.probing || this.drainSentinel) && out.length > 0) out = this.#consumeSentinel(out);
 		if (this.#pending.length > 0) {
 			const headComplete = this.#pending.startsWith(TSP_PREFIX);
 			if (!headComplete) this.#pendingSince = Date.now();
@@ -1089,14 +1195,17 @@ export class InputShim {
 		for (let n = max; n > 0; n--) {
 			if (TSP_PREFIX.startsWith(buf.slice(buf.length - n))) return buf.slice(buf.length - n);
 		}
-		if (this.probing) {
+		if (this.probing || this.drainSentinel) {
 			const m = DA1_PREFIX.exec(buf);
 			if (m && m[0].length < 12) return m[0];
 		}
 		return "";
 	}
 
-	/** While a probe is pending, the first DA1 reply pi isn't waiting for itself resolves it negatively. */
+	/**
+	 * While a sentinel is out, the first DA1 reply pi isn't waiting for itself is its answer: a pending probe
+	 * resolves negatively, a pending exit drain is released.
+	 */
 	#consumeSentinel(out: string): string {
 		const terminal = this.#session.terminal as Any | null;
 		const tui = this.#session.tui as Any | null;
@@ -1113,7 +1222,8 @@ export class InputShim {
 				at = index + match[0].length;
 				continue;
 			}
-			this.#session.onDa1Sentinel();
+			if (this.probing) this.#session.onDa1Sentinel();
+			else this.#answerDrain();
 			return out.slice(0, index) + out.slice(index + match[0].length);
 		}
 	}

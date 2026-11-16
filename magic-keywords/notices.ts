@@ -20,6 +20,10 @@ export function orchestrateNotice(tools: readonly string[]): string | undefined 
 	const editTools = ["edit", "write"].filter(has).map(code).join("/");
 	const verifyParts = [has("bash") && "project checks, tests", has("lsp") && "`lsp diagnostics`"].filter(Boolean);
 	const verify = verifyParts.join(", ");
+	// Per-phase gate is targeted; the full gates are rerun in workflow step 7.
+	const phaseVerify = [has("bash") && "project checks, targeted tests", has("lsp") && "`lsp diagnostics` on changed files"]
+		.filter(Boolean)
+		.join(", ");
 	const todo = has("todo");
 	const waitHint = has("irc") ? " Blocked with nothing else to do? Use `irc` op `wait`." : "";
 	const steerHint = has("irc") ? ` Steer running subagents with \`irc\` op \`send\` instead of respawning them.` : "";
@@ -47,7 +51,7 @@ Decompose, dispatch, verify, iterate. Substantial or parallelizable work: ${T} s
 2. Before dispatch, enumerate the full surface. Expand referenced audits, plans, checklists, phase lists, and file lists into flat${todo ? " `todo`" : ""} items. "Most"/"important" items is failure. Re-read source documents; NEVER work from memory.
 3. Parallelize maximally; NEVER launch one-off ${T}. Disjoint-scope edits MUST be dispatched together in one ${T} call via \`tasks[]\`. Divisible work: split and dispatch together, never serially. Before exactly one subagent: find parallel work and dispatch it, or make the small change inline. Serialize only when a produced contract—types, schema, shared module—is consumed next; state the dependency.
 4. Every task self-contained; subagents share no context. Specify ≤3–5 explicit target paths (no globs), change APIs/patterns, edge cases, observable acceptance criteria. NEVER assume a shared plan. Never give two concurrent subagents edits to the same files.
-5. Verify each phase before the next${verify ? `: ${verify} on changed files` : ""}. Breakage: dispatch fix-up subagents, then re-verify before advancing. NEVER declare a red tree done.
+5. Verify each phase before the next${phaseVerify ? `: ${phaseVerify}` : ""}. Breakage: dispatch fix-up subagents, then re-verify before advancing. NEVER declare a red tree done.
 6. Commit only if requested or repo workflow expects it: after each green phase, focused phase-naming message. NEVER commit red trees or unrequested work.
 7. Incomplete/wrong subagent work: spawn a corrective subagent (or message the idle one) specifying the gap; NEVER silently fix it inline.
 8. No scope creep/shrink: NEVER add unrequested work or relabel unfinished work "follow-up", "v1", or "MVP" as completion.

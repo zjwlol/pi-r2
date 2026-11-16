@@ -1,7 +1,9 @@
 /**
  * ANSI-styled pi text → TSP spans. pi paints with theme tokens (`theme.fg("accent", …)`),
  * so the exact SGR prefix each token produces maps back to the token name, which
- * Tern resolves through the palette we sent. Bold/italic/dim/underline become the
+ * the terminal resolves through the palette we sent (verb `t`, a local extension sent
+ * only to a `program-palette` terminal such as rsttyd) or, without one (omp retired
+ * the verb in 1513e856d5), through its own theme. Bold/italic/dim/underline become the
  * semantic `strong`/`em`/`dim`/`link` styles. Unknown colors keep their text unstyled.
  */
 import type { TspSpan } from "./wire.ts";

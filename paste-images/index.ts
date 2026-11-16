@@ -9,6 +9,13 @@
  * submit every token's file is attached to the user message as image content
  * (the marker stays in the text). Deleting a token drops its image.
  *
+ * The model is also told where each attached image lives: a prompt that
+ * starts a run is followed by one hidden custom message (`display: false`,
+ * type "paste-images.source") naming the source path of every `[Image #N]`
+ * whose file still exists, so file tools can act on the file itself. A
+ * steer / follow-up queued while the agent runs carries no such notice
+ * (`before_agent_start` doesn't fire for it).
+ *
  * Tokenising watches the editor text: a 150 ms poll (unref'd) plus a check
  * right after each raw terminal input, so it covers ANSI pastes and TSP
  * native edits (which never pass through terminal input) alike. Only paths
@@ -27,8 +34,10 @@
  * which shows them inside its chat bar; while it does, the widget describes
  * as a hidden col.
  */
+import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
+import { existsSync } from "node:fs";
 import { type ComposerAttachmentProvider, composerAttachments, setComposerAttachments } from "../shared/composer-slots.ts";
 import { type DescribeCx, ImageBand } from "./band.ts";
 import { Draft } from "./draft.ts";
@@ -37,6 +46,17 @@ const WIDGET = "paste-images";
 /** This extension's key among the composer's attachment providers. */
 const SLOT = "paste-images";
 const POLL_MS = 150;
+/** customType of the hidden message that names the attached images' source paths. */
+const SOURCE_NOTICE = "paste-images.source";
+
+/** What the model is told about attached image `[Image #n]`: the file behind it. */
+function sourceNotice(n: number, path: string): string {
+	return [
+		`The user attached an image as \`[Image #${n}]\` in their visible message.`,
+		`Source path: \`${path}\``,
+		`The attached image is stored in this file on disk. Use the source path directly with file tools (for example \`read ${path}\`) when you need the file itself — to inspect, copy, or upload it.`,
+	].join("\n\n");
+}
 
 /** The parts of pi-tui's Editor (private members included) a rewrite touches. Duck-typed: MagicEditor etc. qualify. */
 interface EditorLike {
@@ -119,6 +139,13 @@ export default function (pi: ExtensionAPI) {
 	let checkQueued = false;
 	/** The last non-empty editor text seen: what a submitted prompt is compared with (the editor is cleared by then). */
 	let lastSeen = "";
+	/**
+	 * Source notices of submitted prompts, by the image content each is about,
+	 * until the run that prompt starts takes them. Keyed by the very object
+	 * handed to pi, so a prompt that never starts a run (no model, queued
+	 * behind another) can't pass its notices to a later one.
+	 */
+	let pendingNotices = new WeakMap<ImageContent, string>();
 
 	const editorText = (): string | undefined => {
 		try {
@@ -197,6 +224,7 @@ export default function (pi: ExtensionAPI) {
 		if (composerAttachments().includes(provider)) setComposerAttachments(SLOT, undefined);
 		draft.reset();
 		lastSeen = "";
+		pendingNotices = new WeakMap();
 		band?.dispose();
 		if (band && ui) {
 			try {
@@ -263,8 +291,30 @@ export default function (pi: ExtensionAPI) {
 			const count = plan.withheld.length;
 			ctx.ui.notify(`paste-images: ${model} has no image input; sent ${count} image path${count > 1 ? "s" : ""} as text`, "warning");
 		}
+		// A steer / follow-up is queued into the running agent: no before_agent_start will deliver a notice for it.
+		if (!event.streamingBehavior) {
+			plan.attached.forEach((entry, i) => {
+				const image = plan.images[i];
+				// A file deleted since it was tokenised still sends (cached bytes), but its path is stale: no notice.
+				if (image && existsSync(entry.path)) pendingNotices.set(image, sourceNotice(entry.n, entry.path));
+			});
+		}
 		if (plan.text === event.text && plan.images.length === 0) return;
 		return { action: "transform", text: plan.text, images: [...(event.images ?? []), ...plan.images] };
+	});
+
+	// The run a submitted prompt starts: tell the model the attached images' source paths.
+	pi.on("before_agent_start", async (event) => {
+		if (event.messageType !== "user" || !event.images) return;
+		const notices: string[] = [];
+		for (const image of event.images) {
+			const notice = pendingNotices.get(image);
+			if (notice === undefined) continue;
+			pendingNotices.delete(image);
+			notices.push(notice);
+		}
+		if (notices.length === 0) return;
+		return { message: { customType: SOURCE_NOTICE, content: notices.join("\n\n"), display: false } };
 	});
 }
 

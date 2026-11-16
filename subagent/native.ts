@@ -4,7 +4,8 @@
  *   - `task` / parent `irc` tools: describe hooks returning data-first tool views (head data plus a
  *     body of `agent`, `md` and `text` nodes) instead of pre-rendered rows;
  *   - one `agent` node per subagent (status, name, agent type, task, model, stats, live tool; its
- *     children are the expanded content: assignment, error, output / data, merge note, nested agents);
+ *     `hovercard` is the full assignment; its children are the expanded content: assignment, error,
+ *     output / data, merge note, nested agents);
  *   - `describe(cx)` bodies for the bottom widget and delivered `task-result` / `irc` messages.
  * The contract types are declared here (no imports from tsp-native). Everything returns undefined /
  * null unless the terminal draws `agent` nodes, which keeps tsp-native's own rendering.
@@ -16,7 +17,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { DEFAULT_AGENT } from "./agents.ts";
 import type { AgentHub, Child, ParentEvent } from "./hub.ts";
 import { activeDescendants, firstLine, isActive, PARENT_ID, subtreeActive } from "./hub.ts";
-import { type DoneInfo, fmtDuration, type MergeInfo, type SubagentSummary } from "./prompts.ts";
+import { type DoneInfo, fmtDuration, type MergeInfo, repairDoubleEncodedJsonString, type SubagentSummary } from "./prompts.ts";
 import {
 	mergeParts,
 	nestedRows,
@@ -118,6 +119,8 @@ export type IrcDetails =
 			pending?: string;
 			/** Not waiting: no running subagents. */
 			idle?: boolean;
+			/** Not waiting: results/messages already queued for the main session (labels, e.g. "result of B", "message from C"). */
+			queued?: string[];
 	  };
 
 // ---------------------------------------------------------------------------------------------
@@ -168,9 +171,9 @@ function errorText(message: string, key?: string): NativeNode {
 	return text([span(message.trim(), "error")], { wrap: "word", role: "omp.tool.error" }, key);
 }
 
-/** The shared batch context as one quiet line above the agents. */
+/** The shared batch context as one quiet line above the agents (raw call arguments: a double-encoded value is decoded). */
 function contextNode(raw: unknown): NativeNode | undefined {
-	const line = typeof raw === "string" ? flat(raw) : "";
+	const line = typeof raw === "string" ? flat(repairDoubleEncodedJsonString(raw)) : "";
 	return line ? text([span(line, "muted")], { wrap: "word", lines: 2, role: "omp.tool.context" }, "context") : undefined;
 }
 
@@ -347,7 +350,13 @@ interface AgentOptions {
 	role?: string;
 }
 
-/** One subagent as an `agent` node (omp TspAgentProps); children are its expanded content. */
+/** An agent row's hover card: the whole assignment the row only summarizes (a plain `md` node, no key). */
+function assignmentCard(full: unknown): NativeNode | undefined {
+	const source = typeof full === "string" ? full.trim() : "";
+	return source ? { k: "md", p: { text: source, role: "omp.task.assignment" } } : undefined;
+}
+
+/** One subagent as an `agent` node (omp TspAgentProps); children are its expanded content, `hovercard` its full assignment. */
 export function agentNode(row: RowSnapshot, o: AgentOptions): NativeNode {
 	const status = agentStatus(row.status);
 	const active = row.status === "running" || row.status === "pending";
@@ -377,9 +386,9 @@ export function agentNode(row: RowSnapshot, o: AgentOptions): NativeNode {
 	if (active && row.queued) badges.push({ text: "queued", tone: "pending" });
 
 	const depth = o.depth ?? 0;
+	const full = o.assignment === undefined ? row.task : o.assignment;
 	let children: NativeNode[] = [];
 	if (!o.bare) {
-		const full = o.assignment === undefined ? row.task : o.assignment;
 		const assignment = full?.trim() && flat(full) !== summary ? md(full.trim(), { role: "omp.task.assignment" }, "assignment") : undefined;
 		let output: NativeNode | undefined;
 		if (o.output !== false && !active) {
@@ -421,6 +430,8 @@ export function agentNode(row: RowSnapshot, o: AgentOptions): NativeNode {
 		collapsed: children.length > 0 ? (o.open ? false : !o.expanded) : undefined,
 	};
 	if (o.role) props.role = o.role;
+	const hovercard = assignmentCard(full);
+	if (hovercard) props.hovercard = hovercard;
 	return node("agent", props, children, row.id);
 }
 
@@ -589,16 +600,19 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 			if (item.isolated === true || item.isolated === "true") badges.push({ text: "isolated" });
 			if (schema !== undefined && schema !== null && schema !== false && schema !== "") badges.push({ text: "schema" });
 			const agent = typeof item.agent === "string" ? item.agent.trim() : "";
+			// Raw (possibly still streaming) arguments: a double-encoded assignment is shown decoded.
+			const brief = typeof item.task === "string" ? repairDoubleEncodedJsonString(item.task) : undefined;
 			return node(
 				"agent",
 				{
 					name,
 					agent: agent || undefined,
-					task: typeof item.task === "string" ? firstLine(item.task, 200) || undefined : undefined,
+					task: brief !== undefined ? firstLine(brief, 200) || undefined : undefined,
 					status: "pending",
 					model: typeof item.model === "string" ? shortModel(item.model) || undefined : undefined,
 					thinking: thinkingToken(typeof item.thinking === "string" ? item.thinking : undefined),
 					badges: badges.length > 0 ? badges : undefined,
+					hovercard: assignmentCard(brief),
 				},
 				undefined,
 				name,
@@ -611,16 +625,16 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		};
 	};
 
-	/** Full assignments from the call's args (persisted rows only carry the first line). */
+	/** Full assignments from the call's raw args, repaired (persisted rows only carry the first line). */
 	const argAssignments = (a: Record<string, any>, items: SpawnedItem[]): (string | undefined)[] => {
 		const tasks = taskItems(a);
 		const byName = new Map<string, string>();
-		for (const t of tasks) if (typeof t.name === "string" && typeof t.task === "string") byName.set(t.name.trim(), t.task);
+		for (const t of tasks) if (typeof t.name === "string" && typeof t.task === "string") byName.set(t.name.trim(), repairDoubleEncodedJsonString(t.task));
 		return items.map((item, i) => {
 			const named = byName.get(item.id);
 			if (named !== undefined) return named;
 			const t = tasks.length === items.length ? tasks[i]?.task : undefined;
-			return typeof t === "string" ? t : undefined;
+			return typeof t === "string" ? repairDoubleEncodedJsonString(t) : undefined;
 		});
 	};
 
@@ -840,6 +854,12 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 			};
 		}
 		if (typeof d.pending === "string") return { tool: ircHead(a, { note: "not waiting" }), body: [userNote("Not waiting")], inline: true };
+		if (Array.isArray(d.queued)) {
+			// Returned at once: what it would wait for is already queued for delivery.
+			const queued = d.queued.filter((x: unknown): x is string => typeof x === "string" && !!x.trim());
+			const line = queued.length ? `Already arrived: ${queued.join(", ")}; delivered right after this call.` : source.trim();
+			return { tool: ircHead(a, { note: "already arrived" }), body: line ? [noteText(line, "muted")] : undefined, inline: true };
+		}
 		if (d.idle) return { tool: ircHead(a, { note: "no running agents" }), inline: true };
 		if (interrupted) return { tool: ircHead(a, { note: "interrupted" }), body: [userNote("Interrupted")], inline: true };
 		if (d.timedOut) {

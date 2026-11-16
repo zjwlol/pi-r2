@@ -7,30 +7,32 @@ A port of oh-my-pi's `task` tool (async batch spawning, `<task-result>` delivery
 - **`task` tool**: `{ context?, tasks: [{ name?, agent?, task, model?, thinking?, cwd?, isolated?, outputSchema? }] }` (max 16 per call).
   - Every agent runs **in the background**. The tool returns the agent names right away. Each agent's final message is **delivered to the parent automatically** as a `<task-result>` message. If the parent is idle, the delivery starts a new turn. If the parent is busy, the result is injected at its next step. There is no blocking mode. To block, use `irc` op `wait`.
   - `name` is a CamelCase id of at most 32 characters. If you leave it out, one is generated in AdjNoun form (`SwiftFalcon`). Names are unique within the session, and a duplicate gets `-2`. `agent` defaults to `task`.
-  - `context` is shared background, for example `# Goal` and `# Contract`. It goes into every child's system prompt under `§ Context`. Each `task` should stand on its own, for example `# Target` / `# Change` / `# Acceptance`.
+  - `context` is shared background, for example `# Goal` and `# Contract`. It goes into every child's system prompt under `⁂ Context`. Each `task` should stand on its own, for example `# Target` / `# Change` / `# Acceptance`.
+  - `model` is an exact `provider/model-id[:level]`. A bare id (no provider) matches only a model with exactly that id. A trailing `:level` sets the agent's thinking level, unless the item also sets `thinking` (which wins). An item whose `model` does not resolve fails at spawn with a per-item error; it never runs on another model. An agent's frontmatter `model` keeps its lenient matching and falls back to the parent's model with a warning in the spawn result.
   - `cwd` defaults to the spawner's cwd; a relative `cwd` resolves against it.
   - `isolated: true` runs the agent in its own git worktree; its changes are merged back into your checkout as a patch when it finishes (see [Isolated tasks](#isolated-tasks)).
   - `outputSchema` (JSON Schema: object or JSON string) makes the agent return validated JSON through a `yield` tool (see [Structured output](#structured-output)).
-  - Per-item problems (unknown agent, invalid schema, `isolated` outside a git repo, …) are reported per item in the tool result; the other items still spawn.
-  - Common malformed calls are repaired before validation (`prepareArguments`): a flat `{ task, agent }` call, a single object or JSON string passed as `tasks`, or a top-level `agent` next to `tasks[]`.
+  - Per-item problems (unknown agent, a `model` that does not resolve, invalid schema, `isolated` outside a git repo, …) are reported per item in the tool result; the other items still spawn.
+  - Common malformed calls are repaired before validation (`prepareArguments`): a flat `{ task, agent }` call; a single object or JSON string passed as `tasks`; a top-level `agent`, `model`, `thinking`, `cwd`, `isolated` or `outputSchema` next to `tasks[]` (applied to every item that lacks its own); blank placeholders (`null`, `""`, whitespace, `[]`) in an item's `name` / `agent` / `model` / `thinking` / `cwd` (dropped, so the defaults apply); and a double-encoded `task` or `context` string (every newline and quote still backslash-escaped; decoded once).
+  - The first tool result of each spawner (the main agent, and every child that spawns) that started at least one agent also carries the `irc` lifecycle reference: `list` / `read` / `kill`, and that agents stay alive (idle) after finishing until killed or the session ends. The `task` description itself no longer repeats it.
   - At most **16 runs execute at once per nesting level** (top-level agents, their subagents). Extra spawns and wake-ups **queue** (FIFO semaphore) instead of failing. `PI_SUBAGENT_MAX_RUNNING` overrides the cap.
   - Agents whose definition has `spawns` get **their own `task` tool** (see [Nested subagents](#nested-subagents)).
 - **Result envelope** (same shape as OMP's `task-summary.md`):
   ```
   <task-result id="SwiftFalcon" agent="scout" status="completed" duration="12.3s">
-  <output>…</output>                       # or <meta …/><preview full-output="irc read SwiftFalcon">…</preview> past 5000 chars
+  <output>…</output>                       # whole output, up to 11,500 chars; longer: <meta …/><preview full-output="irc read SwiftFalcon">first 5,000 chars</preview>
                                            # structured tasks: <data>{ pretty JSON }</data> instead of <output>
   <merge-summary>…</merge-summary>          # isolated tasks only
   </task-result>
   SwiftFalcon is now idle — message it with irc op "send" (to: "SwiftFalcon") to follow up …
   ```
 - **`irc` tool (parent)**:
-  - `send`: message an agent or `all`. A running agent gets it as a **steering message at its next step**. An idle agent is **woken up**, and its reply is relayed back to you.
-  - `wait`: block for the next result or message, optionally only `from` one agent. It returns early when **you (the user) send a prompt** while it blocks (or one is already queued when it starts), saying so; the subagents keep running and their results still auto-deliver (see [Prompting while subagents work](#prompting-while-subagents-work)).
+  - `send`: message an agent or `all`. A running agent gets it as a **steering message at its next step**. An idle agent is **woken up**, and its reply is relayed back to you. `all` reaches every agent and draws no automatic replies.
+  - `wait`: block for the next result or message, optionally only `from` one agent. It returns at once when a matching result or message is already queued for the main session, or when the `from` agent is not running (nothing could reply); a wait on one agent also ends when that agent stops, and a wait without `from` ends once no agent is running any more. An unknown `from` is an error (an agent being spawned by a `task` call earlier in the same tool batch counts as known). On a timeout it lists each still-running agent with its run time, requests, cost and context fill. It returns early when **you (the user) send a prompt** while it blocks (or one is already queued when it starts), saying so; the subagents keep running and their results still auto-deliver (see [Prompting while subagents work](#prompting-while-subagents-work)).
   - `list`: show agents and their status.
   - `read`: full latest output plus recent activity.
   - `kill`: abort an agent and its subagents.
-- **`irc` tool (children)**: `send` to `parent`, a peer, or `all`; `wait`; `list`. Nested children can also address the main agent as `main`. Children that can spawn also get `read` and `kill` for their own subagents.
+- **`irc` tool (children)**: `send` to `parent` or a peer (subagents cannot send to `all`); `wait` (an unknown `from` is an error, a `from` agent that is not running returns at once, and the wait ends when that agent stops); `list`. Nested children can also address the main agent as `main`. Children that can spawn also get `read` and `kill` for their own subagents.
 - **`/irc <id|all> <message>`**: lets you (the user) message agents directly.
 - **Agent inspector** (**Ctrl+S**, Alt+A, a deliberate **←←** on an empty editor, or `/agents [id]`): oh-my-pi's Agent Hub. A live roster of every agent (nested ones under their owner) and a live transcript of any of them, where you can message (steer / wake) or kill it. See [Agent inspector](#agent-inspector). Killing an agent here also delivers an aborted `<task-result>` to whoever spawned it, because they may still be waiting on it. In dialog-only UIs (RPC), `/agents` keeps the old pick-an-agent → message / show output / kill flow.
 - **Print/JSON mode** (`pi -p`): the parent is kept alive until background agents finish, and their results are fed back to it.
@@ -49,6 +51,7 @@ A port of oh-my-pi's `task` tool (async batch spawning, `<task-result>` delivery
   - After the tool returns, the card keeps updating from live hub state (spinner, stats, current tool) until all of its agents settle.
   - Collapsed, the card shows at most 4 rows: finished rows first, live rows at the bottom, and a `… N more agents` line. Expanded (Ctrl+O), it shows every agent's assignment and an output preview.
   - Agents of the default `task` type don't get an `⟨agent⟩` badge.
+  - A succeeded agent whose worktree merge failed (conflict, files not applied, merge error) shows `⚠` instead of `✓` and is counted as `N merge failed` in the summary line, not as succeeded. The card header shows `⚠` too once every agent has settled and none failed or was aborted.
   - Nested subagents are drawn as a tree under the agent that spawned them, with the same row format. Collapsed, each level shows at most 3 (live ones last) plus `… N more agents (k done)`. An owner that is waiting on them shows `↳ waiting for N subagents`:
     ```
     ⇶ Task · 1 agent · 2 nested
@@ -63,6 +66,7 @@ A port of oh-my-pi's `task` tool (async batch spawning, `<task-result>` delivery
 - **Badges**: `[isolated]` and `{}` (structured) follow the agent badge on every row (call preview, live card, widget, delivered card). Finished isolated rows get a merge line: `↳ merged 3 files`, `↳ no changes to merge`, `↳ ⚠ merge conflict — patch: <path>`, `↳ ⚠ 2 files not applied — patch: <path>`. Expanded rows of structured tasks show a `Data` preview (pretty JSON, capped) instead of `Output`.
 - **Delivered results** are rendered as cards with the same row style, the agent's subagent tree (as it was when the agent settled), an output preview, and an expand option.
 - **Bottom widget**: lists running agents (nested ones included, under their owner) whose task card is **not on screen**, with name, stats, and current tool. It is hidden while the card itself is visible.
+- **Native terminals** (tsp-native on a TSP terminal; `native.ts`): cards, the widget and delivered results are described as `agent` nodes instead of text rows. Each node carries the agent's full assignment as its hover card.
 
 ## Agent inspector
 
@@ -72,7 +76,8 @@ A port of oh-my-pi's `task` tool (async batch spawning, `<task-result>` delivery
   - Not `pi.registerShortcut("ctrl+s")`: pi binds Ctrl+S in several selectors, so registering it prints a shortcut-conflict warning on every start.
 - **Roster** (`1 Agents` of oh-my-pi): `Roster · By parent / Flat`, status counts, and usage totals; one entry per agent in render.ts row format (status, ⟨agent⟩, badges, model, stats, duration), its task, and its current activity. `t` toggles grouping by parent (tree rails under the owner's status icon) and a flat status-ordered list (`↳ owner` tags). On terminals ≥ 96 columns a detail pane shows the selected agent: state, model, task, current tool, error, usage, lineage (spawner, subagents, worktree, last merge) and recent activity; `Tab` toggles it on narrow terminals, PgUp/PgDn scroll it.
   - Keys: `j`/`k`/↑/↓ select, Enter (or →) open the transcript, `/` fuzzy filter (Enter keeps it, Esc clears), `x` kill, `t` view, Esc close (clears the filter / details first), **←←** close (a single ← right after the ←← that opened it closes it again, as with oh-my-pi's `armCloseTap`), Ctrl+S / Alt+A close.
-- **Transcript**: the agent's conversation, live, drawn with pi's own `UserMessageComponent`, `AssistantMessageComponent` (streaming too), `ToolExecutionComponent` (the session's tool renderers) and `CustomMessageComponent`, plus a message input. Enter sends as the user (`hub.send` from `user`): a running agent reads it at its next step, an idle one is woken and its reply lands in the main transcript. It follows the bottom; with an empty input `j`/`k`/↑/↓, Shift+↑/↓, PgUp/PgDn, `g`/`G` (Home/End) scroll (as in oh-my-pi, once you type, the input owns every key). Ctrl+O expands tool output, Ctrl+T hides thinking, **Ctrl+X twice** kills the agent (the view stays, read-only), Esc (clearing the input first) or **←←** goes back to the roster, Ctrl+S closes everything.
+- **Transcript**: the agent's conversation, live, drawn with pi's own `UserMessageComponent`, `AssistantMessageComponent` (streaming too), `ToolExecutionComponent` (the session's tool renderers) and `CustomMessageComponent`, plus a message input. A message that reached the agent over `irc` (a steer, a wake, a continuation) is drawn as an IRC card (`✉ irc from → agent` over the body: the first 6 lines, or all of it as Markdown with Ctrl+O), not as the `<irc from="…">` envelope the model reads. Enter sends as the user (`hub.send` from `user`): a running agent reads it at its next step, an idle one is woken and its reply lands in the main transcript. It follows the bottom; with an empty input `j`/`k`/↑/↓, Shift+↑/↓, PgUp/PgDn, `g`/`G` (Home/End) scroll (as in oh-my-pi, once you type, the input owns every key). Ctrl+O expands tool output, Ctrl+T hides thinking, **Ctrl+X twice** kills the agent (the view stays, read-only), Esc (clearing the input first) or **←←** goes back to the roster, Ctrl+S closes everything.
+- **Native** (tsp-native): the roster is a `picker` sheet and the transcript an overlay of the same components (IRC cards as `omp.irc.message` nodes). While agents run, roster rows age in one-second steps, so a rebuild within the same second (a selection move, a filter keystroke, a notice) leaves unchanged rows identical and they are not sent to the terminal again.
 - **Not replicated**: oh-my-pi's Enter *focuses the main view* on the subagent's session (its chat replaces the main one until ←← / Esc) — vanilla pi has one session view, so the in-hub transcript viewer (oh-my-pi's fallback for collab guests) is used instead. Also missing: the `2 Activity` section (a time-ordered log across agents; the hub keeps no timestamped event log), `r` revive (agents here are never parked; killed ones are gone, so `r` only explains that), mouse hover/click/wheel, the per-agent unread IRC count (an `⧉ N` badge shows queued inbox items instead), role badges, and persisted agents from earlier sessions (the hub only knows live agents).
 
 ## Prompting while subagents work
@@ -95,6 +100,7 @@ have ^us.anthropic.claude-haiku-4-5 map the auth code, then fix it yourself
 
 - The popup lists **models only**: the session's scoped models if `/scoped-models` is set, else all available ones. Models you recently picked with `^` or used in the main session come first, newest first, with "5m ago" (picks are saved on send to `~/.pi/agent/model-mention-history.json`; main-session use comes from remember-model's `model-history.json`), and typing filters. Tab or Enter inserts `^<model-id> `; ids that exist under several providers are inserted as `^provider/id`.
 - A tag always stands for a subagent of the **default agent type** (`task`) running on that model. The main agent still writes its task: on send, a hidden notice tells it to give the work you assigned to each tag its own `tasks[]` item with `model` set to that exact `provider/id`.
+- `^model:level` (for example `^us.anthropic.claude-haiku-4-5:high`) also pins that subagent's thinking level: the notice then lists `thinking` for the tag. Levels are `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; an unambiguous abbreviation of two or more characters works (`:hi`). A model id that itself contains a colon still matches as a whole. A suffix that is not a level the model supports (`:off` included) leaves the whole tag as plain text: no notice is sent for it. The popup does not list levels; type the suffix.
 - Your message text stays as typed. Tags inside `code`, fenced blocks or XML, mid-word (`x^2`), unknown models, and bash-mode (`!…`) prompts are ignored.
 - Typing while the agent is busy works too (the notice rides along with the steer or follow-up).
 - Code: `mentions.ts`. It uses pi's public `addAutocompleteProvider` (trigger character `^`), so it works with any editor, including the magic-keywords one.
@@ -103,13 +109,18 @@ have ^us.anthropic.claude-haiku-4-5 map the auth code, then fix it yourself
 
 | Recipient state | Delivery |
 |---|---|
-| Blocked in `irc wait` | The message is returned from that wait directly (the main agent's wait also returns when the user submits a prompt) |
-| Mid-run | `session.steer()` injects it after the current tool calls, before the next model call |
+| Blocked in `irc wait` | The message is returned from that wait directly (the main agent's wait also returns when the user submits a prompt). A broadcast leg never ends a wait; it is delivered after the wait returned |
+| Mid-run | From its owner, the main agent, the user or one of its own subagents (results included): `session.steer()` injects it after the current tool calls, before the next model call, also when the run was about to end. From anyone else (a peer message, any broadcast leg, a notice): held, then injected at the next tool step (a held peer message or notice is also returned by the agent's next `irc wait`). If the agent is finishing instead, the message gets a turn of its own after the run's result has settled, so it never replaces or joins that result |
 | Queued / starting / between steps | Queued, then folded into its next prompt |
-| Idle (finished) | Woken with a new turn. Its final text goes back to the sender, unless it already replied with `irc` during that turn |
+| Idle (finished) | Woken with a new turn. Its final text goes back to the sender, unless it already replied with `irc` during that turn (a failed turn always reports). Nothing is relayed for a broadcast leg or for a relayed reply |
 | `parent` | `pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" })` |
 
 Sending never waits for the recipient to reply. A nested subagent's `<task-result>` reaches its owner by the same rules (it resolves the owner's `irc wait`, is steered in while the owner runs, or queues), except that nothing is relayed back to the subagent.
+
+- **Broadcast**: only the main agent and the user (`/irc all`) can send to `all`; a subagent's `send` to `all` is an error. A broadcast is one leg per live agent. A leg draws no automatic reply and never ends the recipient's `irc wait`. (The user's `/irc all` keeps the reply relay: those replies only show in the transcript.)
+- **Relayed replies**: the relayed reply of a wake turn is an answer, never a wake source. An idle agent woken by one relays nothing back, so two idle agents cannot ping-pong.
+- **Failed or killed wake turns**: if a wake turn fails, or the agent is killed before it replied, whoever woke it is told (a kill does not notify the killer itself).
+- **Escaping**: message bodies are escaped inside the `<irc>` envelope, so agent-written text cannot close it or forge another sender.
 
 ## Nested subagents
 
@@ -118,7 +129,7 @@ Sending never waits for the recipient to reply. A nested subagent's `<task-resul
 - **Ids** are unique across the whole tree. The main agent can `irc send` / `read` / `kill` any agent directly. A nested agent woken by the main agent replies to `main`.
 - **Results go to the owner**: a nested agent's `<task-result>` is delivered to the agent that spawned it, never to the main session. It resolves the owner's pending `irc wait` (a result that already arrived while the owner was busy makes `wait` return right away), is injected at the owner's next step while it runs, or queues.
 - **Owners settle last**: if an owner ends its turn while any of its subagents are still active, it doesn't settle. It pauses (`waiting for N subagents`) until the next result or message arrives, then continues with it. Its own result goes up (to the main agent, or to its owner) only once all its subagents have settled and nothing is queued, so the main agent never gets a result from an agent whose subagents are still working. The same applies when an idle owner is woken by a message: its reply is relayed only once none of its subagents is active. Messages that arrive while an owner is paused are handled like messages arriving mid-run (the owner continues with them; no automatic reply relay).
-- **Addressing**: for a nested agent, `parent` is the agent that spawned it, and `main` is the main agent (for top-level agents, `parent` is the main agent, as before). Rosters (`irc list`, the `§ Coop` peer list) show siblings and own subagents, and `all` broadcasts to that roster plus `parent`. The main agent's `irc list` shows the whole tree, indented, and its (or the user's) `all` reaches every agent in the tree.
+- **Addressing**: for a nested agent, `parent` is the agent that spawned it, and `main` is the main agent (for top-level agents, `parent` is the main agent, as before). Rosters (`irc list`, the `⁂ Coop` peer list) show siblings and own subagents. Subagents cannot send to `all`: only the main agent and the user broadcast, and their `all` reaches every agent in the tree. The main agent's `irc list` shows the whole tree, indented.
 - **Kill cascades**: killing an agent first kills its whole subtree. Killing a nested agent (from the main agent or `/agents`) delivers an aborted `<task-result>` to its owner, so the owner doesn't wait forever. An owner killing its own subagent with `irc kill` gets no notification.
 - **Concurrency**: each nesting level has its own pool of `MAX_RUNNING` permits. With one shared pool, owners holding every permit while waiting on queued subagents would deadlock. With per-level pools, the deepest level never waits on anything below it, so it always makes progress, and so does every level above it. An owner also gives up its permit while it is paused waiting for its subagents, and takes one again before it continues.
 
@@ -127,12 +138,13 @@ Sending never waits for the recipient to reply. A nested subagent's `<task-resul
 `isolated: true` (or `isolated: true` in the agent's frontmatter; the item value wins) gives the agent its own **git worktree**:
 
 - **At spawn** the item's `cwd` must be inside a git work tree, else the item fails with a per-item error.
-- **Before it starts** a detached worktree is created in a private temp directory (isolation.ts decides where) from an exact snapshot of the spawner's *current working state*: HEAD + staged + unstaged + untracked (non-ignored) files. The spawner's index, working tree, refs and stash are not touched. The agent's cwd is the same subdirectory inside the worktree, and its system prompt gets a `§ Coop` `# Working Tree` section (work only there; changes merge back automatically; never commit / push / stash / switch branches; the original checkout may change concurrently).
+- **Before it starts** a detached worktree is created in a private temp directory (isolation.ts decides where) from an exact snapshot of the spawner's *current working state*: HEAD + staged + unstaged + untracked (non-ignored) files. The spawner's index, working tree, refs and stash are not touched. The agent's cwd is the same subdirectory inside the worktree, and its system prompt gets a `⁂ Coop` `# Working Tree` section (work only there; changes merge back automatically; never commit / push / stash / switch branches; the original checkout may change concurrently).
 - **Every time a run settles** (the initial task and every later wake-up):
-  - `completed` → the changes since the last merge are applied to the spawner's **working tree** (never staged or committed), via `git apply`, falling back to a 3-way merge done in object space. Merges into one checkout are serialized.
+  - `completed` → the changes since the last merge are applied to the spawner's **working tree** (never staged or committed), via `git apply`, falling back to a 3-way merge done in object space. Merges into one checkout are serialized. Paths that start with a double quote or end in a carriage return are handled like any other.
+  - moved HEAD → if the agent moved HEAD off the task's baseline (switched, checked out or reset to another commit, amended or rebased), each file the baseline changed is judged on its own: where the worktree went back to the fork point's version (the merge base of the baseline and its HEAD, e.g. after `reset --hard`), the agent's changes are measured from the fork point, so the spawner's uncommitted work is not reverted; where it still holds the baseline's version (amend, `reset --soft` / `--mixed`), they are measured from the baseline as usual. The `<merge-summary>` says when the fork point was used. A file that cannot be attributed either way is reported as a conflict (patch saved, checkout untouched), as is a HEAD on unrelated history (no common ancestor).
   - conflict → the spawner's checkout is left untouched; the patch is saved (its path is in the summary) and the worktree is kept. The result still reports `completed`, with the conflict in `<merge-summary>`. Resolve manually: `git apply --reject <patch>` (working tree only; writes .rej files for conflicting hunks). The agent's next successful run retries with all unmerged changes.
   - `failed` / aborted run → nothing is applied; if there are changes, a patch is saved.
-  - The outcome is in the envelope's `<merge-summary>` (applied files / conflict + patch + worktree / patch saved for a failed run / "No file changes."). For a follow-up (wake) run, the summary is appended to the relayed reply; when that reply doesn't go to whoever owns the merged-into checkout (the nearest isolated ancestor, else the main agent) — e.g. the agent already answered via `irc`, it was woken by a subagent result, or the user / a peer woke it — the owner gets it as a separate notice, so a merge into a checkout is never silent. Idle or paused agents get the notice with their next run (it doesn't wake them); an unchanged conflict is not re-sent (the reply notes it is still not merged).
+  - The outcome is in the envelope's `<merge-summary>` (applied files / conflict + patch + worktree / patch saved for a failed run / "No file changes."). For a follow-up (wake) run, the summary is appended to the relayed reply; when that reply doesn't go to whoever owns the merged-into checkout (the nearest isolated ancestor, else the main agent) — e.g. the agent already answered via `irc`, it was woken by a subagent result, or the user / a peer woke it — the owner gets it as a separate notice, so a merge into a checkout is never silent. Idle or paused agents get the notice with their next run (it doesn't wake them), a running one at its next tool step (never as an extra turn of a run that is ending); an unchanged conflict is not re-sent (the reply notes it is still not merged).
 - **The worktree lives as long as the agent** (it stays idle and can be woken). When the agent is killed or the session ends, unmerged changes are saved as a patch (reported in the `irc kill` result / `/agents` notification and in the aborted `<task-result>`), then the worktree is removed. If the changes cannot be collected or saved (e.g. an unreadable file), the worktree is **kept** and the note says `changes NOT saved; worktree kept at <path>`. A merge that was still running when the agent was killed is reported the same way. `session_shutdown` then removes every other worktree this process created.
 - **Nesting**: subagents default to their owner's cwd, so a subagent of an isolated agent works inside the owner's worktree; an *isolated* subagent branches from the owner's worktree and merges back into it, and the owner's own merge then carries everything into the main checkout.
 
@@ -143,7 +155,8 @@ Limitations: submodules and nested (non-submodule) repositories are not reproduc
 `outputSchema` on an item (a JSON Schema object, a JSON string of one, or `true` for "any JSON value"), or `output:` in the agent's frontmatter as its default (`outputSchema: false` / `null` on the item disables it), makes the task **structured**:
 
 - The schema is validated at spawn; an invalid one is a per-item error (an agent with an invalid `output:` fails every item that would use it).
-- The child gets a `yield` tool (`{ data }` matching the schema, or `{ error }`), added to any `tools` allowlist, and its `§ Completion` section is replaced: the result goes through `yield`, not the final message, and the schema is shown in full. Invalid `data` is rejected with an issue list and the child retries.
+- The child gets a `yield` tool (`{ data }` matching the schema, or `{ error }`), added to any `tools` allowlist, and its `⁂ Completion` section is replaced: the result goes through `yield`, not the final message, and the schema is shown in full. Invalid `data` is rejected with an issue list and the child retries. A JSON string sent as `data` is decoded when the decoded value is valid; if it decodes but fails validation and the schema takes no string there, the rejection lists the decoded value's issues (not `expected object, got string`) and asks for the decoded value.
+- For children routed through Codex (the `openai-codex-responses` API), arrays without `items` get an explicit open `items: {}` in the `yield` tool schema, because Codex refuses itemless arrays. The meaning is the same (any item).
 - **Initial run**: a valid `yield` → the parent gets the JSON in `<data>` (and `DoneInfo.data`); `{ error }` → the task fails with that reason. A run that ends without a successful `yield` is re-prompted with a reminder up to 3 times (`MAX_YIELD_REMINDERS`), then the task fails with the reason (and the last rejection). A run that errored or was aborted fails right away, without reminders.
 - **Follow-up (wake) runs**: if the child yields during that turn, the relayed reply is the JSON; otherwise its final text, as for any agent. No reminders. Each turn needs its own `yield` (the state is reset after every settled run).
 - **Agents that spawn**: `yield` is rejected while any of the child's own subagents is still running (a subagent being killed counts until its aborted result is delivered); it must report after they settle (a `yield` made before subagent results arrived is discarded when it is resumed with them).
@@ -171,7 +184,7 @@ name: my-agent
 description: What it's for
 tools: read, grep, find, ls, bash   # optional allowlist; irc (and task, when it can spawn) is always added
 spawns: scout, planner              # optional: agents it may spawn with its own task tool ("*" = any; quote it in YAML)
-model: provider/model-id            # optional; default = parent's current model
+model: provider/model-id            # optional; default = parent's current model (also used, with a warning, when it is not found)
 thinking: low                       # optional (aliases: thinking-level, thinkingLevel); default = parent's level
 isolated: true                      # optional: run in its own git worktree by default (item `isolated` wins)
 output:                             # optional default output schema (YAML mapping or a JSON string); item `outputSchema` wins
@@ -179,17 +192,17 @@ output:                             # optional default output schema (YAML mappi
   properties: { summary: { type: string } }
   required: [summary]
 ---
-Role prompt (becomes § Role of the child system prompt)...
+Role prompt (becomes ⁂ Role of the child system prompt)...
 ```
 
-In the tool description, an agent is tagged **READ-ONLY** when its `tools` list is non-empty and only contains `read`, `grep`, `find`, or `ls`; **STRUCTURED** when it has `output:`; **ISOLATED** when it has `isolated: true`. (No bundled agent sets `output:` or `isolated:`.)
+In the tool description, an agent is tagged `(read-only, no edits)` when its `tools` list is non-empty and only contains `read`, `grep`, `find`, or `ls`; **STRUCTURED** when it has `output:`; **ISOLATED** when it has `isolated: true`. (No bundled agent sets `output:` or `isolated:`.)
 
-Each child's system prompt is pi's default prompt plus OMP's subagent sections:
+Each child's system prompt is pi's default prompt plus OMP's subagent sections (`⁂` is oh-my-pi's section marker):
 
-- `§ Role`: the agent body.
-- `§ Context`: the batch `context`.
-- `§ Coop`: its own id, the peer roster, and `irc` usage rules, plus a `# Working Tree` part for isolated agents and a `# Subagents` part for agents that can spawn.
-- `§ Completion`: "your final message is your result … NEVER end on a plan" (structured tasks: the `yield` protocol and the schema).
+- `⁂ Role`: the agent body.
+- `⁂ Context`: the batch `context`.
+- `⁂ Coop`: its own id, the peer roster, and `irc` usage rules (message a peer only with a question that blocks you or a blocker / decision report; no FYI or progress notes; never `irc wait` on a peer's or the parent's progress), plus a `# Working Tree` part for isolated agents and a `# Subagents` part for agents that can spawn.
+- `⁂ Completion`: "your final message is your result … NEVER end on a plan", and: never run builds, tests, linters, formatters or smoke runs unless the assignment says to; name the checks to run when done (structured tasks: the `yield` protocol and the schema, with the same rule).
 
 The first user message is `Complete assignment thoroughly:\n\n<task>`.
 

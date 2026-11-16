@@ -6,8 +6,8 @@
  *
  * Standalone: no imports from the rest of the extension. The hub wires it up:
  *  1. `normalizeSchema(item.outputSchema ?? agent.output)` → schema (or an error to fail fast).
- *  2. `const state = createYieldState()`; pass `createYieldTool(schema, state)` in the child's
- *     `customTools` (and add `"yield"` to any `tools` allowlist); replace the child's completion
+ *  2. `const state = createYieldState()`; pass `createYieldTool(schema, state, options?)` in the
+ *     child's `customTools` (and add `"yield"` to any `tools` allowlist); replace the child's completion
  *     section with `structuredCompletionPrompt(schema)`.
  *  3. After each run (`await session.prompt(...)`) check `state.submitted`; if false, re-prompt with
  *     `yieldReminder(schema, n)` for n = 1..MAX_YIELD_REMINDERS, then fail the task.
@@ -443,6 +443,19 @@ function unionFailure(keyword: "anyOf" | "oneOf", path: string, results: string[
 	return `${showPath(path)}: must match ${quantifier} of ${results.length} ${keyword} variants; closest is #${best + 1}: ${shown}${more}`;
 }
 
+/** Prefix of the issue `checkNode` pushes when the value's type is wrong at the root. */
+const ROOT_TYPE_MISS = `${showPath("")}: expected `;
+
+/**
+ * True when the issues of a root-level value include a root type mismatch, directly or folded into
+ * a root anyOf/oneOf line by {@link unionFailure} (no variant takes the value's type).
+ */
+function hasRootTypeMiss(issues: string[]): boolean {
+	return issues.some(
+		(i) => i.startsWith(ROOT_TYPE_MISS) || (i.startsWith(`${showPath("")}: must match `) && i.includes(`: ${ROOT_TYPE_MISS}`)),
+	);
+}
+
 function checkString(schema: Record<string, unknown>, value: string, path: string, out: string[]): void {
 	const p = showPath(path);
 	if (typeof schema.minLength === "number" || typeof schema.maxLength === "number") {
@@ -626,12 +639,14 @@ function isNonNegativeInt(v: unknown): v is number {
  * ones become `{}` with a note), `nullable` turned into a `"null"` type/branch, draft-04 boolean
  * exclusive bounds and draft-07 tuple `items` rewritten to 2020-12, `format` moved into the
  * description, invalid patterns and every keyword this validator does not implement dropped.
+ * With `openItems`, arrays that leave `items` out get an explicit `items: {}` (same meaning: any
+ * item, also the open tail after `prefixItems`) for providers that reject itemless arrays.
  * pi validates tool arguments with TypeBox against this, so it must never be stricter than
  * {@link validateAgainstSchema} and must always compile.
  */
-function toToolSchema(root: JsonSchema): Record<string, unknown> {
+function toToolSchema(root: JsonSchema, openItems = false): Record<string, unknown> {
 	try {
-		const out = sanitizeNode(root, root, [], { left: MAX_TOOL_SCHEMA_NODES });
+		const out = sanitizeNode(root, root, [], { left: MAX_TOOL_SCHEMA_NODES, openItems });
 		if (JSON.stringify(out).length <= MAX_TOOL_SCHEMA_CHARS) return out;
 	} catch {
 		// node budget exhausted (ref fan-out) or unserializable: fall back to a loose schema
@@ -643,7 +658,7 @@ function sanitizeNode(
 	node: unknown,
 	root: JsonSchema,
 	refStack: string[],
-	budget: { left: number },
+	budget: { left: number; openItems?: boolean },
 ): Record<string, unknown> {
 	if (--budget.left < 0) throw new Error("tool schema too large");
 	if (node === false) return { not: {} };
@@ -711,6 +726,14 @@ function sanitizeNode(
 		if (node.additionalItems !== undefined) out.items = sanitizeNode(node.additionalItems, root, refStack, budget);
 	} else if (node.items !== undefined) {
 		out.items = sanitizeNode(node.items, root, refStack, budget);
+	}
+	// Codex rejects a tool schema with an array that has no `items` ("array schema must define items").
+	// Omitted `items` means "any item" (also the open tail after prefixItems), so state it.
+	if (budget.openItems && out.items === undefined) {
+		const t = out.type;
+		if (t === "array" || (Array.isArray(t) && t.includes("array")) || (t === undefined && out.prefixItems !== undefined)) {
+			out.items = {};
+		}
 	}
 	for (const key of ["allOf", "anyOf", "oneOf"] as const) {
 		const list = node[key];
@@ -833,20 +856,33 @@ function interpretYieldArgs(schema: JsonSchema, raw: unknown): YieldCheck {
 		return { kind: "rejected", reason: 'yield needs either "data" (your result) or "error" (why you could not finish).', issues: [] };
 	}
 	let issues = validateAgainstSchema(schema, data);
+	let decoded = false;
 	if (issues.length > 0 && typeof data === "string") {
-		// Lossless recovery: a JSON-encoded payload string that parses to a valid value.
+		// A JSON-encoded payload string: adopt the decoded value when it is valid (lossless recovery).
 		try {
 			const parsed: unknown = JSON.parse(data);
-			if (parsed !== null && validateAgainstSchema(schema, parsed).length === 0) {
-				data = parsed;
-				issues = [];
+			if (parsed !== null) {
+				const parsedIssues = validateAgainstSchema(schema, parsed);
+				if (parsedIssues.length === 0) {
+					data = parsed;
+					issues = [];
+				} else if (hasRootTypeMiss(issues)) {
+					// The schema takes no string here, so the string was meant as the decoded value:
+					// report that value's violations, not "expected object, got string". A string the
+					// schema accepts type-wise keeps its own violations (maxLength, ...).
+					issues = parsedIssues;
+					decoded = true;
+				}
 			}
 		} catch {
-			// keep original issues
+			// not JSON: keep original issues
 		}
 	}
 	if (issues.length > 0) {
-		return { kind: "rejected", reason: '"data" does not match the output schema.', issues };
+		const reason = decoded
+			? '"data" was sent as a JSON string; decoded, it still does not match the output schema. Send "data" as the decoded value (not a JSON string) with the issues below fixed.'
+			: '"data" does not match the output schema.';
+		return { kind: "rejected", reason, issues };
 	}
 	return { kind: "data", data };
 }
@@ -875,9 +911,15 @@ Never both; never put result fields at the top level or pass "data" as a JSON st
  * data/error. Invalid data → isError result listing issues + format hint (state otherwise
  * unchanged, attempts++). Valid → state.submitted=true, short ack with terminate: true so the run
  * ends. `error` → state.submitted=true, state.error set. Calling again after success overwrites.
+ * `options.openArrayItems`: give arrays without `items` an explicit `items: {}` in the `data`
+ * parameter schema (Codex refuses itemless arrays: "array schema must define items").
  */
-export function createYieldTool(schema: JsonSchema, state: YieldState): ToolDefinition {
-	const dataSchema: Record<string, unknown> = { ...toToolSchema(schema) };
+export function createYieldTool(
+	schema: JsonSchema,
+	state: YieldState,
+	options?: { openArrayItems?: boolean },
+): ToolDefinition {
+	const dataSchema: Record<string, unknown> = { ...toToolSchema(schema, options?.openArrayItems === true) };
 	const intro = "Your final result; MUST match the output schema.";
 	dataSchema.description = typeof dataSchema.description === "string" ? `${intro} ${dataSchema.description}` : intro;
 
@@ -968,8 +1010,9 @@ export function structuredCompletionPrompt(schema: JsonSchema): string {
 	const schemaBlock = isUnconstrained(schema)
 		? "Output schema for `data`: any JSON value (no constraints). Prefer an object with clearly named fields."
 		: `Output schema for \`data\` — your \`yield\` call MUST use exactly this shape:\n${fenced(prettySchema(schema), "json")}`;
-	return `§ Completion
+	return `⁂ Completion
 No TODO tracking, no progress updates. Execute; report your result with the \`yield\` tool.
+NEVER run builds, tests, linters, formatters or smoke runs unless your assignment says to; the agent that assigned this task verifies once all subagents land. When done, name the checks to run.
 
 While work remains, you MUST continue with another tool call — investigate, edit. When the work is done, call \`yield\`:
 - Success: \`{"data": <value>}\` — \`data\` MUST match the output schema below. The schema's fields go INSIDE \`data\`, NEVER at the top level and NEVER as a stringified JSON blob.

@@ -9,10 +9,17 @@
  *   - Submit: tags standing as prose (not in code) are resolved and a hidden
  *     notice tells the main agent to spawn that work as a default-agent `task`
  *     item with `model` set. The message text stays as typed.
+ *   - Level suffix: `^model:high` also pins the subagent's thinking level (the
+ *     notice lists `thinking` for that tag). Levels are minimal|low|medium|high|
+ *     xhigh|max; an unambiguous abbreviation of two or more characters works
+ *     (`:hi`, `:me`). An exact model id wins, since some ids contain a colon
+ *     (`qwen3:8b`). A suffix that is not a level the model supports (including
+ *     `:off`), or whose full spelling is another model's id, leaves the whole
+ *     tag as plain text: no notice is sent for it.
  */
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	type AutocompleteItem,
@@ -45,6 +52,8 @@ export interface ResolvedMention {
 	/** Token as typed after `^`. */
 	token: string;
 	model: AnyModel;
+	/** Thinking level from a `:level` suffix (full name, never "off"). */
+	thinking?: string;
 }
 
 const selectorOf = (m: AnyModel) => `${m.provider}/${m.id}`;
@@ -63,7 +72,51 @@ export function resolveToken(token: string, models: readonly AnyModel[], current
 	return byId.find((m) => m.provider === current?.provider) ?? byId[0];
 }
 
-/** Tags standing as prose in `text` (never inside code or markup), one per model, in order. */
+/** Levels a `:level` suffix may name. */
+const TAG_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/** Exact level, or an unambiguous abbreviation of 2+ chars (`hi` → high). */
+function parseLevel(value: string): string | undefined {
+	if ((TAG_LEVELS as readonly string[]).includes(value)) return value;
+	if (value.length < 2) return undefined;
+	const hits = TAG_LEVELS.filter((l) => l.startsWith(value));
+	return hits.length === 1 ? hits[0] : undefined;
+}
+
+/** Levels a tag may name for this model (never "off"). */
+function tagLevels(model: AnyModel): string[] {
+	try {
+		return getSupportedThinkingLevels(model).filter((l) => l !== "off");
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Resolve a typed token with an optional `:level` suffix. Exact ids win: some
+ * contain colons (`qwen3:8b`) or end in a level name (`glm-4.7:max`). A level
+ * the model does not support, or a spelling whose full form is another model's
+ * token (`:ma` beside a literal `…:max`), stays unresolved.
+ */
+function resolveMention(
+	token: string,
+	models: readonly AnyModel[],
+	current?: AnyModel,
+): { model: AnyModel; thinking?: string } | undefined {
+	const exact = resolveToken(token, models, current);
+	if (exact) return { model: exact };
+	const colon = token.lastIndexOf(":");
+	if (colon <= 0) return undefined;
+	const base = token.slice(0, colon);
+	const model = resolveToken(base, models, current);
+	if (!model) return undefined;
+	const level = parseLevel(token.slice(colon + 1));
+	if (!level || !tagLevels(model).includes(level)) return undefined;
+	if (resolveToken(`${base}:${level}`, models, current)) return undefined;
+	return { model, thinking: level };
+}
+
+/** Tags standing as prose in `text` (never inside code or markup), one per model and level, in order. */
 export function findMentions(text: string, source: MentionSource): ResolvedMention[] {
 	if (!text.includes(MENTION_TRIGGER) || isBashInput(text)) return [];
 	const models = source.models();
@@ -73,24 +126,32 @@ export function findMentions(text: string, source: MentionSource): ResolvedMenti
 	const out: ResolvedMention[] = [];
 	for (const match of maskNonProse(text).matchAll(MENTION_RE)) {
 		const token = match[2]!;
-		const model = resolveToken(token, models, current);
-		if (!model || seen.has(selectorOf(model))) continue;
-		seen.add(selectorOf(model));
-		out.push({ token, model });
+		const r = resolveMention(token, models, current);
+		if (!r) continue;
+		const key = `${selectorOf(r.model)}${r.thinking ? `:${r.thinking}` : ""}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(r.thinking ? { token, model: r.model, thinking: r.thinking } : { token, model: r.model });
 	}
 	return out;
 }
 
 /** Hidden notice telling the main agent what each tag means for this message. */
 export function mentionNotice(mentions: readonly ResolvedMention[], defaultAgent: string): string {
-	const lines = mentions.map(
-		({ token, model }) =>
-			`- \`^${token}\` → ${displayName(model)}: a \`task\` item with \`model: "${selectorOf(model)}"\` (omit \`agent\`; default \`${defaultAgent}\`)`,
-	);
+	const lines = mentions.map(({ token, model, thinking }) => {
+		const name = thinking ? `${displayName(model)} · ${thinking}` : displayName(model);
+		const fields = thinking
+			? `\`model: "${selectorOf(model)}"\` and \`thinking: "${thinking}"\``
+			: `\`model: "${selectorOf(model)}"\``;
+		return `- \`^${token}\` → ${name}: a \`task\` item with ${fields} (omit \`agent\`; default \`${defaultAgent}\`)`;
+	});
+	const level = mentions.some((m) => m.thinking)
+		? " Where a tag lists `thinking`, the user chose that level: set it exactly as listed."
+		: "";
 	return `<system-notice id="model-mentions">
 The user tagged models with \`^\` in this message. Each tag stands for a subagent of the default agent type running on that model:
 ${lines.join("\n")}
-Give the work the user assigns to a tag to that subagent: one \`tasks[]\` item per tag, with \`model\` exactly as listed. Do not run it on another model or agent type, and do not do that work yourself.
+Give the work the user assigns to a tag to that subagent: one \`tasks[]\` item per tag, with \`model\` exactly as listed.${level} Do not run it on another model or agent type, and do not do that work yourself.
 </system-notice>`;
 }
 

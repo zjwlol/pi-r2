@@ -156,7 +156,58 @@ export function sniffMime(head: Uint8Array): string | undefined {
 	return undefined;
 }
 
-/** Read an image file: a regular file, 1 byte … {@link MAX_IMAGE_BYTES}, recognised by its magic bytes. */
+/**
+ * Whether a JPEG stream reaches its EOI marker (a file still being written,
+ * or cut mid-scan, does not: strict provider decoders reject such bytes, and
+ * one in the history fails every later request). Walks the marker structure:
+ * segments carry their length, and entropy-coded scan data is skipped by
+ * JPEG's byte-stuffing rules, so an EOI inside an embedded thumbnail isn't
+ * mistaken for the file's end. Data after the EOI (MPF, motion photos) passes.
+ */
+export function jpegStreamIsComplete(bytes: Uint8Array): boolean {
+	if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return false;
+	let offset = 2;
+	while (offset < bytes.length) {
+		if (bytes[offset] !== 0xff) return false;
+		let markOffset = offset + 1;
+		while (markOffset < bytes.length && bytes[markOffset] === 0xff) markOffset++;
+		if (markOffset >= bytes.length) return false;
+		const marker = bytes[markOffset]!;
+		if (marker === 0xd9) return true;
+		offset = markOffset + 1;
+		if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+		if (marker === 0xd8) return false;
+		if (offset + 1 >= bytes.length) return false;
+		const segmentLength = (bytes[offset]! << 8) | bytes[offset + 1]!;
+		if (segmentLength < 2) return false;
+		offset += segmentLength;
+		if (offset > bytes.length) return false;
+		if (marker === 0xda) {
+			// Entropy-coded data: 0xFF is stuffed as FF00, restart markers are
+			// standalone, and every other following byte opens the next segment.
+			while (true) {
+				const next = bytes.indexOf(0xff, offset);
+				if (next < 0) return false;
+				let scan = next + 1;
+				while (scan < bytes.length && bytes[scan] === 0xff) scan++;
+				if (scan >= bytes.length) return false;
+				const code = bytes[scan]!;
+				if (code === 0x00 || (code >= 0xd0 && code <= 0xd7)) {
+					offset = scan + 1;
+					continue;
+				}
+				offset = next;
+				break;
+			}
+		}
+	}
+	return false;
+}
+
+/**
+ * Read an image file: a regular file, 1 byte … {@link MAX_IMAGE_BYTES}, recognised by its magic bytes.
+ * A JPEG without its EOI marker (truncated, or still being written) is not one.
+ */
 export function readImage(path: string): ImageFile | undefined {
 	let fd: number | undefined;
 	try {
@@ -172,6 +223,7 @@ export function readImage(path: string): ImageFile | undefined {
 		}
 		const data = read === bytes.length ? bytes : bytes.subarray(0, read);
 		const mime = sniffMime(data);
+		if (mime === "image/jpeg" && !jpegStreamIsComplete(data)) return undefined;
 		return mime ? { path, mime, size: data.length, bytes: data } : undefined;
 	} catch {
 		return undefined;

@@ -10,6 +10,7 @@
  *     └─ ⠹ KeenLynx ⟨scout⟩ claude-opus-4-5 · 1 tool · 1 req · 3.0s
  *          ↳ grep: TODO
  *   [1 succeeded · 1 running · 2 nested · 13 req · 42.1s]
+ * A succeeded agent whose worktree merge failed draws `⚠` (row and card header) and counts as `N merge failed`.
  *
  * Everything here renders from immutable snapshots, so a component never changes its output unless
  * the owner rebuilds it (important for pi's main-screen TUI, where changing lines that scrolled
@@ -21,7 +22,14 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { DEFAULT_AGENT } from "./agents.ts";
 import { type Child, type ChildStatus, firstLine } from "./hub.ts";
-import { type DoneInfo, fmtDuration, type MergeInfo, resultOutputFallback, type SubagentSummary } from "./prompts.ts";
+import {
+	type DoneInfo,
+	fmtDuration,
+	type MergeInfo,
+	repairDoubleEncodedJsonString,
+	resultOutputFallback,
+	type SubagentSummary,
+} from "./prompts.ts";
 import { formatStructuredData } from "./structured.ts";
 
 export const COLLAPSED_AGENT_LIMIT = 4;
@@ -176,6 +184,11 @@ export function mergeParts(merge: MergeInfo | undefined): { color: "success" | "
 	}
 }
 
+/** A merge failure is a warning: the agent's work succeeded, only folding its worktree back did not. */
+export function mergeFailed(row: Pick<RowSnapshot, "status" | "merge">): boolean {
+	return row.status === "idle" && (row.merge?.status === "conflict" || row.merge?.status === "error" || row.merge?.status === "unapplied");
+}
+
 /** Merge line (+ the path on a continuation line, tail kept, when it does not fit). */
 function mergeLine(row: RowSnapshot, indent: string, theme: Theme, width: number): string[] {
 	if (row.status === "running" || row.status === "pending") return [];
@@ -275,11 +288,13 @@ function flat(text: string): string {
 	return text.replace(/\t/g, "  ").replace(/\s+/g, " ").trim();
 }
 
-/** One agent row: icon, bold Name, ⟨agent⟩, model badge, status badge, stats, duration. */
+/** One agent row: icon (`⚠` for a succeeded agent whose merge failed), bold Name, ⟨agent⟩, model badge, status badge, stats, duration. */
 export function formatRow(row: RowSnapshot, theme: Theme, width: number, frame: number, opts: { model?: boolean } = {}): string {
 	const live = row.status === "running" || row.status === "pending";
-	const nameColor = row.status === "idle" ? "text" : row.status === "failed" || row.status === "aborted" ? "error" : live ? "accent" : "muted";
-	let line = `${statusIcon(row.status, theme, frame)} ${theme.fg(nameColor, theme.bold(row.id))}`;
+	const warn = mergeFailed(row);
+	const nameColor = warn ? "accent" : row.status === "idle" ? "text" : row.status === "failed" || row.status === "aborted" ? "error" : live ? "accent" : "muted";
+	const icon = warn ? theme.fg("warning", "⚠") : statusIcon(row.status, theme, frame);
+	let line = `${icon} ${theme.fg(nameColor, theme.bold(row.id))}`;
 	line += agentBadge(row.agent, theme);
 	line += featureBadges(row, theme);
 	if (opts.model !== false) line += modelBadge(row, theme);
@@ -485,22 +500,25 @@ function orderRows(rows: RowSnapshot[]): RowSnapshot[] {
 	return [...finished, ...rest];
 }
 
-export function headerLine(count: number, state: "running" | "success" | "error" | "neutral", theme: Theme, nested = 0): string {
+export function headerLine(count: number, state: "running" | "success" | "warning" | "error" | "neutral", theme: Theme, nested = 0): string {
 	const icon =
 		state === "success"
 			? theme.fg("success", "✓")
-			: state === "error"
-				? theme.fg("error", "✗")
-				: state === "running"
-					? theme.fg("accent", "⇶")
-					: theme.fg("muted", "⇶");
+			: state === "warning"
+				? theme.fg("warning", "⚠")
+				: state === "error"
+					? theme.fg("error", "✗")
+					: state === "running"
+						? theme.fg("accent", "⇶")
+						: theme.fg("muted", "⇶");
 	let meta = count > 0 ? theme.fg("muted", `${SEP}${count} ${count === 1 ? "agent" : "agents"}`) : "";
 	if (nested > 0) meta += theme.fg("dim", `${SEP}${nested} nested`);
 	return `${icon} ${theme.fg("toolTitle", theme.bold("Task"))}${meta}`;
 }
 
 function contextLines(context: string | undefined, width: number, expanded: boolean, theme: Theme): string[] {
-	const text = context?.trim();
+	// Raw call arguments: a double-encoded context is shown decoded (as the agents receive it).
+	const text = typeof context === "string" ? repairDoubleEncodedJsonString(context).trim() : undefined;
 	if (!text) return [];
 	const lines = text.split("\n");
 	const max = expanded ? 40 : 2;
@@ -513,8 +531,10 @@ export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, exp
 	const active = s.rows.filter((r) => r.status === "running" || r.status === "pending").length;
 	const failed = s.rows.filter((r) => r.status === "failed").length;
 	const aborted = s.rows.filter((r) => r.status === "aborted").length;
-	const succeeded = s.rows.filter((r) => r.status === "idle").length;
+	const mergeFails = s.rows.filter(mergeFailed).length;
+	const succeeded = s.rows.filter((r) => r.status === "idle").length - mergeFails;
 	const detached = s.rows.every((r) => r.status === "detached");
+	const nested = s.rows.flatMap((r) => nestedRows(r));
 	const state =
 		s.rows.length === 0
 			? s.isError
@@ -526,8 +546,9 @@ export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, exp
 					? "neutral"
 					: failed + aborted > 0 || s.errors.length > 0
 						? "error"
-						: "success";
-	const nested = s.rows.flatMap((r) => nestedRows(r));
+						: mergeFails > 0 || nested.some(mergeFailed)
+							? "warning"
+							: "success";
 	const lines = [clip(headerLine(s.rows.length, state, theme, nested.length), width)];
 	lines.push(...contextLines(s.context, width, expanded, theme));
 
@@ -560,6 +581,7 @@ export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, exp
 		if (aborted) parts.push(theme.fg("error", `${aborted} aborted`));
 		if (succeeded) parts.push(theme.fg("success", `${succeeded} succeeded`));
 		if (failed) parts.push(theme.fg("error", `${failed} failed`));
+		if (mergeFails) parts.push(theme.fg("warning", `${mergeFails} merge failed`));
 		const running = s.rows.filter((r) => r.status === "running").length;
 		const queued = s.rows.filter((r) => r.status === "pending" && r.queued).length;
 		const starting = s.rows.filter((r) => r.status === "pending" && !r.queued).length;
@@ -594,7 +616,7 @@ export function buildCallLines(args: any, theme: Theme, width: number, expanded:
 		const item = items[i];
 		const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : `#${i + 1}`;
 		let line = `${bullet} ${theme.fg("accent", theme.bold(name))}`;
-		const brief = typeof item.task === "string" ? firstLine(item.task, 200) : "";
+		const brief = typeof item.task === "string" ? firstLine(repairDoubleEncodedJsonString(item.task), 200) : "";
 		if (brief) line += `${theme.fg("dim", ":")} ${theme.fg("muted", brief)}`;
 		line += agentBadge(typeof item.agent === "string" ? item.agent : undefined, theme);
 		const schema = item.outputSchema;

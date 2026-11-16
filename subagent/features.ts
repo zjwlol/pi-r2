@@ -3,7 +3,7 @@
  *
  *  outputSchema (structured.ts)
  *    spawn    schema = item.outputSchema ?? agent `output:`; invalid -> per-item error
- *    session  one YieldState + `yield` tool per child; § Completion = structuredCompletionPrompt
+ *    session  one YieldState + `yield` tool per child; ⁂ Completion = structuredCompletionPrompt
  *    settle   initial run: yielded data -> `data` (output = pretty JSON); {error} -> failed; no yield ->
  *             up to MAX_YIELD_REMINDERS reminder turns, then failed (with the last rejection). No
  *             reminders when the run itself errored/aborted. Follow-up (wake) runs: the reply relayed
@@ -31,7 +31,7 @@ import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	type AgentHub,
-	activeDescendants,
+	owedSubagents,
 	PARENT_ID,
 	type Child,
 	type ChildHooks,
@@ -246,14 +246,17 @@ async function mergeOrSave(wt: Worktree, delta: Delta, completed: boolean, st: F
 	};
 }
 
-/** `yield` that refuses while the agent's own subagents are still running (it must report after they settle). */
+/** `yield` that refuses while the agent's own subagents still owe it a result or reply (`owedSubagents`; it must report after they settle). */
 function yieldTool(child: Child, state: YieldState): ToolDefinition {
-	const tool = createYieldTool(child.schema!, state);
+	// Codex refuses tool schemas with itemless arrays; vanilla pi-ai sends ours as written.
+	const tool = createYieldTool(child.schema!, state, { openArrayItems: child.model?.api === "openai-codex-responses" });
 	const execute = tool.execute.bind(tool);
 	return {
 		...tool,
 		execute: (async (...args: Parameters<ToolDefinition["execute"]>) => {
-			const active = activeDescendants(child);
+			// Only subagents that still owe a result or reply block it: one busy with a turn of its own after
+			// its result (a held peer message, a broadcast leg) sends this agent nothing more.
+			const active = owedSubagents(child);
 			if (active.length > 0) {
 				const ids = active.map((c) => c.id).join(", ");
 				return {

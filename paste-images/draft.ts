@@ -45,6 +45,8 @@ export interface Rewrite {
 export interface SubmitPlan {
 	readonly text: string;
 	readonly images: ImageContent[];
+	/** Entries attached as image content, in the order of `images`. */
+	readonly attached: readonly DraftImage[];
 	/** Entries whose file couldn't be read: their path text was put back. */
 	readonly missing: readonly DraftImage[];
 	/** Entries not attached because the model has no image input: their path text was put back. */
@@ -192,7 +194,7 @@ export class Draft {
 				images.push({ type: "image", data, mimeType: entry.mime });
 			}
 		}
-		if (attached.size === 0 && restore.size === 0) return current === text ? null : { text: current, images, missing, withheld };
+		if (attached.size === 0 && restore.size === 0) return current === text ? null : { text: current, images, attached: [], missing, withheld };
 
 		let out = "";
 		let last = 0;
@@ -203,7 +205,7 @@ export class Draft {
 			last = t.end;
 		}
 		out += current.slice(last);
-		return { text: out, images, missing, withheld };
+		return { text: out, images, attached: [...attached.values()], missing, withheld };
 	}
 
 	/**

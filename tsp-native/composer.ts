@@ -18,7 +18,8 @@
  * The facts come from pi's FooterComponent (its `session`, `footerData` and
  * `getSessionStats()`); while the composer carries them the footer itself
  * describes as hidden. Clicks come back as `status.model`, `thinking.cycle`,
- * `submit` and `interrupt` actions (omp's names).
+ * `thinking.set` (a level picked from the terminal's effort menu, as the
+ * action's `value`), `submit` and `interrupt` actions (omp's names).
  *
  * No runtime imports from describers.ts (it imports this module).
  */
@@ -424,16 +425,30 @@ function call(handler: unknown): boolean {
  * A click on a composer control, routed the way pi's keys go: the model chip
  * opens the model selector (`app.model.select`), the effort glyph cycles the
  * thinking level (`app.thinking.cycle`), Stop interrupts like Esc (the
- * editor's `onEscape`, else `app.interrupt`) while something runs. `submit`
- * is the describer's (it owns the draft). Unknown actions are ignored.
+ * editor's `onEscape`, else `app.interrupt`) while something runs.
+ * `thinking.set` carries a level picked by pointer as `value`: it is set on
+ * the footer's session when the model offers it, else ignored (no value, no
+ * footer, a level pi doesn't have such as omp's `auto`). `submit` is the
+ * describer's (it owns the draft). Unknown actions are ignored.
  */
-export function runComposerAction(editor: Any, act: string, running: boolean): boolean {
+export function runComposerAction(editor: Any, act: string, running: boolean, value?: string, footer?: Any): boolean {
 	const handlers: Any | undefined = editor.actionHandlers instanceof Map ? editor.actionHandlers : undefined;
 	switch (act) {
 		case "status.model":
 			return call(handlers?.get("app.model.select"));
 		case "thinking.cycle":
 			return call(handlers?.get("app.thinking.cycle"));
+		case "thinking.set": {
+			const session: Any | undefined = footer?.session;
+			if (typeof value !== "string" || !value || typeof session?.setThinkingLevel !== "function") return false;
+			const levels: unknown = session.getAvailableThinkingLevels?.();
+			// Not offered: ignored rather than left to `setThinkingLevel` to clamp.
+			if (!Array.isArray(levels) || !levels.includes(value)) return false;
+			session.setThinkingLevel(value);
+			// pi refreshes the footer and the editor border on the change, without asking for a frame.
+			editor.tui?.requestRender?.();
+			return true;
+		}
 		case "interrupt":
 			if (!running) return false;
 			return call(editor.onEscape ?? handlers?.get("app.interrupt"));

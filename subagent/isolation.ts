@@ -7,6 +7,7 @@
  *   ...child runs with cwd = wt.cwd...
  *   mergeDelta(wt)                 -> child's changes since baseCommit applied to the parent's working
  *                                     tree (never staged/committed); baseline advances on success
+ *                                     (measured from the fork point if the child moved HEAD, see below)
  *   removeWorktree(wt) / removeAllWorktrees()
  *
  * Baseline technique: instead of replaying `git diff HEAD` + copying untracked files, the parent's
@@ -19,6 +20,32 @@
  * The same snapshot routine (run inside the worktree) yields the delta tree ("theirs"); the delta
  * patch is `git diff-tree --binary baseCommit theirs`.
  *
+ * Moved HEAD: the delta is state-based (baseCommit tree -> worktree snapshot) wherever the agent's own
+ * commits went, as long as baseCommit is still an ancestor of the worktree's HEAD. If it is not (the
+ * agent switched / checked out / reset to another commit, amended or rebased the baseline), the
+ * working tree may no longer hold what baseCommit added on top of that history - notably the spawner's
+ * uncommitted work, which exists only inside baseCommit - and a delta from the baseline would revert
+ * all of it in the parent. Whether it does is decided per path, for the paths that differ between the
+ * fork point (`git merge-base baseCommit HEAD`) and baseCommit (see deltaOrigin):
+ *   - the snapshot or HEAD's commit still holds the baseline's version (`commit --amend`, `reset
+ *     --soft/--mixed`, rebase; whatever the agent then did to other files): state-based as usual, so the
+ *     spawner's own work is neither offered again nor reverted;
+ *   - the snapshot is back at the fork's version (`reset --hard`, `switch`, `checkout`): an effect of
+ *     moving HEAD, not part of the delta;
+ *   - the snapshot holds something else: it builds on the baseline if merging it with the baseline on
+ *     top of the fork changes nothing (it already contains what the baseline added; state-based), on
+ *     the fork if that merge is clean but adds something (measured from the fork's version, so the
+ *     3-way merge below keeps both sides), and is undecidable if that merge conflicts.
+ * The delta (patch, files, stat) is measured from the resulting origin (DeltaMeta.from: the baseline
+ * with the fork's version at the paths measured from the fork); result messages say that HEAD had
+ * moved. An undecidable path and a HEAD without any common ancestor are never merged automatically
+ * (conflict, parent untouched; in the latter case the saved patch holds the agent's files as additions
+ * only, so applying it cannot delete anything). An unborn HEAD (`checkout --orphan`) and content-level
+ * changes while HEAD still descends from the baseline (`git checkout <old> -- .`, `git restore
+ * --source`) stay state-based. advanceBaseline() records a moved HEAD as second parent of the new
+ * baseline commit, so a follow-up run that returns to that commit (`git switch <its branch>`) is
+ * measured from it and neither reverts nor re-delivers what was already merged.
+ *
  * Apply strategy (exact, never fuzzy, no `git apply` into the parent): the plan is a set of
  * per-path transitions pre-blob -> post-blob. Every path of the parent working tree is first compared
  * with `pre` as git sees it (`git hash-object --stdin-paths`, so eol conversion / clean filters such as
@@ -26,8 +53,8 @@
  *   - all touched paths still equal the baseline (or already equal the child's version): the plan is
  *     baseline -> child for the paths that still need it.
  *   - some paths diverged: 3-way merge entirely in object space with `git merge-tree --write-tree
- *     --merge-base=<baseCommit> <parentSnapshot> <theirs>` (git >= 2.40); the parent index is never
- *     touched (unlike `git apply --3way`). A conflict-free result gives the plan parentSnapshot -> merged.
+ *     --merge-base=<baseCommit or fork point> <parentSnapshot> <theirs>` (git >= 2.40); the parent index is
+ *     never touched (unlike `git apply --3way`). A conflict-free result gives the plan parentSnapshot -> merged.
  *   Execution writes whole blobs (`git cat-file --filters --path=<p>`, i.e. smudged like a checkout)
  *   via temp file + rename, deletions deepest-first then writes shallowest-first (file<->dir and
  *   symlink transitions), never through a symlinked ancestor. Each path is re-verified byte-for-byte
@@ -117,8 +144,20 @@ interface DeltaMeta {
 	raw: Buffer;
 	/** Snapshot tree of the worktree the delta was computed against ("theirs"). */
 	tree: string;
-	/** baseCommit the delta is relative to. */
+	/** baseCommit the delta belongs to (staleness check; the baseline that advances on a merge). */
 	base: string;
+	/**
+	 * What the delta is measured from: `base`, or - when the agent moved HEAD off the baseline - the
+	 * fork point `git merge-base base HEAD`, or a synthetic commit holding the baseline with the fork's
+	 * version at some paths (see deltaOrigin). A commit, except for `unrelated`.
+	 */
+	from: string;
+	/** The fork point, when at least one path is measured from it (`from` differs from `base`). */
+	fork?: string;
+	/** Paths that could be built on either the baseline or the fork: never merged automatically. */
+	unsure?: string[];
+	/** HEAD shares no history with `base`: `from` is the empty tree; never merged automatically. */
+	unrelated?: boolean;
 }
 
 const worktreeMeta = new WeakMap<Worktree, WorktreeMeta>();
@@ -657,6 +696,138 @@ function rawPatchOf(delta: Delta): Buffer {
 	return deltaMeta.get(delta)?.raw ?? Buffer.from(delta.patch, "utf8");
 }
 
+interface DeltaOrigin {
+	from: string;
+	fork?: string;
+	unsure?: string[];
+	unrelated?: boolean;
+}
+
+/**
+ * What a worktree's changes (snapshot `tree`) are measured from. Normally the baseline. If the agent
+ * moved HEAD so that the baseline is no longer an ancestor of it (switch / checkout / reset to another
+ * commit, amend, rebase), the working tree may have lost what the baseline commit holds on top of that
+ * history - including the spawner's uncommitted work - and a delta from the baseline would revert it
+ * in the parent. The paths that lost it are then measured from where HEAD forked (`git merge-base`,
+ * see forkOrigin); without a common ancestor everything is measured from the empty tree, i.e. as
+ * additions only (`unrelated`, never merged automatically).
+ */
+async function deltaOrigin(dir: string, base: string, tree: string): Promise<DeltaOrigin> {
+	const head = await resolveHead(dir);
+	// Unborn HEAD (`checkout --orphan`): the files are still the baseline's, stay state-based.
+	if (!head || head === base) return { from: base };
+	const anc = await git(["merge-base", "--is-ancestor", base, head], { cwd: dir, allowFail: true });
+	if (anc.code === 0) return { from: base }; // the agent committed on top of the baseline
+	if (anc.code !== 1) {
+		throw new Error(`could not relate HEAD to the task baseline (${summarizeGitStderr(anc.stderr) || `git merge-base exited ${anc.code}`})`);
+	}
+	const mb = await git(["merge-base", base, head], { cwd: dir, allowFail: true });
+	const fork = mb.stdout.toString("utf8").trim().split("\n")[0] ?? "";
+	if (mb.code === 0 && fork) return forkOrigin(dir, base, head, fork, tree);
+	if (mb.code !== 1) {
+		throw new Error(`could not find where HEAD forked from the task baseline (${summarizeGitStderr(mb.stderr) || `git merge-base exited ${mb.code}`})`);
+	}
+	// Unrelated history: nothing to measure from. (The empty tree is known to git without being stored.)
+	const empty = await gitText(["hash-object", "-t", "tree", "--stdin"], { cwd: dir, input: "" });
+	return { from: empty, unrelated: true };
+}
+
+const sameEntry = (a: TreeEntry | undefined, b: TreeEntry | undefined) => a?.mode === b?.mode && a?.oid === b?.oid;
+
+/**
+ * Origin for a worktree whose HEAD left the baseline at `fork`. Only the paths that differ between
+ * the fork and the baseline can be affected; each is attributed on its own:
+ *   - snapshot or HEAD's commit still holds the baseline's version (amend, `reset --soft/--mixed`,
+ *     rebase): measured from the baseline as usual;
+ *   - snapshot is back at the fork's version (`reset --hard`, switch, checkout): an effect of moving
+ *     HEAD - measured from the fork, i.e. no change;
+ *   - snapshot holds something else: merge it with the baseline on top of the fork. Nothing added: it
+ *     already contains what the baseline added, measured from the baseline. Clean but different: it was
+ *     built on the fork's version, measured from the fork (the merge into the parent then keeps both
+ *     sides). Conflict (or no usable merge): it could be either - `unsure`, measured from the fork so
+ *     that the saved patch cannot revert the spawner's work.
+ * The origin is the baseline with the fork's entry at every path measured from the fork.
+ */
+async function forkOrigin(dir: string, base: string, head: string, fork: string, tree: string): Promise<DeltaOrigin> {
+	const lost = await rawDiff(dir, fork, base);
+	// Names that do not survive as strings cannot be attributed one by one: everything from the fork.
+	if (lost.nonUtf8.length > 0) return { from: fork, fork };
+	if (lost.paths.length === 0) return { from: base };
+	const [now, atHead] = await Promise.all([rawDiff(dir, base, tree), rawDiff(dir, base, head)]);
+	const changedNow = new Set(now.paths);
+	const changedAtHead = new Set(atHead.paths);
+	const fromFork: string[] = [];
+	const open: string[] = [];
+	for (const p of lost.paths) {
+		if (!changedNow.has(p) || !changedAtHead.has(p)) continue;
+		if (sameEntry(now.post.get(p), lost.pre.get(p))) fromFork.push(p);
+		else open.push(p);
+	}
+	const unsure: string[] = [];
+	if (open.length > 0) {
+		let merged = "";
+		let conflicted = new Set<string>();
+		if (await gitAtLeast(2, 40)) {
+			const theirs = await commitTree(dir, tree, [fork], "pi: task worktree state");
+			// No rename detection: the verdict is per path.
+			const mt = await git(
+				["-c", "merge.renames=false", "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", `--merge-base=${fork}`, base, theirs],
+				{ cwd: dir, allowFail: true },
+			);
+			if (mt.code === 0 || mt.code === 1) {
+				const parts = splitNul(mt.stdout);
+				merged = parts[0]?.trim() ?? "";
+				conflicted = new Set(parts.slice(1));
+			}
+		}
+		const added = merged ? new Set((await rawDiff(dir, tree, merged)).paths) : undefined;
+		for (const p of open) {
+			if (!added || conflicted.has(p)) unsure.push(p);
+			else if (!added.has(p)) continue; // already contains what the baseline added
+			fromFork.push(p);
+		}
+	}
+	if (fromFork.length === 0) return { from: base };
+	const extra = unsure.length > 0 ? { unsure } : {};
+	if (fromFork.length === lost.paths.length) return { from: fork, fork, ...extra };
+	const tmpIndex = path.join(await storageDir("tmp"), `index-${process.pid}-${randomSuffix()}`);
+	const env = { GIT_INDEX_FILE: tmpIndex };
+	try {
+		await git(["read-tree", base], { cwd: dir, env });
+		const info = fromFork.map((p) => {
+			const e = lost.pre.get(p);
+			return e ? `${e.mode} ${e.oid}\t${p}\0` : `0 ${"0".repeat(base.length)}\t${p}\0`;
+		});
+		await git(["update-index", "-z", "--index-info"], { cwd: dir, env, input: info.join("") });
+		const origin = await gitText(["write-tree"], { cwd: dir, env });
+		return { from: await commitTree(dir, origin, [fork], "pi: task delta origin"), fork, ...extra };
+	} finally {
+		await fs.rm(tmpIndex, { force: true }).catch(() => {});
+		await fs.rm(`${tmpIndex}.lock`, { force: true }).catch(() => {});
+	}
+}
+
+const shortOid = (oid: string) => oid.slice(0, 10);
+
+/** Sentence for results whose delta was (partly) measured from a fork point instead of the baseline, else "". */
+function movedNote(d: Delta): string {
+	const m = deltaMeta.get(d);
+	if (!m?.fork || m.unrelated || (m.unsure && m.unsure.length > 0)) return "";
+	const what = m.from === m.fork ? "its changes" : "its changes to files that no longer held the baseline's content";
+	return ` Note: the agent moved HEAD off the task baseline; ${what} were measured from commit ${shortOid(m.fork)}, where its HEAD forked from the baseline.`;
+}
+
+/** What a saved patch of `d` is relative to (for user-facing messages). */
+function patchOrigin(d: Delta): string {
+	const m = deltaMeta.get(d);
+	if (m?.unrelated) return "every file of the agent's checkout as an addition, as its HEAD shares no history with the task's baseline";
+	if (m?.fork && m.from === m.fork) return `relative to commit ${shortOid(m.fork)}, where the agent's HEAD forked from the task's baseline`;
+	if (m?.fork) {
+		return `relative to the task's baseline, but to commit ${shortOid(m.fork)}, where the agent's HEAD forked from it, for files that no longer held the baseline's content`;
+	}
+	return "relative to the task's baseline";
+}
+
 // ---------------------------------------------------------------------------------------------
 // Exact, verified writes into the parent working tree
 // ---------------------------------------------------------------------------------------------
@@ -810,7 +981,10 @@ async function readStates(root: string, paths: readonly string[], ctx: CompareCt
 			st.oid = createHash(ctx.algo).update(`blob ${st.bytes.length}\0`).update(st.bytes).digest("hex");
 		}
 	});
-	const batch = files.filter((p) => !p.includes("\n"));
+	// `--stdin-paths` C-unquotes a line starting with `"` and drops a trailing CR: such paths (and ones
+	// containing a newline) are passed as an argument instead.
+	const needsArg = (p: string) => p.includes("\n") || p.startsWith('"') || p.endsWith("\r");
+	const batch = files.filter((p) => !needsArg(p));
 	if (batch.length > 0) {
 		const out = await git(["hash-object", "--stdin-paths"], { cwd: root, input: `${batch.join("\n")}\n` });
 		const oids = out.stdout.toString("utf8").split("\n");
@@ -819,7 +993,7 @@ async function readStates(root: string, paths: readonly string[], ctx: CompareCt
 			if (st) st.oid = oids[i]?.trim();
 		});
 	}
-	for (const p of files.filter((f) => f.includes("\n"))) {
+	for (const p of files.filter(needsArg)) {
 		const st = map.get(p);
 		if (st) st.oid = await gitText(["hash-object", "--", p], { cwd: root });
 	}
@@ -1240,7 +1414,7 @@ async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, kno
 
 const APPLY_FLAGS = ["-c", "apply.ignoreWhitespace=no", "apply", "--binary", "--whitespace=nowarn"];
 
-/** Rebuild the child's tree from a patch relative to `base` (for deltas without metadata). */
+/** Rebuild the child's tree from a patch relative to `base` (a tree-ish; for deltas without metadata). */
 async function treeFromPatch(cwd: string, base: string, raw: Buffer): Promise<string> {
 	const dir = await storageDir("tmp");
 	const tmpIndex = path.join(dir, `index-${process.pid}-${randomSuffix()}`);
@@ -1339,22 +1513,26 @@ export async function createWorktree(cwd: string, id: string, signal?: AbortSign
 /**
  * Everything changed in the worktree since `wt.baseCommit` (edits, new untracked files, deletions,
  * mode changes, binaries), whether or not the agent committed. The worktree's index is not modified.
+ * If the agent moved HEAD so that the baseline is no longer an ancestor of it, the changes are those
+ * since the fork point instead (see deltaOrigin / "Moved HEAD" in the file header).
  * Throws a descriptive Error if the worktree cannot be read (e.g. unreadable files).
  */
 export async function collectDelta(wt: Worktree): Promise<Delta> {
 	const base = wt.baseCommit;
 	let tree: string;
+	let origin: DeltaOrigin;
 	try {
 		tree = await snapshotWorkingState(wt.path);
+		origin = await deltaOrigin(wt.path, base, tree);
 	} catch (err) {
 		throw new Error(
 			`Could not collect changes from isolated worktree ${wt.path}: ${errorMessage(err)}. ` +
 				"Fix the problem in the worktree (e.g. file permissions) and merge again; the worktree is kept.",
 		);
 	}
-	const { raw, files, stat } = await diffTrees(wt.path, `${base}^{tree}`, tree);
+	const { raw, files, stat } = await diffTrees(wt.path, `${origin.from}^{tree}`, tree);
 	const delta: Delta = { patch: raw.toString("utf8"), files, stat };
-	deltaMeta.set(delta, { raw, tree, base });
+	deltaMeta.set(delta, { raw, tree, base, ...origin });
 	return delta;
 }
 
@@ -1368,7 +1546,12 @@ export async function advanceBaseline(wt: Worktree, delta?: Delta): Promise<void
 	const tree = meta && meta.base === wt.baseCommit ? meta.tree : await snapshotWorkingState(wt.path);
 	const baseTree = await gitText(["rev-parse", `${wt.baseCommit}^{tree}`], { cwd: wt.path });
 	if (tree === baseTree) return;
-	const commit = await commitTree(wt.path, tree, [wt.baseCommit], "pi: isolated task baseline (merged)");
+	// A HEAD the agent moved (own commits, another branch) becomes a second parent: if a later run
+	// returns to it, its merge base with the new baseline is that commit, not an older fork point, so
+	// what was merged here is neither offered again nor reverted.
+	const head = await resolveHead(wt.path);
+	const parents = head && head !== wt.baseCommit ? [wt.baseCommit, head] : [wt.baseCommit];
+	const commit = await commitTree(wt.path, tree, parents, "pi: isolated task baseline (merged)");
 	// Detach (never move a branch the agent may have checked out - refs are shared with the parent).
 	await git(["update-ref", "--no-deref", "-m", "pi: advance task baseline", "HEAD", commit], { cwd: wt.path });
 	// Index := new baseline; working tree untouched (so `git status` in the worktree shows only new work).
@@ -1433,12 +1616,29 @@ async function mergeLocked(wt: Worktree, d: Delta): Promise<MergeResult> {
 		};
 	}
 	if (!meta) {
+		// A delta without metadata is taken to be relative to what collectDelta() measures from now.
 		const raw = rawPatchOf(d);
-		meta = { raw, tree: await treeFromPatch(wt.path, wt.baseCommit, raw), base: wt.baseCommit };
+		const origin = await deltaOrigin(wt.path, wt.baseCommit, await snapshotWorkingState(wt.path));
+		meta = { raw, tree: await treeFromPatch(wt.path, origin.from, raw), base: wt.baseCommit, ...origin };
 		deltaMeta.set(d, meta);
 	}
 	const m = meta;
-	const [delta, ctx] = await Promise.all([rawDiff(wt.path, m.base, m.tree), compareCtx(repoRoot)]);
+	if (m.unrelated) {
+		// No fork point: the agent's work cannot be told apart from the history it checked out.
+		return conflict(wt, d, d.files, "the agent moved HEAD to a history unrelated to the task baseline, so its changes cannot be measured");
+	}
+	if (m.unsure && m.unsure.length > 0) {
+		// Could be the spawner's version edited further (deliver the edit) or a rewrite of the fork's
+		// version (keep the spawner's lines): not decidable, and a wrong guess loses or resurrects work.
+		return conflict(
+			wt,
+			d,
+			d.files,
+			`the agent moved HEAD off the task baseline and it cannot be told whether its version of ${m.unsure.join(", ")} builds on the baseline's or on the older committed one`,
+		);
+	}
+	// `m.from` is the baseline, or the fork point / a mix of both if the agent moved HEAD off it (see deltaOrigin).
+	const [delta, ctx] = await Promise.all([rawDiff(wt.path, m.from, m.tree), compareCtx(repoRoot)]);
 	const { paths: touched, pre: baseEntries, post: theirsEntries } = delta;
 	const files = d.files.length > 0 ? d.files : touched;
 	if (delta.nonUtf8.length > 0) return conflict(wt, d, files, `non-UTF-8 filename: ${delta.nonUtf8.join(", ")}`);
@@ -1450,7 +1650,7 @@ async function mergeLocked(wt: Worktree, d: Delta): Promise<MergeResult> {
 		} catch (err) {
 			message += ` (warning: could not advance the worktree baseline, these changes may be offered again: ${errorMessage(err)})`;
 		}
-		return { status: "applied", message, files };
+		return { status: "applied", message: message + movedNote(d), files };
 	};
 
 	// Classify each touched path of the parent working tree exactly (as git sees it: filters apply).
@@ -1493,9 +1693,9 @@ async function mergeLocked(wt: Worktree, d: Delta): Promise<MergeResult> {
 	}
 	const parentTree = await snapshotTree(repoRoot, head, nested);
 	const ours = await commitTree(repoRoot, parentTree, [], "pi: parent working state");
-	const theirs = await commitTree(repoRoot, m.tree, [m.base], "pi: task changes");
+	const theirs = await commitTree(repoRoot, m.tree, [m.from], "pi: task changes");
 	const mt = await git(
-		["merge-tree", "--write-tree", "--name-only", "--no-messages", `--merge-base=${m.base}`, ours, theirs],
+		["merge-tree", "--write-tree", "--name-only", "--no-messages", `--merge-base=${m.from}`, ours, theirs],
 		{ cwd: repoRoot, allowFail: true },
 	);
 	const lines = mt.stdout.toString("utf8").split("\n").filter(Boolean);
@@ -1524,14 +1724,15 @@ async function conflict(wt: Worktree, d: Delta, files: string[], detail: string)
 		saveError = errorMessage(err);
 	}
 	const saved = patchFile
-		? `Patch saved to ${patchFile} (relative to the task's baseline). ${recoveryHint(patchFile, wt.repoRoot)} `
+		? `Patch saved to ${patchFile} (${patchOrigin(d)}). ${recoveryHint(patchFile, wt.repoRoot)} `
 		: `The patch could not be saved (${saveError}). `;
 	return {
 		status: "conflict",
 		message:
 			`Could not merge isolated changes into ${wt.repoRoot} (${detail}); the parent checkout was left untouched. ` +
 			saved +
-			`The worktree with the full changes is kept at ${wt.path}.`,
+			`The worktree with the full changes is kept at ${wt.path}.` +
+			movedNote(d),
 		files,
 		patchFile,
 	};

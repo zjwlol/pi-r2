@@ -3,9 +3,10 @@
  *
  * Parent tools:
  *   task  - spawn `tasks[]` as background subagents (results auto-deliver as `task-result` messages)
- *   irc   - send (steer a running agent / follow up an idle one), wait, list, read, kill
+ *   irc   - send (steer a running agent / follow up an idle one; `all` broadcasts, without automatic
+ *           replies), wait, list, read, kill
  * Child tools:
- *   irc   - send to parent/peers/all, wait, list (+ read/kill of own subagents for spawners)
+ *   irc   - send to parent/peers (no broadcast), wait, list (+ read/kill of own subagents for spawners)
  *   task  - only for agents with `spawns` below MAX_DEPTH (nested subagents; results go to the owner)
  *   yield - only for tasks with an output schema (`outputSchema` / agent `output:`), see features.ts
  * Per-task features (features.ts): `isolated` (own git worktree, merged back as a patch) and
@@ -14,6 +15,12 @@
  *   /agents [id] - agent inspector (also ctrl+s / alt+a, or a deliberate ←← on an empty editor):
  *                  live roster and transcripts; message / kill agents (inspector.ts)
  *   /irc <id> <message> - message a subagent as the user
+ * Delivery (hub.ts): a message from the main agent or the user steers a running agent at its next
+ *   step; messages between subagents, broadcast legs and notices never extend a finishing run (they
+ *   get a turn of their own after its result). Parent `irc wait` returns at once when a result or
+ *   message is already queued for the main session or the agent named in `from` cannot reply, and
+ *   ends when that agent stops or (without `from`) no agent is active any more; it first lets a
+ *   `task` call of the same tool batch register its agents.
  * Prompt:
  *   `^model`  - popup of models; a tag means "a default-agent subagent on this model" (mentions.ts)
  * UI:
@@ -40,6 +47,7 @@ import {
 	AgentHub,
 	descendants,
 	describeChild,
+	describeProgress,
 	describeTree,
 	firstLine,
 	formatParentEvent,
@@ -108,7 +116,7 @@ const TaskParams = buildTaskParams(DEFAULT_AGENT);
 
 const IrcParams = Type.Object({
 	op: StringEnum(["send", "wait", "list", "read", "kill"] as const),
-	to: Type.Optional(Type.String({ description: 'send: recipient agent name, or "all"' })),
+	to: Type.Optional(Type.String({ description: 'send: recipient agent name, or "all" (broadcast to every agent; no automatic replies)' })),
 	message: Type.Optional(Type.String({ description: "send: message body" })),
 	from: Type.Optional(Type.String({ description: "wait: only return events from this agent" })),
 	id: Type.Optional(Type.String({ description: "read/kill: agent name" })),
@@ -438,11 +446,36 @@ export default function (pi: ExtensionAPI) {
 		if (message) await pi.sendMessage(message, { deliverAs: event.streamingBehavior });
 	});
 
+	// A delivered result / message reached the transcript: it is no longer queued behind an `irc wait`
+	// (hub.parentBacklog). Nothing stays queued once the run settled.
+	pi.on("message_start", async (event) => {
+		const m = event.message as { role?: string; customType?: string; details?: unknown; content?: unknown };
+		if (m.role !== "custom" || (m.customType !== RESULT_MESSAGE_TYPE && m.customType !== IRC_MESSAGE_TYPE)) return;
+		hub.markParentDelivered(m.details, m.content);
+	});
+	pi.on("agent_settled", async () => {
+		hub.clearParentBacklog();
+	});
+
 	// In print/json mode the process exits when the parent settles, so hold the parent
-	// open while background agents are still working and feed it their results.
+	// open while background agents are still working and feed it their results. A run can end without
+	// any event for the main agent (an agent woken quietly by a broadcast or a relayed reply, a held
+	// message's own turn after the result): the wait also ends, quietly, once nothing is active.
 	pi.on("agent_before_settle", async (event, ctx) => {
 		if (ctx.hasUI || !hub.hasActive()) return;
-		const ev = await hub.waitForParent(() => true, 0, ctx.signal);
+		const quiet = new AbortController();
+		const off = hub.onChange(() => {
+			if (!hub.hasActive()) quiet.abort();
+		});
+		let ev: ParentEvent | null;
+		try {
+			ev = await hub.waitForParent(() => true, 0, ctx.signal ? AbortSignal.any([ctx.signal, quiet.signal]) : quiet.signal);
+		} catch (e) {
+			if (quiet.signal.aborted && !ctx.signal?.aborted) return;
+			throw e;
+		} finally {
+			off();
+		}
 		if (!ev) return;
 		return {
 			entries: [
@@ -574,8 +607,8 @@ export default function (pi: ExtensionAPI) {
 		label: "IRC",
 		description: [
 			"Coordinate with task subagents (address them by name).",
-			'op "send": message `to` (agent name, or "all"). A running agent receives it at its next step (use this to steer/correct it mid-task); an idle agent is woken and its reply is delivered back to you. Never blocks.',
-			'op "wait": block until the next task result or agent message (optionally only `from` one agent); it returns early when the user sends you a message (your subagents keep running). Only when you are completely blocked; results otherwise auto-deliver.',
+			'op "send": message `to` (agent name, or "all"). A running agent receives it at its next step (use this to steer/correct it mid-task); an idle agent is woken and its reply is delivered back to you. "all" reaches every agent and draws no automatic replies. Never blocks.',
+			'op "wait": block until the next task result or agent message (optionally only `from` one agent); it returns early when the user sends you a message (your subagents keep running), and at once when a result or message is already on its way to you. Only when you are completely blocked on a result and have nothing else to do first; results otherwise auto-deliver. Nothing left at all but waiting on your subagents? End your turn instead: each result and message starts your next turn. A result arrived and others still run? Act on it before waiting again. NEVER wait for messages nobody owes you.',
 			'op "list": roster with status (nested subagents indented under the agent that spawned them). op "read": full latest output + recent activity of `id` (e.g. when a delivered result was truncated). op "kill": abort `id` and its subagents.',
 		].join(" "),
 		promptSnippet: "Message/steer task subagents, wait for them, list/read/kill",
@@ -607,7 +640,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "kill":
 					try {
-						const notes = await hub.kill(params.id ?? "");
+						// The main agent is the killer: a wake turn it started needs no "killed before it replied" note.
+						const notes = await hub.kill(params.id ?? "", { by: PARENT_ID });
 						return textResult([`Killed ${params.id}.`, ...notes].join("\n"));
 					} catch (e) {
 						return textResult(e instanceof Error ? e.message : String(e), undefined, true);
@@ -616,9 +650,30 @@ export default function (pi: ExtensionAPI) {
 					// A user prompt is already queued (typed while this call was generated): don't block it.
 					const pending = pendingUserInput(ctx);
 					if (pending) return textResult(userInputText(pending, false), { op: "wait", pending } satisfies IrcDetails);
-					if (!hub.hasActive() && !params.from) return textResult("No running subagents to wait for.", { op: "wait", idle: true } satisfies IrcDetails);
-					const from = params.from;
+					// A `task` call of the same tool batch may still be validating: its agents must exist before
+					// `from` is checked and before "nothing is running" is concluded.
+					await hub.spawnsSettled(PARENT_ID);
+					const from = params.from?.trim() || undefined;
+					if (from && !hub.children.has(from)) {
+						return textResult(`Unknown agent "${from}". Known: ${[...hub.children.keys()].join(", ") || "none"}`, undefined, true);
+					}
 					const filter = (ev: ParentEvent) => !from || (ev.kind === "done" ? ev.done.id === from : ev.msg.from === from);
+					// Already handed to pi but injected only after this tool batch: blocking would wait in front of it.
+					const queued = hub.queuedForParent(filter).map((ev) => (ev.kind === "done" ? `result of ${ev.done.id}` : `message from ${ev.msg.from}`));
+					if (queued.length > 0) {
+						const more = queued.length > 1 ? ` (and ${queued.length - 1} more)` : "";
+						return textResult(`Already arrived: ${queued[0]}${more}; delivered right after this call.`, { op: "wait", queued } satisfies IrcDetails);
+					}
+					if (!hub.hasActive() && !from) return textResult("No running subagents to wait for.", { op: "wait", idle: true } satisfies IrcDetails);
+					// Nothing can come from an agent that is not running; a wait on one also ends when it stops
+					// (its result or reply resolves the wait first).
+					const target = from ? hub.children.get(from) : undefined;
+					if (target && !subtreeActive(target)) {
+						return textResult(
+							`\`${target.id}\` is ${target.status}: nothing is running that could reply. Its last result was already delivered (irc read ${target.id}).`,
+							{ op: "wait" } satisfies IrcDetails,
+						);
+					}
 					const timeout = Math.max(1, params.timeoutSec ?? 300) * 1000;
 					// The user submitting a prompt ends the wait (see userInputQueued).
 					const interrupt = new AbortController();
@@ -628,10 +683,30 @@ export default function (pi: ExtensionAPI) {
 						interrupt.abort();
 					};
 					waitBreakers.add(end);
+					// A wait also ends when nothing can arrive any more: the agent named in `from` stopped, or,
+					// without `from`, no agent is active (the last one may finish without an event for the main
+					// agent, e.g. after a broadcast nobody answers). An event resolves the wait first.
+					let stopped = false;
+					const stop = () => {
+						stopped = true;
+						interrupt.abort();
+					};
+					const offStopped = target
+						? hub.onInactive(target.id, stop)
+						: hub.onChange(() => {
+								if (!hub.hasActive()) stop();
+							});
 					try {
 						const ev = await hub.waitForParent(filter, timeout, signal ? AbortSignal.any([signal, interrupt.signal]) : interrupt.signal);
-						const running = ev ? [] : hub.active().map((c) => c.id);
-						const text = ev ? formatParentEvent(ev) : `Timed out; agents still running: ${running.join(", ") || "none"}`;
+						const active = ev ? [] : hub.active();
+						const running = active.map((c) => c.id);
+						const now = Date.now();
+						// One progress row per still-active agent, so a looping one or one near its context limit shows.
+						const text = ev
+							? formatParentEvent(ev)
+							: active.length
+								? `Timed out; agents still running:\n${active.map((c) => describeProgress(c, now)).join("\n")}\nTheir results still auto-deliver. Still blocked on one? Call irc wait again; otherwise keep working or end your turn. NEVER use sleep to wait longer.`
+								: "Timed out; agents still running: none";
 						// The delivered event (JSON copy) for the native view; older sessions fall back to the text.
 						const details: IrcDetails = ev
 							? { op: "wait", event: jsonCopy(ev), interrupted: interruptedBy }
@@ -639,9 +714,15 @@ export default function (pi: ExtensionAPI) {
 						return textResult(interruptedBy ? `${text}\n\n${userInputText(interruptedBy, false)}` : text, details);
 					} catch (e) {
 						if (interruptedBy && !signal?.aborted) return textResult(userInputText(interruptedBy, true), { op: "wait", interrupted: interruptedBy } satisfies IrcDetails);
+						if (stopped && !signal?.aborted) {
+							return target
+								? textResult(`\`${target.id}\` stopped (${target.status}) without replying.`, { op: "wait" } satisfies IrcDetails)
+								: textResult("No agent is running any more: nothing further will arrive.", { op: "wait", idle: true } satisfies IrcDetails);
+						}
 						return textResult(e instanceof Error ? e.message : String(e), undefined, true);
 					} finally {
 						waitBreakers.delete(end);
+						offStopped();
 					}
 				}
 			}
@@ -793,7 +874,7 @@ export default function (pi: ExtensionAPI) {
 			} else if (action === "Kill") {
 				// Its owner (main agent or spawning child) may still be expecting this agent's result: deliver an aborted one.
 				// Its own subagents are killed first.
-				const notes = await hub.kill(child.id, { notify: true });
+				const notes = await hub.kill(child.id, { notify: true, by: USER_ID });
 				ctx.ui.notify([`Killed ${child.id}`, ...notes].join("\n"), "info");
 			}
 		},

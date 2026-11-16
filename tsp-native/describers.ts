@@ -161,6 +161,62 @@ function previewLines(text: string): number {
 	return Math.min(10, Math.max(1, text.split("\n").length));
 }
 
+/** A line of pi's display diff: marker, padded line number, one space, the line's text. */
+const DISPLAY_DIFF_LINE = /^([+\- ])(\s*\d+)(?: (.*))?$/s;
+
+/**
+ * The `diff` hunks of pi's display-oriented edit diff (`+12 added`,
+ * `-12 removed`, ` 12 context`, a numberless `...` row between regions), the
+ * way omp's `nativeDiff` reads its compact diff: each run of consecutive lines
+ * is one hunk, and a `...` row or a jump in line numbers starts the next.
+ * Removed and context rows carry old line numbers, added rows new ones, so the
+ * other side follows from the running offset. Runs without a change are
+ * dropped. Undefined when nothing parses into a hunk.
+ */
+function displayDiffHunks(display: string): { oldStart: number; newStart: number; lines: string[] }[] | undefined {
+	const hunks: { oldStart: number; newStart: number; lines: string[] }[] = [];
+	let lines: string[] = [];
+	let changed = false;
+	let oldStart = 1;
+	let newStart = 1;
+	// The old and new lines the open run continues with.
+	let nextOld = 1;
+	let nextNew = 1;
+	const close = (): void => {
+		if (changed) hunks.push({ oldStart, newStart, lines });
+		lines = [];
+		changed = false;
+	};
+	for (const raw of display.split("\n")) {
+		const parsed = DISPLAY_DIFF_LINE.exec(raw);
+		if (!parsed) {
+			const trimmed = raw.trim();
+			if (trimmed === "" || trimmed === "..." || trimmed === "…") close();
+			continue;
+		}
+		const prefix = parsed[1]!;
+		const number = Number.parseInt(parsed[2]!.trim(), 10);
+		const added = prefix === "+";
+		if (number !== (added ? nextNew : nextOld)) {
+			close();
+			// The lines skipped are unchanged: both sides move by as many.
+			const skipped = number - (added ? nextNew : nextOld);
+			nextOld += skipped;
+			nextNew += skipped;
+		}
+		if (lines.length === 0) {
+			oldStart = nextOld;
+			newStart = nextNew;
+		}
+		if (prefix !== "+") nextOld++;
+		if (prefix !== "-") nextNew++;
+		changed ||= prefix !== " ";
+		lines.push(`${prefix}${parsed[3] ?? ""}`);
+	}
+	close();
+	return hunks.length > 0 ? hunks : undefined;
+}
+
 // ── Describers ──────────────────────────────────────────────────────────
 
 const userMessage: Describer = {
@@ -442,8 +498,17 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 			return out;
 		}
 		case "edit": {
-			const d = result?.details?.diff ?? result?.details?.patch;
-			if (typeof d === "string" && d.trim()) out.push(diff(d, { path: typeof args.path === "string" ? args.path : undefined, role: "omp.tool.edit.diff" }, "diff"));
+			const path = typeof args.path === "string" ? args.path : undefined;
+			// pi's standard unified patch (`--- path`, `+++ path`, `@@ -a,b +c,d @@` hunks); a patch without a hunk shows nothing.
+			const patch: unknown = result?.details?.patch;
+			if (typeof patch === "string" && /^@@ /m.test(patch)) {
+				out.push(diff(patch, { path, role: "omp.tool.edit.diff" }, "diff"));
+				return out;
+			}
+			// Only the display diff (older pi, other edit tools): its numbered lines as hunks, never as unified text.
+			const display: unknown = result?.details?.diff;
+			const hunks = typeof display === "string" && display.trim() ? displayDiffHunks(display) : undefined;
+			if (hunks) out.push(node("diff", { path, role: "omp.tool.edit.diff", hunks }, undefined, "diff"));
 			else if (output) out.push(text(plain(output), undefined, "out"));
 			return out;
 		}
@@ -465,6 +530,11 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 				return out;
 			}
 			if (output) out.push(code(output, { preview, role: "omp.tool.output" }, "out"));
+			// The complete arguments (the head clips its one value), folded after the output, once the call runs:
+			// streamed argument deltas would re-send the whole JSON each frame.
+			if ((a.executionStarted === true || result !== undefined) && args && typeof args === "object" && !Array.isArray(args) && Object.keys(args).length > 0) {
+				out.push(node("section", { head: [span("Args", "muted")], collapsible: true, collapsed: true }, [code(JSON.stringify(args, null, 2), { lang: "json" }, "json")], "args"));
+			}
 			return out;
 		}
 	}
@@ -1182,8 +1252,12 @@ const editor: Describer = {
 				return;
 			case "action": {
 				// The composer's controls (omp's action names); chips and unknown actions are ignored.
-				if (event.act === "submit") submitDraft(a);
-				else runComposerAction(a, event.act, editorRunning(a, composerFrames.get(c)?.footer));
+				if (event.act === "submit") {
+					submitDraft(a);
+					return;
+				}
+				const footer = composerFrames.get(c)?.footer;
+				runComposerAction(a, event.act, editorRunning(a, footer), event.value, footer);
 				return;
 			}
 		}
@@ -1209,13 +1283,27 @@ function applyHostEdit(a: Any, edit: { from: number; to: number; text: string; c
 	}
 	const cursor = Math.min(Math.max(0, Math.trunc(edit.cursor)), next.length);
 	const lines: string[] = a.state.lines;
+	const beforeLine: unknown = a.state.cursorLine;
+	const beforeCol: unknown = a.state.cursorCol;
 	let line = 0;
 	let colOffset = cursor;
 	while (line < lines.length - 1 && colOffset > lines[line]!.length) colOffset -= lines[line++]!.length + 1;
 	a.state.cursorLine = line;
 	a.state.cursorCol = Math.min(colOffset, lines[line]!.length);
 	a.preferredVisualCol = null;
-	if (!changed) return;
+	if (!changed) {
+		// The caret alone moved (a click in the draft): an open list follows it as on pi-tui's arrow keys (re-queried
+		// at the new position, closed when nothing matches there), and none opens.
+		if ((a.state.cursorLine !== beforeLine || a.state.cursorCol !== beforeCol) && a.autocompleteState) {
+			try {
+				if (typeof a.updateAutocomplete === "function") a.updateAutocomplete();
+				else a.cancelAutocomplete?.();
+			} catch {
+				// A provider's failure must not break the caret move.
+			}
+		}
+		return;
+	}
 	a.onChange?.(next);
 	retriggerAutocomplete(a);
 }

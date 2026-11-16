@@ -7,15 +7,17 @@
  *   on wide terminals (Tab toggles it on narrow ones).
  * - Transcript: a live view of one agent's conversation, drawn with pi's own message components
  *   (user, assistant, tool calls), plus an input line that messages the agent as the user (steers a
- *   running agent, wakes an idle one; its reply comes back to the main transcript).
+ *   running agent, wakes an idle one; its reply comes back to the main transcript). A message that
+ *   reached the agent over irc is an IRC card (`✉ irc from → agent` over the body), not the
+ *   model-facing `<irc from="…">` envelope it was injected as.
  *
  * Opened with ctrl+s / alt+a (oh-my-pi's app.session.observe / app.agents.hub), a deliberate ←← on
  * an empty editor (only when there are subagents), or /agents. The same keys (or ←← / Esc) close it.
  *
  * Natively (tsp-native, a TSP terminal) the roster is omp's `picker` sheet (agent rows with usage
  * columns, the selected agent as the side preview) and the transcript a full overlay of pi's message
- * components plus a native message field; keys stay this component's, pointer events come back
- * through handleNativeEvent to the same handlers.
+ * components (irc cards as `omp.irc.message` nodes) plus a native message field; keys stay this
+ * component's, pointer events come back through handleNativeEvent to the same handlers.
  */
 
 import {
@@ -38,6 +40,7 @@ import {
 	Input,
 	isKeyRelease,
 	isKeyRepeat,
+	Markdown,
 	matchesKey,
 	Spacer,
 	type TUI,
@@ -45,7 +48,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { type AgentHub, activeDescendants, type Child, firstLine, PARENT_ID, USER_ID } from "./hub.ts";
+import { type AgentHub, activeDescendants, type Child, firstLine, PARENT_ID, parseIrcFrames, USER_ID } from "./hub.ts";
 import {
 	HUB_COLUMNS,
 	type HubTranscriptView,
@@ -83,6 +86,8 @@ const TICK_MS = 150;
 const NATIVE_ROSTER_TICKS = 7;
 /** Second ctrl+x within this window kills the agent shown in the transcript view. */
 const KILL_CONFIRM_MS = 3000;
+/** Body lines of a collapsed IRC card in the transcript view (the main transcript's irc message shows as many). */
+const IRC_CARD_PREVIEW_LINES = 6;
 
 /**
  * Deliberate double-tap detector (oh-my-pi #detectLeftDoubleTap): true only on the second tap of a
@@ -693,7 +698,10 @@ export class AgentInspector implements Component, Focusable {
 		if (this.native?.sig === sig) return this.native.node;
 		const q = query.trim();
 		const tree = this.mode === "tree" && !q;
-		const items = rows.map((c) => hubPickerItem(c, { now, depth: tree ? Math.max(0, c.depth - 1) : undefined, showOwner: !tree, query: q || undefined }));
+		// Rows age from the signature's one-second bucket: a rebuild within the second (a selection move, a filter
+		// keystroke, a notice) then yields deep-equal items, which the reconciler does not re-send.
+		const clock = ticking ? Math.floor(now / 1000) * 1000 : now;
+		const items = rows.map((c) => hubPickerItem(c, { now: clock, depth: tree ? Math.max(0, c.depth - 1) : undefined, showOwner: !tree, query: q || undefined }));
 		const showQuery = this.filterEditing || query !== "";
 		const confirming = this.killConfirm !== undefined && selected !== undefined;
 		const props: Record<string, unknown> = {
@@ -1188,6 +1196,15 @@ class TranscriptView {
 			case "user": {
 				const text = userText(msg);
 				if (!text) return [];
+				// A message delivered over irc (a steer, a wake, a continuation): a card per message, not its envelope.
+				const frames = parseIrcFrames(text);
+				if (frames?.length) {
+					return frames.flatMap((frame, i) => {
+						const card = new IrcCard(frame.from, this.id, frame.body, () => this.deps.theme);
+						card.setExpanded(this.expanded);
+						return first && i === 0 ? [card] : [new Spacer(1), card];
+					});
+				}
 				return [...(first ? [] : [new Spacer(1)]), new UserMessageComponent(text, md, 1)];
 			}
 			case "assistant": {
@@ -1390,7 +1407,7 @@ class TranscriptView {
 		}
 	}
 
-	/** The agent's messages are pi's own components (described by tsp-native's describers), plus a native message field. */
+	/** The agent's messages are pi's own components (described by tsp-native's describers) and irc cards, plus a native message field. */
 	describe(cx: NativeComponentContext): NativeUiNode | null {
 		if (!supportsAll(cx, TRANSCRIPT_KINDS)) return null;
 		this.nativeDrawn = true;
@@ -1570,4 +1587,66 @@ class NoteLeaf implements Component {
 	}
 
 	invalidate(): void {}
+}
+
+/**
+ * A message that reached the agent over irc, in place of the model-facing `<irc from="…">` envelope it was
+ * injected as: `✉ irc from → to` over the body (the main transcript's irc message, index.ts renderEvent;
+ * natively the `omp.irc.message` node of native.ts). Collapsed it shows the first lines, expanded all as markdown.
+ */
+class IrcCard implements Component {
+	private readonly body: string;
+	private expanded = false;
+	private markdown: Markdown | undefined;
+	private native: { md: boolean; node: NativeUiNode } | undefined;
+
+	constructor(
+		private readonly from: string,
+		private readonly to: string,
+		body: string,
+		private readonly theme: () => Theme,
+	) {
+		this.body = body.trim();
+	}
+
+	setExpanded(expanded: boolean): void {
+		this.expanded = expanded;
+	}
+
+	render(width: number): string[] {
+		const t = this.theme();
+		const out = [clip(` ${t.fg("warning", "✉")} ${t.bold("irc")} ${t.fg("accent", `${this.from} → ${this.to}`)}`, width)];
+		if (!this.body) return out;
+		if (this.expanded) {
+			this.markdown ??= new Markdown(this.body, 3, 0, getMarkdownTheme());
+			return [...out, ...this.markdown.render(width)];
+		}
+		const inner = Math.max(1, width - 4);
+		const lines = this.body.split("\n").flatMap((line) => (line.trim() === "" ? [""] : wrapTextWithAnsi(line.replace(/\t/g, "  "), inner)));
+		for (const line of lines.slice(0, IRC_CARD_PREVIEW_LINES)) out.push(clip(`   ${line}`, width));
+		const more = lines.length - IRC_CARD_PREVIEW_LINES;
+		if (more > 0) out.push(clip(`   ${t.fg("muted", `… ${more} more line${more === 1 ? "" : "s"}`)}`, width));
+		return out;
+	}
+
+	describe(cx: NativeComponentContext): NativeUiNode | null {
+		if (!cx.supports("col") || !cx.supports("text")) return null;
+		const md = cx.supports("md");
+		if (this.native?.md === md) return this.native.node;
+		const head: TspSpan[] = [
+			{ t: this.from, s: "strong" },
+			{ t: ` → ${this.to}`, s: "muted" },
+		];
+		const children = [uiNode("text", { spans: head, lines: 1 }, undefined, "head")];
+		if (this.body) {
+			children.push(md ? uiNode("md", { role: "omp.irc.message", text: this.body }, undefined, "body") : uiNode("text", { text: this.body, wrap: "word" }, undefined, "body"));
+		}
+		const node = uiNode("col", { role: "omp.irc.message", gap: "xs" }, children);
+		this.native = { md, node };
+		return node;
+	}
+
+	invalidate(): void {
+		this.markdown?.invalidate();
+	}
 }

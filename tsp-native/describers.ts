@@ -60,6 +60,7 @@ import {
 	text,
 } from "./node.ts";
 import { cleanRow, nativeComponentId } from "./reconcile.ts";
+import { composerGhost } from "../shared/composer-slots.ts";
 import { hasStyle, lineToSpans, spansThemeId } from "./spans.ts";
 import { TRANSCRIPT_DESCRIBERS } from "./transcript.ts";
 import { BLOCK_DESCRIBERS, releaseBlockSideEffects, toolResultImages } from "./describe-blocks.ts";
@@ -1183,6 +1184,7 @@ const editor: Describer = {
 			indicator?.frames?.length,
 			a.borderColor,
 			cx.cols,
+			isPromptEditor(c) ? composerGhost(c) : undefined,
 		];
 		if (!isPromptEditor(c)) return fp;
 		if (!composerSupported(cx)) {
@@ -1210,6 +1212,7 @@ const editor: Describer = {
 				cursor,
 				placeholder: value === "" ? (name ? sessionPlaceholder(name) : EDITOR_PLACEHOLDER) : undefined,
 				decor: editorDecor(c, value, bash),
+				ghost: value !== "" && isPromptEditor(c) ? composerGhost(c) : undefined,
 				sendable: a.disableSubmit !== true,
 				maxLines: 12,
 				lang: bash ? "bash" : undefined,

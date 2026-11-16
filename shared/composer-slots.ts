@@ -11,6 +11,8 @@
  *   natively (false when it falls back to rows or the session is ANSI), so an
  *   extension's own above-editor band can step aside instead of drawing the
  *   same chips twice.
+ * - Ghost: a provider returns the ghost text to draw after the prompt editor's
+ *   caret; tsp-native puts it on the `editor` node.
  *
  * The state lives on `globalThis` under a registered symbol, so every module
  * copy jiti loads (one per extension, a fresh one per reload) shares it.
@@ -21,11 +23,17 @@ export interface ComposerAttachmentProvider {
 	describe(cx: unknown): unknown;
 }
 
+export interface ComposerGhostProvider {
+	/** Ghost text after the caret of prompt editor `editor` in its current state, or undefined. Synchronous and cheap: called every described frame. */
+	ghost(editor: unknown): string | undefined;
+}
+
 interface ComposerSlots {
 	readonly attachments: Map<string, ComposerAttachmentProvider>;
 	/** The providers sorted by key, cached until the registry changes. */
 	sorted: readonly ComposerAttachmentProvider[] | undefined;
 	hosted: boolean;
+	ghost?: ComposerGhostProvider;
 }
 
 const SLOTS = Symbol.for("pi-extended.composer-slots");
@@ -66,4 +74,26 @@ export function setComposerHosted(hosted: boolean): void {
 
 export function isComposerHosted(): boolean {
 	return slots().hosted;
+}
+
+/** Register (or with `undefined`, remove) the ghost provider. */
+export function setComposerGhost(provider: ComposerGhostProvider | undefined): void {
+	slots().ghost = provider;
+}
+
+/** The registered provider (to remove only one's own). */
+export function composerGhostProvider(): ComposerGhostProvider | undefined {
+	return slots().ghost;
+}
+
+/** tsp-native: the ghost for `editor` this frame; undefined when none, empty, or the provider throws. */
+export function composerGhost(editor: unknown): string | undefined {
+	const provider = slots().ghost;
+	if (!provider) return undefined;
+	try {
+		const ghost = provider.ghost(editor);
+		return typeof ghost === "string" && ghost !== "" ? ghost : undefined;
+	} catch {
+		return undefined;
+	}
 }

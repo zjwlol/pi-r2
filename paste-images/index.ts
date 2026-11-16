@@ -33,12 +33,17 @@
  * as an attachment provider (shared/composer-slots.ts, key "paste-images"),
  * which shows them inside its chat bar; while it does, the widget describes
  * as a hidden col.
+ *
+ * Commands: pi runs an extension command without the `input` event, so a
+ * command that sends its text to a model itself (`/btw`) gets the draft's
+ * images through the resolver registered in shared/draft-images.ts.
  */
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import { type ComposerAttachmentProvider, composerAttachments, setComposerAttachments } from "../shared/composer-slots.ts";
+import { type DraftImageResolver, getDraftImageResolver, setDraftImageResolver } from "../shared/draft-images.ts";
 import { type DescribeCx, ImageBand } from "./band.ts";
 import { Draft } from "./draft.ts";
 
@@ -146,6 +151,8 @@ export default function (pi: ExtensionAPI) {
 	 * behind another) can't pass its notices to a later one.
 	 */
 	let pendingNotices = new WeakMap<ImageContent, string>();
+	/** The session's context: the model named in the resolver's warning. */
+	let session: ExtensionContext | undefined;
 
 	const editorText = (): string | undefined => {
 		try {
@@ -215,6 +222,43 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
+	/**
+	 * The images of a text that doesn't pass the `input` event
+	 * (shared/draft-images.ts). Scope "editor": a text submitted from this
+	 * editor, treated as the `input` handler treats a prompt, minus the source
+	 * notice (no run starts). Scope "detached": a text that never was in this
+	 * editor; its image paths are attached through a draft of its own.
+	 */
+	const resolver: DraftImageResolver = (text, { vision, scope }) => {
+		if (!ui) return undefined;
+		const detached = scope === "detached";
+		const plan = detached
+			? new Draft().prepareSubmit(text, { vision, prev: "" })
+			: draft.prepareSubmit(text, { vision, prev: lastSeen.trim() });
+		if (!detached) {
+			draft.prune(observe()?.text ?? "");
+			lastSeen = draft.snapshot;
+			refreshBand();
+		}
+		if (!plan) return undefined;
+		try {
+			if (plan.missing.length > 0) {
+				const names = plan.missing.map((e) => e.name).join(", ");
+				ui.notify(`paste-images: couldn't read ${names}; sent the path${plan.missing.length > 1 ? "s" : ""} as text`, "warning");
+			}
+			if (plan.withheld.length > 0) {
+				const current = session?.model;
+				const model = current ? current.name || current.id : "the current model";
+				const count = plan.withheld.length;
+				ui.notify(`paste-images: ${model} has no image input; sent ${count} image path${count > 1 ? "s" : ""} as text`, "warning");
+			}
+		} catch {
+			// UI or session already replaced: the plan still stands.
+		}
+		if (plan.text === text && plan.images.length === 0) return undefined;
+		return { text: plan.text, images: plan.images };
+	};
+
 	const stop = () => {
 		if (timer) clearInterval(timer);
 		timer = undefined;
@@ -222,6 +266,8 @@ export default function (pi: ExtensionAPI) {
 		unsubscribeInput = undefined;
 		// Only our own registration: a reloaded copy may already have taken the slot.
 		if (composerAttachments().includes(provider)) setComposerAttachments(SLOT, undefined);
+		if (getDraftImageResolver() === resolver) setDraftImageResolver(undefined);
+		session = undefined;
 		draft.reset();
 		lastSeen = "";
 		pendingNotices = new WeakMap();
@@ -264,6 +310,8 @@ export default function (pi: ExtensionAPI) {
 		});
 		timer = setInterval(check, POLL_MS);
 		timer.unref?.();
+		session = ctx;
+		setDraftImageResolver(resolver);
 	});
 
 	pi.on("session_shutdown", async () => {

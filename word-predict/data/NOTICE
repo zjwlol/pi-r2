@@ -1,0 +1,56 @@
+word-predict: third-party notice
+================================
+
+1. Origin
+---------
+
+The code under word-predict/engine/, the file word-predict/provider.ts and the
+data file word-predict/data/web-prior.bin.zst are ported or copied from
+oh-my-pi (https://github.com/can1357/oh-my-pi, commit 67ef5342de):
+
+  - crates/pi-predict           the N-gram word-completion engine (Rust), ported
+                                to TypeScript under word-predict/engine/, and
+                                data/web-prior.bin.zst, copied byte for byte
+  - packages/tui/src/prompt     the word-completion provider and prose gates,
+                                ported as word-predict/provider.ts
+
+oh-my-pi is MIT licensed. Its licence text follows.
+
+2. Licence of oh-my-pi (LICENSE, verbatim)
+------------------------------------------
+
+MIT License
+
+Copyright (c) 2025 Mario Zechner
+Copyright (c) 2025-2026 Can Bölük
+Copyright (c) 2026 Stencil Labs, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+3. Data provenance of web-prior.bin.zst
+---------------------------------------
+
+As stated in oh-my-pi's crates/pi-predict/scripts/build-web-prior.ts, which
+builds the file:
+
+  - unigram and bigram counts come from Peter Norvig's count_1w.txt and
+    count_2w.txt (https://norvig.com/ngrams/), which are derived from the
+    Google Web Trillion Word Corpus;
+  - dictionary membership ("trusted" spelling) comes from the system word list
+    /usr/share/dict/words.

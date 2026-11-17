@@ -42,6 +42,11 @@
  * queue (status "pending") instead of failing. Permits come from one pool PER DEPTH LEVEL, and an
  * owner releases its permit while it is blocked waiting for its subagents (see `runLoop`).
  *
+ * Request budget: every run has a soft budget of assistant requests (SOFT_REQUEST_BUDGET, after
+ * oh-my-pi's `task.softRequestBudget`): a wrap-up notice is steered in at the budget, the turn is
+ * stopped at 1.5x and the agent asked once for its final report, and the run fails if it still has
+ * not reported a few requests later (`checkBudget`, `runLoop` step 0b).
+ *
  * Per-task features (worktree isolation, structured output) plug in through `hub.hooks`
  * (ChildHooks: validate / prepare / tools / resume / beforeSettle / dispose); features.ts implements
  * them. The hub only carries their data (Child.isolated / schema / worktree, DoneInfo.data / merge).
@@ -88,7 +93,7 @@ import {
 	TASK_PROMPT_GUIDELINES,
 	TASK_PROMPT_SNIPPET,
 } from "./prompts.ts";
-import { formatStructuredData, type JsonSchema } from "./structured.ts";
+import { formatStructuredData, type JsonSchema, YIELD_TOOL_NAME } from "./structured.ts";
 import { recordUsage, sessionUsage } from "./usage.ts";
 
 export { fmtDuration };
@@ -118,6 +123,72 @@ export const MAX_RUNNING = envInt("PI_SUBAGENT_MAX_RUNNING") ?? 16;
  */
 export const MAX_DEPTH = 2;
 export const READ_CAP = 100 * 1024;
+
+/**
+ * Soft per-agent request budgets (assistant requests per run), after oh-my-pi's `task.softRequestBudget`
+ * (task/executor.ts). Crossing the budget steers one wrap-up notice into the run; at 1.5x the budget the
+ * in-flight turn is stopped and the agent is prompted once for a final report from what it has; if it
+ * still has not reported BUDGET_STOP_GRACE_REQUESTS requests later, the run is aborted and fails.
+ * Entries are ceilings: `default` applies to agents without an entry, and the configured budget
+ * (`PI_SUBAGENT_REQUEST_BUDGET`, read once at load; 0 disables the guard) can only lower an agent's
+ * budget, never raise it above its entry here.
+ */
+export const SOFT_REQUEST_BUDGET: Record<string, number> = { scout: 100, sonic: 100, default: 200 };
+export const BUDGET_STOP_GRACE_REQUESTS = 5;
+
+function configuredRequestBudget(): number {
+	const raw = process.env.PI_SUBAGENT_REQUEST_BUDGET;
+	if (raw === undefined || raw.trim() === "") return SOFT_REQUEST_BUDGET.default!;
+	const n = Number.parseInt(raw, 10);
+	return Number.isFinite(n) && n >= 0 ? n : SOFT_REQUEST_BUDGET.default!;
+}
+const CONFIGURED_REQUEST_BUDGET = configuredRequestBudget();
+
+/** An agent's soft request budget: the tighter of the configured budget and its bundled entry; 0 = no guard. */
+export function resolveSoftRequestBudget(agentName: string, configured: number = CONFIGURED_REQUEST_BUDGET): number {
+	const normalized = Math.max(0, Math.trunc(configured));
+	if (normalized === 0) return 0;
+	return Math.min(normalized, SOFT_REQUEST_BUDGET[agentName] ?? normalized);
+}
+
+/** Requests at which a run with `budget` is force-stopped. */
+export function budgetStopThreshold(budget: number): number {
+	return Math.ceil(budget * 1.5);
+}
+
+export function buildBudgetNotice(requests: number, budget: number): string {
+	return `[budget notice] You have used ${requests} requests in this run (soft budget: ${budget}). Wrap up now: finish the current step and deliver your final report. At ${budgetStopThreshold(budget)} requests the run is force-stopped and you will be asked to report whatever you have.`;
+}
+
+/** The one forced final prompt after a budget stop (oh-my-pi subagent-yield-reminder.md, budgetStop branch). Tools stay declared so the prompt cache holds. */
+export function buildBudgetStopPrompt(structured: boolean): string {
+	return structured
+		? `<system-reminder>
+Request budget crossed; in-flight turn stopped → forced wrap-up. MUST call \`yield\` NOW with best final report from completed work.
+
+- Consolidate all gathered value; mark remaining gaps incomplete, do not investigate further.
+- Do NOT call another tool or resume assignment.
+</system-reminder>`
+		: `<system-reminder>
+Request budget crossed; in-flight turn stopped → forced wrap-up. Do NOT call another tool or resume assignment. Reply NOW with best final report from completed work; this message is your result.
+
+- Consolidate all gathered value; mark remaining gaps incomplete, do not investigate further.
+</system-reminder>`;
+}
+
+/** Request-budget state of the current run (see SOFT_REQUEST_BUDGET). */
+export interface RunBudget {
+	/** Soft budget of this run; 0 = no guard. */
+	limit: number;
+	/** Assistant requests of this run so far. */
+	requests: number;
+	/** The wrap-up notice steered at the soft budget, while pi may still hold it queued. */
+	noticeText?: string;
+	/** "requested": turn being stopped at 1.5x; "forced": the final-report prompt is out; "hard": aborted after the grace. */
+	stop?: "requested" | "forced" | "hard";
+	/** The session abort started by the stop. */
+	aborting?: Promise<void>;
+}
 
 export const RESULT_MESSAGE_TYPE = "task-result";
 export const IRC_MESSAGE_TYPE = "irc";
@@ -280,6 +351,8 @@ export interface Child {
 	steered: Array<{ msg: IrcMessage; text: string; direct?: boolean }>;
 	/** session.steer() calls not yet enqueued (steer awaits input handlers before queueing). */
 	steersInFlight: Set<Promise<void>>;
+	/** Request budget of the current run (reset when a run starts). */
+	budget: RunBudget;
 	/** Waiting for a run permit (MAX_RUNNING runs already active at its depth). */
 	queued: boolean;
 	/** Holds a run permit right now. */
@@ -1017,6 +1090,7 @@ export class AgentHub {
 			sentDuringRun: new Set(),
 			steered: [],
 			steersInFlight: new Set(),
+			budget: { limit: 0, requests: 0 },
 			queued: false,
 			hasPermit: false,
 			blocked: false,
@@ -1292,6 +1366,9 @@ export class AgentHub {
 		} else if (ev.type === "message_end" && (ev.message as any).role === "assistant") {
 			const msg = ev.message as any;
 			child.usage.requests++;
+			// The run goes on after this response only when it calls tools other than the terminating `yield`.
+			const calls = (msg.content ?? []).filter((p: any) => p.type === "toolCall");
+			this.checkBudget(child, msg.stopReason !== "error" && msg.stopReason !== "aborted" && calls.some((c: any) => c.name !== YIELD_TOOL_NAME));
 			const u = msg.usage;
 			// A failed or aborted response carries zero or partial usage: keep the last good figure (pi's own
 			// context estimate skips those too).
@@ -1362,6 +1439,56 @@ export class AgentHub {
 			}
 		}
 		this.changed();
+	}
+
+	/**
+	 * Count one assistant request against the run's soft budget: steer the wrap-up notice at the budget,
+	 * stop the in-flight turn at 1.5x (runLoop then asks for the final report), abort for good when the
+	 * agent still has not reported BUDGET_STOP_GRACE_REQUESTS requests after that. `continues`: the
+	 * response calls tools, so the run goes on; only then is there anything to nudge or stop.
+	 */
+	private checkBudget(child: Child, continues: boolean): void {
+		const b = child.budget;
+		b.requests++;
+		const session = child.session;
+		// A response that ends the run needs no nudge, and a notice queued behind it would start another turn.
+		if (!continues || b.limit <= 0 || !session || child.status !== "running" || b.stop === "requested" || b.stop === "hard") return;
+		const stopAt = budgetStopThreshold(b.limit);
+		const stop = (): Promise<void> => session.abort().catch(() => {});
+		if (b.stop === "forced") {
+			if (b.requests < stopAt + BUDGET_STOP_GRACE_REQUESTS) return;
+			b.stop = "hard";
+			b.aborting = stop();
+			this.pushActivity(child, `✗ request budget: no report ${BUDGET_STOP_GRACE_REQUESTS} requests after the stop, aborted`);
+			this.changed();
+			return;
+		}
+		if (b.requests >= stopAt) {
+			b.stop = "requested";
+			b.aborting = stop();
+			this.pushActivity(child, `⚠ request budget: stopped at ${b.requests} requests (budget ${b.limit}), asked for its report`);
+			this.changed();
+			return;
+		}
+		if (b.noticeText !== undefined || b.requests < b.limit) return;
+		const notice = buildBudgetNotice(b.requests, b.limit);
+		b.noticeText = notice;
+		this.pushActivity(child, `⚠ request budget: ${b.requests} requests (budget ${b.limit}), asked to wrap up`);
+		// Only worth sending while the run goes on; behind an async boundary so a throwing steer cannot break event handling.
+		const landed = Promise.resolve()
+			.then(() => (session.isStreaming ? session.steer(notice) : undefined))
+			.then(
+				() => {},
+				() => {},
+			);
+		child.steersInFlight.add(landed);
+		void landed.then(() => child.steersInFlight.delete(landed));
+	}
+
+	/** Why a run that hit its budget stop failed. */
+	private budgetError(child: Child, hard: boolean): string {
+		const b = child.budget;
+		return `Soft request budget exceeded (${b.requests} requests; budget ${b.limit})${hard ? " — agent did not report when force-stopped" : ""}`;
 	}
 
 	private lastAssistantError(child: Child): string | undefined {
@@ -1524,6 +1651,10 @@ export class AgentHub {
 			let text = firstText;
 			let current = purpose;
 			child.sentDuringRun.clear();
+			child.budget = { limit: resolveSoftRequestBudget(child.agent.name), requests: 0 };
+			// Messages set aside while the budget stop asks for the final report; they rejoin the batch after it.
+			let carried: IrcMessage[] = [];
+			let carriedLeftovers: string[] = [];
 			while (true) {
 				// Messages that arrived while queued are folded into this run's prompt.
 				const early = child.inbox.splice(0);
@@ -1536,6 +1667,12 @@ export class AgentHub {
 					thrown = e instanceof Error ? e.message : String(e);
 				}
 				if ((child.status as ChildStatus) === "aborted") return;
+				// A budget stop aborts the turn from inside an event: let that settle before the session is used again.
+				if (child.budget.aborting) {
+					await child.budget.aborting;
+					child.budget.aborting = undefined;
+					if ((child.status as ChildStatus) === "aborted") return;
+				}
 				// A steer that raced with the end of the prompt must land in the queue before it is collected.
 				if (child.steersInFlight.size > 0) {
 					await Promise.all([...child.steersInFlight]);
@@ -1551,18 +1688,34 @@ export class AgentHub {
 				// Steers pi never consumed are messages again, and so is everything still held: they get the
 				// continuation below or, once this run has reported, a turn of their own (wake framing, relay).
 				const unsent = child.steered.filter((s) => s.direct || leftovers.includes(s.text)).map((s) => s.msg);
-				leftovers = leftovers.filter((t) => !child.steered.some((s) => s.text === t));
+				leftovers = leftovers.filter((t) => !child.steered.some((s) => s.text === t) && t !== child.budget.noticeText);
 				child.steered = [];
 				child.batchTerminates = undefined;
-				let queued = [...unsent, ...child.held.splice(0), ...child.inbox.splice(0)];
+				let queued = [...carried, ...unsent, ...child.held.splice(0), ...child.inbox.splice(0)];
+				leftovers = [...carriedLeftovers, ...leftovers];
+				carried = [];
+				carriedLeftovers = [];
+				child.runningTools.clear();
+
+				// 0b. Budget stop: the turn was cut at 1.5x the budget. One prompt asks for the final report; what
+				// arrived meanwhile waits until that report has settled (it must not become part of it).
+				if (child.budget.stop === "requested") {
+					child.budget.stop = "forced";
+					carried = queued;
+					carriedLeftovers = leftovers;
+					text = buildBudgetStopPrompt(child.schema !== undefined);
+					continue;
+				}
+				const budgetStopped = child.budget.stop !== undefined;
+				if (child.budget.stop === "hard") thrown = this.budgetError(child, true);
 
 				const output = session.getLastAssistantText() ?? "";
 				const error = thrown ?? this.lastAssistantError(child);
 				child.error = error;
-				child.runningTools.clear();
 
 				// 1. An owner is not done while subagents still owe it a result or reply, or their results are unread.
-				if (queued.some((m) => m.kind === "result") || owedSubagents(child).length > 0) {
+				// A budget-stopped run reports now: later results wake the agent like any message to an idle one.
+				if (!budgetStopped && (queued.some((m) => m.kind === "result") || owedSubagents(child).length > 0)) {
 					let resume = true;
 					if (leftovers.length === 0 && queued.every((m) => this.holdsAtStop(child, m))) {
 						// Nothing queued, or only what must not extend a turn that ended (peer messages, broadcast
@@ -1625,6 +1778,8 @@ export class AgentHub {
 				].join("\n\n");
 				current = firstIrc ? { kind: "reply", to: firstIrc.from } : { kind: "none" };
 				child.sentDuringRun.clear();
+				// A turn of its own is a run of its own for the budget.
+				child.budget = { limit: child.budget.limit, requests: 0 };
 			}
 			child.status = child.error ? "failed" : "idle";
 			child.finishedAt = Date.now();

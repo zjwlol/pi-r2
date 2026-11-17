@@ -10,6 +10,8 @@
  *             is the yielded data if the child yielded that turn, else its final text; no reminders.
  *             The state is reset after every settled run (so each turn needs its own `yield`) and when
  *             an owner resumes with subagent results (a `yield` is only accepted once they all settled).
+ *             A run force-stopped at its request budget gets no reminders: no `yield` in its one forced
+ *             final turn -> failed.
  *
  *  isolated (isolation.ts)
  *    spawn    cwd must be inside a git work tree -> else per-item error
@@ -349,6 +351,10 @@ export function createFeatureHooks(hub: AgentHub): ChildHooks {
 					} else if (status === "failed") {
 						// The run itself errored / was aborted: reminding would not help.
 						o.error = `${child.error || "run failed"} (no result was submitted with \`${YIELD_TOOL_NAME}\`)`;
+					} else if (child.budget.stop !== undefined) {
+						// Force-stopped at its request budget and asked once for a final `yield`: no reminder ladder.
+						status = "failed";
+						o.error = `Soft request budget exceeded (${child.budget.requests} requests; budget ${child.budget.limit}): no \`${YIELD_TOOL_NAME}\` when force-stopped`;
 					} else if (st.reminders < MAX_YIELD_REMINDERS) {
 						st.reminders++;
 						return { retry: yieldReminder(child.schema, st.reminders) };

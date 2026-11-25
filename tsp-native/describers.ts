@@ -940,7 +940,7 @@ function composerFrame(c: Component, a: Any, cx: DescribeContext): ComposerFrame
 	let facts: ComposerFacts | undefined;
 	try {
 		footer = findFooter(a.tui, isFooterComponent);
-		facts = footer ? composerFacts(footer) : undefined;
+		facts = footer ? composerFacts(footer, !cx.checkoutShown) : undefined;
 	} catch (error) {
 		stats.failures.set("Composer.facts", String(error));
 		facts = undefined;

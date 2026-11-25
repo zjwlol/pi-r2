@@ -224,6 +224,7 @@ export type TspEvent =
 	| { ev: "theme"; dark: boolean }
 	| { ev: "motion"; reduce: boolean }
 	| { ev: "visible"; sf?: string; visible: boolean }
+	| { ev: "checkout"; sf?: string; shown: boolean }
 	| { ev: "toggle"; sf: string; id: string; key?: string; collapsed: boolean }
 	| { ev: "select"; sf: string; id: string; item: string }
 	| { ev: "activate"; sf: string; id: string; item: string }

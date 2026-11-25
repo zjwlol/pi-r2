@@ -1,8 +1,11 @@
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
+import { hostname } from "node:os";
+import { pathToFileURL } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { colorToHex, type Component, Container, StdinBuffer, TuiAltScreen, TuiMainScreen } from "@earendil-works/pi-tui";
 import { type BackendHost, NativeBackend } from "./backend.ts";
+import { shellCwd } from "./composer.ts";
 import { describeComponent, describerFor, dispatchEvent, editorAutocompleteOverlay, releaseNativeSideEffects, resetStats, stats as describerStats } from "./describers.ts";
 import { encodeTspHelloQuery, TSP_PREFIX, TspReader } from "./encode.ts";
 import type { DescribeContext, NativeChild, NativeNode, NativeRegions } from "./node.ts";
@@ -224,6 +227,7 @@ export class TspSession {
 	backend: NativeBackend | null = null;
 	hello: TspHello | null = null;
 	lastProbe: ProbeResult | null = null;
+	#cwd: string | undefined;
 	#probe: ProbeRun | null = null;
 	#reader = new TspReader();
 	#input = new InputShim(this);
@@ -295,8 +299,19 @@ export class TspSession {
 
 	attachContext(ctx: ExtensionContext): void {
 		this.ctx = ctx;
+		this.#cwd = ctx.sessionManager.getCwd();
 		this.#paletteCache = null;
-		if (this.backend?.live) this.tui?.requestRender();
+		if (this.backend?.live) {
+			this.#reportCwd();
+			this.tui?.requestRender();
+		}
+	}
+
+	#reportCwd(): void {
+		if (this.#cwd && this.terminal) {
+			const path = pathToFileURL(shellCwd(this.#cwd)).pathname;
+			this.terminal.write(`\x1b]7;file://${hostname()}${path}\x07`);
+		}
 	}
 
 	surrender(): { backend: NativeBackend | null; seq: number; surfaceCounter: number } {
@@ -324,7 +339,7 @@ export class TspSession {
 			this.state = "live";
 			resetStats();
 			try {
-				this.backend.takeOver(handed.seq);
+				this.backend.takeOver(handed.seq, handed.backend.context.checkoutShown);
 			} catch (error) {
 				this.fail(error);
 				return;
@@ -624,6 +639,7 @@ export class TspSession {
 		this.hello = hello;
 		try {
 			this.#eraseRows();
+			this.#reportCwd();
 			resetStats();
 			const adopt = this.#pendingResume && this.backend && new Set(hello.features ?? []).has("adopt");
 			this.#pendingResume = false;

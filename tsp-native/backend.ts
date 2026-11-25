@@ -35,6 +35,7 @@ const STALLED_ACK_MS = 5000;
 const SESSION_ROLE = "omp.session";
 
 export class NativeContext implements DescribeContext {
+	checkoutShown = false;
 	cols: number;
 	reduceMotion: boolean;
 	dark: boolean;
@@ -186,9 +187,10 @@ export class NativeBackend {
 	/**
 	 * The terminal expects the frame sequence to continue on an open surface.
 	 */
-	takeOver(seq: number): void {
+	takeOver(seq: number, checkoutShown = false): void {
 		if (this.#live) return;
 		this.#live = true;
+		this.#cx.checkoutShown = checkoutShown;
 		this.#seq = seq;
 		this.#acked = seq;
 		this.#blobsSent.clear();
@@ -429,6 +431,15 @@ export class NativeBackend {
 				if (e.cols === this.#cx.cols) return;
 				this.#cx.cols = e.cols;
 				this.#host.requestRender();
+				return;
+			}
+			case "checkout": {
+				const e = event as Extract<TspEvent, { ev: "checkout" }>;
+				if (e.sf !== undefined && e.sf !== this.#surfaceId) return;
+				if (e.shown !== this.#cx.checkoutShown) {
+					this.#cx.checkoutShown = e.shown;
+					this.#host.requestRender();
+				}
 				return;
 			}
 			case "theme": {

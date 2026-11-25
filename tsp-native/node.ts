@@ -12,6 +12,7 @@ export interface NativeNode {
 export type NativeChild = NativeNode | Component;
 
 export interface DescribeContext {
+	readonly checkoutShown: boolean;
 	readonly cols: number;
 	readonly reduceMotion: boolean;
 	readonly dark: boolean;

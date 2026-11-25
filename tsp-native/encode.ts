@@ -137,6 +137,7 @@ const EVENT_REQUIRED: Readonly<Record<string, Readonly<Record<string, "string" |
 	theme: { dark: "boolean" },
 	motion: { reduce: "boolean" },
 	visible: { visible: "boolean" },
+	checkout: { shown: "boolean" },
 	toggle: { id: "string", collapsed: "boolean" },
 	select: { id: "string", item: "string" },
 	activate: { id: "string", item: "string" },

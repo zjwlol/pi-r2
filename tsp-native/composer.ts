@@ -27,7 +27,7 @@ function shortCwd(cwd: string): string {
 	return cwd;
 }
 
-function shellCwd(cwd: string): string {
+export function shellCwd(cwd: string): string {
 	const pwd = process.env.PWD;
 	if (!pwd || pwd === cwd) return cwd;
 
@@ -144,7 +144,7 @@ function sameSig(a: readonly unknown[], b: readonly unknown[]): boolean {
 	return true;
 }
 
-export function composerFacts(footer: Any): ComposerFacts | undefined {
+export function composerFacts(footer: Any, showPath: boolean): ComposerFacts | undefined {
 	const session: Any | undefined = footer.session;
 	const data: Any | undefined = footer.footerData;
 	if (!session || !data) return undefined;
@@ -168,7 +168,7 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 		}
 	}
 	const sessionManager: Any | undefined = session.sessionManager;
-	const cwd = String(sessionManager?.getCwd?.() ?? "");
+	const cwd = showPath ? String(sessionManager?.getCwd?.() ?? "") : "";
 	const nameValue: unknown = sessionManager?.getSessionName?.();
 	const sessionName = typeof nameValue === "string" && nameValue.trim() ? nameValue.trim() : undefined;
 	const statusMap: unknown = data.getExtensionStatuses?.();

@@ -1,86 +1,3 @@
-/**
- * Git-worktree isolation for subagents (modeled on oh-my-pi's task/worktree.ts, much smaller).
- *
- * Lifecycle (driven by the hub):
- *   createWorktree(parentCwd, id)  -> detached worktree whose first commit (baseCommit) is an exact
- *                                     snapshot of the parent's *current working state*
- *   ...child runs with cwd = wt.cwd...
- *   mergeDelta(wt)                 -> child's changes since baseCommit applied to the parent's working
- *                                     tree (never staged/committed); baseline advances on success
- *                                     (measured from the fork point if the child moved HEAD, see below)
- *   removeWorktree(wt) / removeAllWorktrees()
- *
- * Baseline technique: instead of replaying `git diff HEAD` + copying untracked files, the parent's
- * working state is captured as a git tree through a *temporary index* (copy of the real index so
- * stat caches stay valid, then `GIT_INDEX_FILE=tmp git add -A --sparse` + `write-tree`). That
- * reproduces staged + unstaged + deleted + untracked-non-ignored files, modes, symlinks and binaries
- * exactly, without touching the parent's index, working tree, refs or stash (only new objects are
- * written to the shared object store). The tree is committed (`commit-tree`, parent = HEAD) and that
- * commit is checked out with `git worktree add --detach`, so it *is* the worktree's HEAD/baseCommit.
- * The same snapshot routine (run inside the worktree) yields the delta tree ("theirs"); the delta
- * patch is `git diff-tree --binary baseCommit theirs`.
- *
- * Moved HEAD: the delta is state-based (baseCommit tree -> worktree snapshot) wherever the agent's own
- * commits went, as long as baseCommit is still an ancestor of the worktree's HEAD. If it is not (the
- * agent switched / checked out / reset to another commit, amended or rebased the baseline), the
- * working tree may no longer hold what baseCommit added on top of that history - notably the spawner's
- * uncommitted work, which exists only inside baseCommit - and a delta from the baseline would revert
- * all of it in the parent. Whether it does is decided per path, for the paths that differ between the
- * fork point (`git merge-base baseCommit HEAD`) and baseCommit (see deltaOrigin):
- *   - the snapshot or HEAD's commit still holds the baseline's version (`commit --amend`, `reset
- *     --soft/--mixed`, rebase; whatever the agent then did to other files): state-based as usual, so the
- *     spawner's own work is neither offered again nor reverted;
- *   - the snapshot is back at the fork's version (`reset --hard`, `switch`, `checkout`): an effect of
- *     moving HEAD, not part of the delta;
- *   - the snapshot holds something else: it builds on the baseline if merging it with the baseline on
- *     top of the fork changes nothing (it already contains what the baseline added; state-based), on
- *     the fork if that merge is clean but adds something (measured from the fork's version, so the
- *     3-way merge below keeps both sides), and is undecidable if that merge conflicts.
- * The delta (patch, files, stat) is measured from the resulting origin (DeltaMeta.from: the baseline
- * with the fork's version at the paths measured from the fork); result messages say that HEAD had
- * moved. An undecidable path and a HEAD without any common ancestor are never merged automatically
- * (conflict, parent untouched; in the latter case the saved patch holds the agent's files as additions
- * only, so applying it cannot delete anything). An unborn HEAD (`checkout --orphan`) and content-level
- * changes while HEAD still descends from the baseline (`git checkout <old> -- .`, `git restore
- * --source`) stay state-based. advanceBaseline() records a moved HEAD as second parent of the new
- * baseline commit, so a follow-up run that returns to that commit (`git switch <its branch>`) is
- * measured from it and neither reverts nor re-delivers what was already merged.
- *
- * Apply strategy (exact, never fuzzy, no `git apply` into the parent): the plan is a set of
- * per-path transitions pre-blob -> post-blob. Every path of the parent working tree is first compared
- * with `pre` as git sees it (`git hash-object --stdin-paths`, so eol conversion / clean filters such as
- * git-lfs apply exactly as for `git add`; a directory counts as "no blob").
- *   - all touched paths still equal the baseline (or already equal the child's version): the plan is
- *     baseline -> child for the paths that still need it.
- *   - some paths diverged: 3-way merge entirely in object space with `git merge-tree --write-tree
- *     --merge-base=<baseCommit or fork point> <parentSnapshot> <theirs>` (git >= 2.40); the parent index is
- *     never touched (unlike `git apply --3way`). A conflict-free result gives the plan parentSnapshot -> merged.
- *   Execution writes whole blobs (`git cat-file --filters --path=<p>`, i.e. smudged like a checkout)
- *   via temp file + rename, deletions deepest-first then writes shallowest-first (file<->dir and
- *   symlink transitions), never through a symlinked ancestor. Each path is re-verified byte-for-byte
- *   right before it is written and every path is re-checked afterwards. On any failure (concurrent
- *   edit, EACCES/ENOSPC, ...) already written paths are rolled back to their exact previous bytes - but
- *   only if they still hold exactly what the merge wrote; anything else is left alone (a copy is
- *   saved) and reported. So "applied" always means the parent's files now hold the intended content.
- *   Anything else is a "conflict" (parent untouched) or "error" (details per file); patch saved,
- *   worktree kept.
- *
- * Storage: worktrees, saved patches, rescued copies and temp files live in a private per-user directory
- * ($PI_TASK_WORKTREES_DIR, else $XDG_CACHE_HOME/pi/task-worktrees, else ~/.cache/pi/task-worktrees),
- * owner-checked; directories created here are 0700 (an existing directory is never chmodded - if it is
- * accessible by others a private `.pi-task-worktrees/` subdirectory is used); files are 0600 + O_EXCL.
- *
- * Limitations: submodules and nested (non-submodule) repositories are not reproduced in the worktree
- * and their changes are ignored; ignored files (node_modules, build output) are neither copied in
- * nor merged back; only git's file modes are reproduced (exec bit / symlink, not e.g. 0600) and empty
- * directories are not. Writes go through `.pi-merge-*` temp files next to their targets (left behind
- * only if the process dies mid-merge). In sparse checkouts the worktree
- * inherits the parent's sparse patterns; changes to files outside the parent's cone (not present in
- * its working tree) are reported as conflicts, and deleting outside-cone files is not detected.
- * Worktree/Delta objects carry hidden metadata (WeakMaps): pass the same objects back; `baseCommit`
- * is updated in place on a successful merge. Nothing is cleaned up automatically (no exit hooks).
- */
-
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -88,27 +5,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-// ---------------------------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------------------------
-
 export interface Worktree {
-	/** Top-level of the parent checkout (where merges are applied). */
 	repoRoot: string;
-	/** Worktree directory. */
 	path: string;
-	/** Child cwd inside the worktree (parent cwd mapped relative to repoRoot). */
 	cwd: string;
-	/** Commit in the worktree representing the last merged state (baseline). */
 	baseCommit: string;
 }
 
 export interface Delta {
-	/** Binary-safe `git diff` (a/ b/ prefixes, relative to the repo root). Empty string if no changes. */
 	patch: string;
-	/** Changed paths relative to the repo root. */
 	files: string[];
-	/** `git diff --stat` summary (empty if no changes). */
 	stat: string;
 }
 
@@ -119,57 +25,35 @@ export interface MergeResult {
 	patchFile?: string;
 }
 
-/** Refuse to snapshot a parent whose untracked (non-ignored) content exceeds this. */
 export const MAX_UNTRACKED_BYTES = 200 * 1024 * 1024;
 
-/** Files larger than this are not merged automatically (their bytes are held in memory for rollback). */
 export const MAX_MERGE_FILE_BYTES = 64 * 1024 * 1024;
-
-// ---------------------------------------------------------------------------------------------
-// Internal state
-// ---------------------------------------------------------------------------------------------
 
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 const PI_IDENT = { name: "pi", email: "pi@localhost" };
 
 interface WorktreeMeta {
-	/** Shared git dir (absolute), used when repoRoot is gone at removal time. */
 	commonDir: string;
-	/** Lock key (realpath of repoRoot). */
 	lockKey: string;
 }
 
 interface DeltaMeta {
-	/** Exact patch bytes (the string form may be lossy for non-UTF-8 text). */
-	raw: Buffer;
-	/** Snapshot tree of the worktree the delta was computed against ("theirs"). */
-	tree: string;
-	/** baseCommit the delta belongs to (staleness check; the baseline that advances on a merge). */
-	base: string;
 	/**
-	 * What the delta is measured from: `base`, or - when the agent moved HEAD off the baseline - the
-	 * fork point `git merge-base base HEAD`, or a synthetic commit holding the baseline with the fork's
-	 * version at some paths (see deltaOrigin). A commit, except for `unrelated`.
+	 * Decoding the patch as UTF-8 can lose bytes.
 	 */
+	raw: Buffer;
+	tree: string;
+	base: string;
 	from: string;
-	/** The fork point, when at least one path is measured from it (`from` differs from `base`). */
 	fork?: string;
-	/** Paths that could be built on either the baseline or the fork: never merged automatically. */
 	unsure?: string[];
-	/** HEAD shares no history with `base`: `from` is the empty tree; never merged automatically. */
 	unrelated?: boolean;
 }
 
 const worktreeMeta = new WeakMap<Worktree, WorktreeMeta>();
 const deltaMeta = new WeakMap<Delta, DeltaMeta>();
-/** Worktrees created by this process and not yet removed/retained (creation order). */
 const liveWorktrees = new Set<Worktree>();
-/** Per-repoRoot async mutex chains. */
 const repoLocks = new Map<string, Promise<void>>();
-
-// ---------------------------------------------------------------------------------------------
-// git runner
-// ---------------------------------------------------------------------------------------------
 
 class GitError extends Error {
 	constructor(
@@ -193,11 +77,8 @@ interface GitOptions {
 	cwd: string;
 	env?: Record<string, string>;
 	signal?: AbortSignal;
-	/** Resolve (instead of throwing) on non-zero exit. */
 	allowFail?: boolean;
-	/** Data written to stdin. */
 	input?: Buffer | string;
-	/** Override the stdout/stderr buffer cap. */
 	maxBuffer?: number;
 }
 
@@ -207,7 +88,6 @@ interface GitResult {
 	stderr: string;
 }
 
-/** Env vars that would redirect git away from the cwd-discovered repository. */
 const SCRUBBED_ENV = [
 	"GIT_DIR",
 	"GIT_WORK_TREE",
@@ -286,7 +166,7 @@ function git(args: string[], opts: GitOptions): Promise<GitResult> {
 					return;
 				}
 				if (err.code === "ENOENT" && typeof err.syscall === "string" && err.syscall.startsWith("spawn")) {
-					// spawn reports a missing cwd the same way as a missing executable.
+					// `spawn` reports `ENOENT` for both a missing cwd and a missing executable.
 					reject(existsSync(opts.cwd) ? new GitMissingError() : new Error(`Directory ${opts.cwd} does not exist.`));
 					return;
 				}
@@ -302,7 +182,7 @@ function git(args: string[], opts: GitOptions): Promise<GitResult> {
 				reject(new GitError(args, code, stderrText || err.message));
 			},
 		);
-		child.stdin?.on("error", () => {}); // EPIPE if git exits early; reported via the exit code
+		child.stdin?.on("error", () => {}); // An early exit causing `EPIPE` is reported by the exit code.
 		child.stdin?.end(opts.input);
 	});
 }
@@ -322,7 +202,6 @@ function splitNulBytes(buf: Buffer): Buffer[] {
 	return out;
 }
 
-/** Printable ASCII as is, everything else as \xNN. */
 function escapeBytes(buf: Buffer): string {
 	let out = "";
 	for (const b of buf) out += b >= 0x20 && b < 0x7f && b !== 0x5c ? String.fromCharCode(b) : `\\x${b.toString(16).padStart(2, "0")}`;
@@ -352,7 +231,6 @@ function randomSuffix(): string {
 	return randomBytes(4).toString("hex");
 }
 
-/** "error: ..." / "fatal: ..." lines of git stderr, condensed for user-facing messages. */
 function summarizeGitStderr(stderr: string, max = 4): string {
 	const lines = stderr
 		.split("\n")
@@ -382,10 +260,6 @@ async function gitAtLeast(major: number, minor: number): Promise<boolean> {
 	return ma > major || (ma === major && mi >= minor);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Private storage
-// ---------------------------------------------------------------------------------------------
-
 function configuredRoot(): string {
 	const override = process.env.PI_TASK_WORKTREES_DIR?.trim();
 	if (override) return path.resolve(override);
@@ -394,7 +268,6 @@ function configuredRoot(): string {
 	return path.join(cache, "pi", "task-worktrees");
 }
 
-/** mkdir `dir` with mode 0700 (missing parents too); true if `dir` itself was created by this call. */
 async function mkdirOwn(dir: string, depth = 0): Promise<boolean> {
 	try {
 		await fs.mkdir(dir, { mode: 0o700 });
@@ -410,7 +283,6 @@ async function mkdirOwn(dir: string, depth = 0): Promise<boolean> {
 	}
 }
 
-/** `dir` must be a directory owned by the current user; returns whether others have no access. */
 async function checkOwnDir(dir: string): Promise<boolean> {
 	const st = await fs.stat(dir);
 	if (!st.isDirectory()) throw new Error(`Task worktree storage ${dir} is not a directory.`);
@@ -424,10 +296,6 @@ async function checkOwnDir(dir: string): Promise<boolean> {
 	return process.platform === "win32" || (st.mode & 0o077) === 0;
 }
 
-/**
- * Private storage root. Permissions are only changed on directories created here; if the configured
- * directory already exists and is accessible by others, a private `.pi-task-worktrees/` subdirectory is used.
- */
 async function storageRoot(): Promise<string> {
 	const root = configuredRoot();
 	const created = await mkdirOwn(root);
@@ -452,27 +320,20 @@ async function storageRoot(): Promise<string> {
 	return fs.realpath(dir);
 }
 
-/** Private per-user storage root (realpath), or one of its subdirectories. */
 async function storageDir(...sub: string[]): Promise<string> {
 	const root = await storageRoot();
 	if (sub.length === 0) return root;
 	const dir = path.join(root, ...sub);
 	const created = await mkdirOwn(dir);
-	// Inside the private root a pre-existing looser subdir is not reachable by others: never chmod it.
 	if (!(await checkOwnDir(dir)) && created) await fs.chmod(dir, 0o700);
 	return dir;
 }
 
-/** Create a new private file (O_EXCL, 0600) with `data` in the private temp dir. */
 async function writePrivateFile(dir: string, name: string, data: Buffer): Promise<string> {
 	const file = path.join(dir, name);
 	await fs.writeFile(file, data, { flag: "wx", mode: 0o600 });
 	return file;
 }
-
-// ---------------------------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------------------------
 
 async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 	const prev = repoLocks.get(key) ?? Promise.resolve();
@@ -528,7 +389,6 @@ interface RepoInfo {
 	commonDir: string;
 }
 
-/** Resolve the work-tree top level for `cwd`. Throws a user-facing error outside a git work tree. */
 async function repoInfo(cwd: string): Promise<RepoInfo> {
 	let stat;
 	try {
@@ -556,7 +416,6 @@ async function repoInfo(cwd: string): Promise<RepoInfo> {
 	return { repoRoot: path.resolve(repoRoot), prefix, commonDir };
 }
 
-/** True if `cwd` is inside a git work tree (and git is available). Never throws. */
 export async function isGitRepo(cwd: string): Promise<boolean> {
 	try {
 		const res = await git(["rev-parse", "--is-inside-work-tree"], { cwd, allowFail: true });
@@ -572,7 +431,9 @@ async function resolveHead(cwd: string, signal?: AbortSignal): Promise<string | 
 	return sha || undefined;
 }
 
-/** Untracked, non-ignored entries. Nested repositories show up as "dir/" entries. */
+/**
+ * `ls-files --others` appends `/` to nested repository paths.
+ */
 async function listUntracked(cwd: string, signal?: AbortSignal): Promise<{ files: string[]; nested: string[] }> {
 	const res = await git(["ls-files", "--others", "--exclude-standard", "-z"], { cwd, signal });
 	const files: string[] = [];
@@ -590,7 +451,8 @@ async function sumSizes(root: string, files: readonly string[]): Promise<number>
 			const st = await fs.lstat(path.join(root, f));
 			return st.isFile() ? st.size : 0;
 		} catch {
-			return 0; // vanished
+			// An untracked file can disappear after it is listed.
+			return 0;
 		}
 	});
 	return sizes.reduce((a, b) => a + b, 0);
@@ -603,13 +465,8 @@ function formatBytes(n: number): string {
 	return `${n} B`;
 }
 
-/** Copied-index failures worth retrying from a fresh index (as opposed to unreadable files etc.). */
 const INDEX_FORMAT_ERROR = /index file|index uses|bad signature|index entry format|unknown index/i;
 
-/**
- * Write the full working state of `dir` (tracked + untracked non-ignored, excluding nested repos and
- * ignored files) as a tree object, using a throwaway index so the real index is never modified.
- */
 async function snapshotTree(
 	dir: string,
 	head: string | undefined,
@@ -620,7 +477,7 @@ async function snapshotTree(
 	const tmpIndex = path.join(await storageDir("tmp"), `index-${process.pid}-${randomSuffix()}`);
 	const env = { GIT_INDEX_FILE: tmpIndex };
 	const excludes = nested.map((p) => `:(top,exclude,literal)${p}`);
-	// --sparse: also record untracked/modified paths outside a sparse-checkout cone (else git add exits 1).
+	// Adding changes outside the sparse checkout cone requires `--sparse`.
 	const sparse = (await gitAtLeast(2, 34)) ? ["--sparse"] : [];
 	const addAll = () => git(["add", "-A", ...sparse, "--", ".", ...excludes], { cwd: dir, env, signal });
 	try {
@@ -629,12 +486,11 @@ async function snapshotTree(
 			const st = await fs.stat(indexPath);
 			await fs.copyFile(indexPath, tmpIndex, fs.constants.COPYFILE_EXCL);
 			await fs.chmod(tmpIndex, 0o600);
-			// Keep the copy's mtime at (just below) the original's: a newer index would make git trust stat
-			// data of entries that were "racily clean" in the original; much older forces re-hashing.
+			// A newer index mtime can make stale stat data look valid.
 			await fs.utimes(tmpIndex, st.atime, new Date(st.mtimeMs - 1));
 			seeded = true;
 		} catch {
-			// no index yet (fresh repo) - start from HEAD below
+			// A fresh repository may not have an index yet.
 		}
 		try {
 			if (!seeded && head) await git(["read-tree", head], { cwd: dir, env, signal });
@@ -642,7 +498,6 @@ async function snapshotTree(
 		} catch (err) {
 			const retry = seeded && !signal?.aborted && err instanceof GitError && INDEX_FORMAT_ERROR.test(err.stderr);
 			if (!retry) throw err;
-			// Copied index unusable (exotic extensions etc.): rebuild from HEAD (slower, re-hashes).
 			await fs.rm(tmpIndex, { force: true });
 			if (head) await git(["read-tree", head], { cwd: dir, env, signal });
 			await addAll();
@@ -703,21 +558,12 @@ interface DeltaOrigin {
 	unrelated?: boolean;
 }
 
-/**
- * What a worktree's changes (snapshot `tree`) are measured from. Normally the baseline. If the agent
- * moved HEAD so that the baseline is no longer an ancestor of it (switch / checkout / reset to another
- * commit, amend, rebase), the working tree may have lost what the baseline commit holds on top of that
- * history - including the spawner's uncommitted work - and a delta from the baseline would revert it
- * in the parent. The paths that lost it are then measured from where HEAD forked (`git merge-base`,
- * see forkOrigin); without a common ancestor everything is measured from the empty tree, i.e. as
- * additions only (`unrelated`, never merged automatically).
- */
 async function deltaOrigin(dir: string, base: string, tree: string): Promise<DeltaOrigin> {
 	const head = await resolveHead(dir);
-	// Unborn HEAD (`checkout --orphan`): the files are still the baseline's, stay state-based.
+	// `checkout --orphan` can leave the baseline files intact.
 	if (!head || head === base) return { from: base };
 	const anc = await git(["merge-base", "--is-ancestor", base, head], { cwd: dir, allowFail: true });
-	if (anc.code === 0) return { from: base }; // the agent committed on top of the baseline
+	if (anc.code === 0) return { from: base };
 	if (anc.code !== 1) {
 		throw new Error(`could not relate HEAD to the task baseline (${summarizeGitStderr(anc.stderr) || `git merge-base exited ${anc.code}`})`);
 	}
@@ -727,30 +573,15 @@ async function deltaOrigin(dir: string, base: string, tree: string): Promise<Del
 	if (mb.code !== 1) {
 		throw new Error(`could not find where HEAD forked from the task baseline (${summarizeGitStderr(mb.stderr) || `git merge-base exited ${mb.code}`})`);
 	}
-	// Unrelated history: nothing to measure from. (The empty tree is known to git without being stored.)
+	// The empty tree is recognized without writing its object.
 	const empty = await gitText(["hash-object", "-t", "tree", "--stdin"], { cwd: dir, input: "" });
 	return { from: empty, unrelated: true };
 }
 
 const sameEntry = (a: TreeEntry | undefined, b: TreeEntry | undefined) => a?.mode === b?.mode && a?.oid === b?.oid;
 
-/**
- * Origin for a worktree whose HEAD left the baseline at `fork`. Only the paths that differ between
- * the fork and the baseline can be affected; each is attributed on its own:
- *   - snapshot or HEAD's commit still holds the baseline's version (amend, `reset --soft/--mixed`,
- *     rebase): measured from the baseline as usual;
- *   - snapshot is back at the fork's version (`reset --hard`, switch, checkout): an effect of moving
- *     HEAD - measured from the fork, i.e. no change;
- *   - snapshot holds something else: merge it with the baseline on top of the fork. Nothing added: it
- *     already contains what the baseline added, measured from the baseline. Clean but different: it was
- *     built on the fork's version, measured from the fork (the merge into the parent then keeps both
- *     sides). Conflict (or no usable merge): it could be either - `unsure`, measured from the fork so
- *     that the saved patch cannot revert the spawner's work.
- * The origin is the baseline with the fork's entry at every path measured from the fork.
- */
 async function forkOrigin(dir: string, base: string, head: string, fork: string, tree: string): Promise<DeltaOrigin> {
 	const lost = await rawDiff(dir, fork, base);
-	// Names that do not survive as strings cannot be attributed one by one: everything from the fork.
 	if (lost.nonUtf8.length > 0) return { from: fork, fork };
 	if (lost.paths.length === 0) return { from: base };
 	const [now, atHead] = await Promise.all([rawDiff(dir, base, tree), rawDiff(dir, base, head)]);
@@ -769,7 +600,6 @@ async function forkOrigin(dir: string, base: string, head: string, fork: string,
 		let conflicted = new Set<string>();
 		if (await gitAtLeast(2, 40)) {
 			const theirs = await commitTree(dir, tree, [fork], "pi: task worktree state");
-			// No rename detection: the verdict is per path.
 			const mt = await git(
 				["-c", "merge.renames=false", "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", `--merge-base=${fork}`, base, theirs],
 				{ cwd: dir, allowFail: true },
@@ -783,7 +613,7 @@ async function forkOrigin(dir: string, base: string, head: string, fork: string,
 		const added = merged ? new Set((await rawDiff(dir, tree, merged)).paths) : undefined;
 		for (const p of open) {
 			if (!added || conflicted.has(p)) unsure.push(p);
-			else if (!added.has(p)) continue; // already contains what the baseline added
+			else if (!added.has(p)) continue;
 			fromFork.push(p);
 		}
 	}
@@ -809,7 +639,6 @@ async function forkOrigin(dir: string, base: string, head: string, fork: string,
 
 const shortOid = (oid: string) => oid.slice(0, 10);
 
-/** Sentence for results whose delta was (partly) measured from a fork point instead of the baseline, else "". */
 function movedNote(d: Delta): string {
 	const m = deltaMeta.get(d);
 	if (!m?.fork || m.unrelated || (m.unsure && m.unsure.length > 0)) return "";
@@ -817,7 +646,6 @@ function movedNote(d: Delta): string {
 	return ` Note: the agent moved HEAD off the task baseline; ${what} were measured from commit ${shortOid(m.fork)}, where its HEAD forked from the baseline.`;
 }
 
-/** What a saved patch of `d` is relative to (for user-facing messages). */
 function patchOrigin(d: Delta): string {
 	const m = deltaMeta.get(d);
 	if (m?.unrelated) return "every file of the agent's checkout as an addition, as its HEAD shares no history with the task's baseline";
@@ -827,10 +655,6 @@ function patchOrigin(d: Delta): string {
 	}
 	return "relative to the task's baseline";
 }
-
-// ---------------------------------------------------------------------------------------------
-// Exact, verified writes into the parent working tree
-// ---------------------------------------------------------------------------------------------
 
 interface TreeEntry {
 	mode: string;
@@ -848,19 +672,14 @@ const SYMLINK = "120000";
 const isRegularMode = (mode: string) => mode === "100644" || mode === "100755";
 
 interface RawDiff {
-	/** Changed paths (gitlinks ignored), in git order. */
 	paths: string[];
-	/** Changed paths whose bytes are not valid UTF-8 (escaped); such merges are refused. */
 	nonUtf8: string[];
-	/** Entries on the "from" side (absent paths omitted). */
 	pre: Map<string, TreeEntry>;
-	/** Entries on the "to" side (absent paths omitted). */
 	post: Map<string, TreeEntry>;
 }
 
 const NULL_MODE = "000000";
 
-/** Per-path entries changed between two tree-ishes (`git diff-tree --raw`), O(changes). */
 async function rawDiff(cwd: string, from: string, to: string): Promise<RawDiff> {
 	const out = await git(["diff-tree", "-r", "-z", "--raw", "--no-abbrev", "--no-renames", "--ignore-submodules=all", from, to], {
 		cwd,
@@ -874,8 +693,6 @@ async function rawDiff(cwd: string, from: string, to: string): Promise<RawDiff> 
 		if (!meta.startsWith(":") || fileBytes.length === 0) continue;
 		const [srcMode = "", dstMode = "", srcOid = "", dstOid = ""] = meta.slice(1).split(" ");
 		if (srcMode === GITLINK || dstMode === GITLINK) continue;
-		// Paths travel as JS strings; a name that does not survive the UTF-8 round trip would be
-		// written/compared under a mangled name - refuse instead.
 		if (file.includes("\uFFFD") || !Buffer.from(file, "utf8").equals(fileBytes)) {
 			res.nonUtf8.push(escapeBytes(fileBytes));
 			continue;
@@ -902,25 +719,20 @@ async function compareCtx(repoRoot: string): Promise<CompareCtx> {
 
 const sha256 = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
 
-/** State of one path in a working tree. */
 interface WorkState {
-	/** "blocked": an ancestor is a symlink or a special file - never read or written through. */
 	kind: "absent" | "dir" | "file" | "symlink" | "other" | "blocked";
-	/** Exact bytes (file content or symlink target); kept for verification and byte-exact rollback. */
 	bytes?: Buffer;
-	/** sha256 of `bytes`. */
 	raw?: string;
 	exec?: boolean;
-	/** Permission bits of a regular file. */
 	perm?: number;
-	/** Blob id as `git add` would record it: filters/eol conversion applied for files, raw for symlinks. */
+	/**
+	 * Regular file IDs must reflect the same clean filters as staging.
+	 */
 	oid?: string;
-	/** Regular file over MAX_MERGE_FILE_BYTES: not read, never merged automatically. */
 	size?: number;
 	tooLarge?: boolean;
 }
 
-/** lstat every ancestor of `rel`; "blocked" if one is a symlink or special file, "absent" if one is a file/missing. */
 async function ancestorsState(root: string, rel: string): Promise<"ok" | "absent" | "blocked"> {
 	const parts = rel.split("/");
 	parts.pop();
@@ -968,7 +780,6 @@ function sameBytes(a: WorkState, b: WorkState): boolean {
 	return a.kind === b.kind && a.raw === b.raw && a.exec === b.exec;
 }
 
-/** Read `paths` and compute the blob ids git would record (via `git hash-object`, so filters apply). */
 async function readStates(root: string, paths: readonly string[], ctx: CompareCtx): Promise<Map<string, WorkState>> {
 	const states = await mapLimit(paths, 16, (p) => readState(root, p));
 	const map = new Map<string, WorkState>();
@@ -981,8 +792,7 @@ async function readStates(root: string, paths: readonly string[], ctx: CompareCt
 			st.oid = createHash(ctx.algo).update(`blob ${st.bytes.length}\0`).update(st.bytes).digest("hex");
 		}
 	});
-	// `--stdin-paths` C-unquotes a line starting with `"` and drops a trailing CR: such paths (and ones
-	// containing a newline) are passed as an argument instead.
+	// `--stdin-paths` splits on newlines, unquotes leading double quotes and strips trailing carriage returns.
 	const needsArg = (p: string) => p.includes("\n") || p.startsWith('"') || p.endsWith("\r");
 	const batch = files.filter((p) => !needsArg(p));
 	if (batch.length > 0) {
@@ -1000,10 +810,6 @@ async function readStates(root: string, paths: readonly string[], ctx: CompareCt
 	return map;
 }
 
-/**
- * A path that is only "blocked" because one of its ancestors is a symlink/file that this merge deletes
- * (e.g. symlink `s` replaced by a real directory `s/`) is effectively absent.
- */
 function unblock(states: Map<string, WorkState>, deleting: ReadonlySet<string>): void {
 	for (const [p, st] of states) {
 		if (st.kind !== "blocked") continue;
@@ -1017,7 +823,6 @@ function unblock(states: Map<string, WorkState>, deleting: ReadonlySet<string>):
 	}
 }
 
-/** Does the working state match the tree entry as git sees it? A directory counts as "no blob here". */
 function matches(expected: TreeEntry | undefined, st: WorkState, ctx: CompareCtx): boolean {
 	if (!expected) return st.kind === "absent" || st.kind === "dir";
 	if (expected.mode === SYMLINK) {
@@ -1040,18 +845,14 @@ function describeState(expected: TreeEntry | undefined, st: WorkState): string {
 
 interface PlanItem {
 	path: string;
-	/** Expected current entry (undefined = no blob). */
 	pre?: TreeEntry;
-	/** Intended entry (undefined = delete). */
 	post?: TreeEntry;
 }
 
 interface Op {
 	path: string;
 	kind: "deleted" | "written";
-	/** State before the merge touched the path (bytes kept for exact rollback). */
 	before: WorkState;
-	/** What was written (for "written"). */
 	wrote?: WorkState;
 }
 
@@ -1063,7 +864,6 @@ class ConcurrentChange extends Error {
 
 const depth = (p: string) => p.split("/").length;
 
-/** Sizes of the intended (post) blobs of a plan, by path. */
 async function blobSizes(root: string, items: readonly PlanItem[]): Promise<Map<string, number>> {
 	const withPost = items.filter((i) => i.post);
 	const sizes = new Map<string, number>();
@@ -1077,7 +877,6 @@ async function blobSizes(root: string, items: readonly PlanItem[]): Promise<Map<
 	return sizes;
 }
 
-/** Conflict reason if any current file or intended blob exceeds MAX_MERGE_FILE_BYTES. */
 function tooLargeList(states: Map<string, WorkState>, postSizes?: Map<string, number>): string | undefined {
 	const big: string[] = [];
 	for (const [p, st] of states) if (st.tooLarge) big.push(`${p} (${formatBytes(st.size ?? 0)})`);
@@ -1086,12 +885,10 @@ function tooLargeList(states: Map<string, WorkState>, postSizes?: Map<string, nu
 	return `files larger than ${formatBytes(MAX_MERGE_FILE_BYTES)} are not merged automatically: ${[...new Set(big)].join(", ")}`;
 }
 
-/** "EACCES: permission denied" without the (temp) path Node appends. */
 function fsErrorText(err: unknown): string {
 	return errorMessage(err).replace(/, \w+ '[^']*'( -> '[^']*')?$/, "");
 }
 
-/** Remove now-empty directories from `rel`'s parent up to (excluding) root. */
 async function pruneEmptyParents(root: string, rel: string): Promise<void> {
 	let dir = path.dirname(rel);
 	while (dir && dir !== ".") {
@@ -1104,7 +901,6 @@ async function pruneEmptyParents(root: string, rel: string): Promise<void> {
 	}
 }
 
-/** Create missing ancestors of `rel` (recorded in `created`); refuses symlinked or non-directory ancestors. */
 async function ensureParents(root: string, rel: string, created: string[]): Promise<void> {
 	const parts = rel.split("/");
 	parts.pop();
@@ -1125,7 +921,6 @@ async function ensureParents(root: string, rel: string, created: string[]): Prom
 	}
 }
 
-/** Write `bytes` as a new temp file/symlink next to `rel`; returns its absolute path. */
 async function writeTemp(root: string, rel: string, bytes: Buffer, link: boolean, perm: number): Promise<string> {
 	const tmp = path.join(path.dirname(path.join(root, rel)), `.pi-merge-${process.pid}-${randomSuffix()}`);
 	try {
@@ -1141,7 +936,6 @@ async function writeTemp(root: string, rel: string, bytes: Buffer, link: boolean
 	}
 }
 
-/** Atomically put `bytes` at `rel` as a file (mode/perm) or symlink, via a temp name + rename. */
 async function putEntry(root: string, rel: string, bytes: Buffer, link: boolean, perm: number): Promise<void> {
 	const tmp = await writeTemp(root, rel, bytes, link, perm);
 	try {
@@ -1157,7 +951,6 @@ function umaskedPerm(exec: boolean): number {
 	return (exec ? 0o777 : 0o666) & ~mask;
 }
 
-/** Permission bits for writing `entry`: keep the existing file's bits where possible. */
 function permFor(entry: TreeEntry, before: WorkState): number {
 	const exec = entry.mode === "100755";
 	if (before.kind !== "file" || before.perm === undefined) return umaskedPerm(exec);
@@ -1170,7 +963,6 @@ async function blobForWorktree(root: string, rel: string, entry: TreeEntry, ctx:
 		const bytes = (await git(["cat-file", "blob", entry.oid], { cwd: root })).stdout;
 		return { bytes, link: ctx.symlinks };
 	}
-	// Smudge filters / eol conversion exactly as a checkout would.
 	try {
 		const out = await git(["cat-file", "--filters", `--path=${rel}`, entry.oid], { cwd: root, maxBuffer: MAX_MERGE_FILE_BYTES });
 		return { bytes: out.stdout, link: false };
@@ -1182,7 +974,6 @@ async function blobForWorktree(root: string, rel: string, entry: TreeEntry, ctx:
 	}
 }
 
-/** rmdir `dir` and any empty subdirectories (fails, removing nothing more, if a non-directory is found). */
 async function removeEmptyTree(dir: string): Promise<void> {
 	for (const e of await fs.readdir(dir, { withFileTypes: true })) {
 		if (!e.isDirectory()) throw new Error(`${e.name} is in the way`);
@@ -1191,7 +982,6 @@ async function removeEmptyTree(dir: string): Promise<void> {
 	await fs.rmdir(dir);
 }
 
-/** Recursively list non-directory entries under `rel` (no symlink following). */
 async function listFilesUnder(root: string, rel: string): Promise<string[]> {
 	const out: string[] = [];
 	const walk = async (r: string) => {
@@ -1205,10 +995,6 @@ async function listFilesUnder(root: string, rel: string): Promise<string[]> {
 	return out;
 }
 
-/**
- * Save `st` (or, for a large file not held in memory, the file at `root/rel`) under
- * rescued/<stamp>/<which>/<rel>; returns the copy's path.
- */
 async function rescueCopy(root: string, rel: string, st: WorkState, stamp: string, which: "current" | "original"): Promise<string | undefined> {
 	if (!st.bytes && !(st.kind === "file" && st.tooLarge)) return undefined;
 	const dir = await storageDir("rescued", stamp);
@@ -1224,18 +1010,10 @@ async function rescueCopy(root: string, rel: string, st: WorkState, stamp: strin
 
 type ExecResult =
 	| { ok: true }
-	/** Nothing in the parent was changed (or every change was rolled back cleanly). */
 	| { ok: false; untouched: true; detail: string }
 	| { ok: false; untouched: false; detail: string };
 
-/**
- * Write `items` into the parent working tree. Every path must currently match `pre` (as git sees
- * it) and is re-verified byte-for-byte right before it is written; afterwards every path must hold
- * exactly what was written. On any failure the already written paths are rolled back - but only
- * those still holding exactly what this merge wrote; anything else is left alone (copy saved).
- */
 async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, known?: Map<string, WorkState>): Promise<ExecResult> {
-	// 1. Preconditions (as git sees the files).
 	const missing = items.map((i) => i.path).filter((p) => !known?.has(p));
 	const fresh = missing.length > 0 ? await readStates(root, missing, ctx) : new Map<string, WorkState>();
 	unblock(fresh, new Set(items.filter((i) => i.pre && !i.post).map((i) => i.path)));
@@ -1246,7 +1024,6 @@ async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, kno
 	if (bad.length > 0) {
 		return { ok: false, untouched: true, detail: bad.map((i) => `${i.path} (${describeState(i.pre, state(i.path))})`).join(", ") };
 	}
-	// 2. Structural checks: nothing in the way of the writes except paths this plan deletes.
 	const deletes = items.filter((i) => !i.post && state(i.path).kind !== "absent" && state(i.path).kind !== "dir");
 	const writes = items.filter((i) => i.post);
 	const deleting = new Set(deletes.map((i) => i.path));
@@ -1274,7 +1051,7 @@ async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, kno
 		}
 	}
 
-	// 3. Execute: deletions deepest-first, then writes shallowest-first.
+	// Delete deepest first and write shallowest first to handle file and directory swaps.
 	const ops: Op[] = [];
 	const createdDirs: string[] = [];
 	let failure: { path: string; error: unknown } | undefined;
@@ -1293,8 +1070,7 @@ async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, kno
 			const post = item.post as TreeEntry;
 			const { bytes, link } = await blobForWorktree(root, item.path, post, ctx);
 			await ensureParents(root, item.path, createdDirs);
-			// Temp file first, then the final check, then rename: the window for an unseen concurrent
-			// edit is only the check + rename, not the (possibly slow) write.
+			// Write the temp file before the final check to narrow the race window.
 			const tmp = await writeTemp(root, item.path, bytes, link, umaskedPerm(post.mode === "100755"));
 			let perm: number;
 			try {
@@ -1322,7 +1098,6 @@ async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, kno
 		failure = { path: current, error };
 	}
 
-	// 4. Postconditions: every touched path holds exactly what was written / is gone.
 	const concurrent: string[] = [];
 	if (!failure) {
 		for (const op of ops) {
@@ -1333,7 +1108,6 @@ async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, kno
 		if (concurrent.length === 0) return { ok: true };
 	}
 
-	// 5. Safe rollback.
 	const stamp = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomSuffix()}`;
 	const rolledBack: string[] = [];
 	const leftAsIs: string[] = [];
@@ -1344,14 +1118,11 @@ async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, kno
 			const copy = await rescueCopy(root, op.path, now, stamp, "current");
 			if (copy) notes.push(`current content copied to ${copy}`);
 		} catch {
-			// best effort
 		}
 		try {
-			// The pre-merge content is no longer on disk (overwritten or deleted by the merge): save it too.
 			const original = await rescueCopy(root, op.path, op.before, stamp, "original");
 			if (original) notes.push(`original content saved to ${original}`);
 		} catch {
-			// best effort
 		}
 		leftAsIs.push(notes.length > 0 ? `${op.path} (${notes.join("; ")})` : op.path);
 	};
@@ -1414,7 +1185,6 @@ async function executePlan(root: string, items: PlanItem[], ctx: CompareCtx, kno
 
 const APPLY_FLAGS = ["-c", "apply.ignoreWhitespace=no", "apply", "--binary", "--whitespace=nowarn"];
 
-/** Rebuild the child's tree from a patch relative to `base` (a tree-ish; for deltas without metadata). */
 async function treeFromPatch(cwd: string, base: string, raw: Buffer): Promise<string> {
 	const dir = await storageDir("tmp");
 	const tmpIndex = path.join(dir, `index-${process.pid}-${randomSuffix()}`);
@@ -1434,22 +1204,12 @@ async function treeFromPatch(cwd: string, base: string, raw: Buffer): Promise<st
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------------------------
-
-/**
- * Create a detached worktree for `id` reproducing the current working state of the repository
- * containing `cwd` (HEAD + staged + unstaged + untracked non-ignored files). The parent's index,
- * working tree, refs and stash are not modified.
- */
 export async function createWorktree(cwd: string, id: string, signal?: AbortSignal): Promise<Worktree> {
 	signal?.throwIfAborted();
 	const info = await repoInfo(path.resolve(cwd));
 	const repoRoot = info.repoRoot;
 	const lockKey = await realpathOr(repoRoot);
-	// Only the snapshot needs the lock (consistency with concurrent merges into the same checkout);
-	// checking out the snapshot commit does not read the parent's working tree.
+	// The snapshot must not run during a merge into the parent checkout.
 	const baseCommit = await withRepoLock(lockKey, async () => {
 		signal?.throwIfAborted();
 		const head = await resolveHead(repoRoot, signal);
@@ -1498,7 +1258,7 @@ export async function createWorktree(cwd: string, id: string, signal?: AbortSign
 	worktreeMeta.set(wt, { commonDir: info.commonDir, lockKey });
 	liveWorktrees.add(wt);
 	try {
-		// cwd may be an ignored / untracked-empty directory that does not exist in the snapshot.
+		// The snapshot can omit an ignored or empty working directory.
 		await fs.mkdir(wt.cwd, { recursive: true });
 	} catch {
 		wt.cwd = wtPath;
@@ -1510,13 +1270,6 @@ export async function createWorktree(cwd: string, id: string, signal?: AbortSign
 	return wt;
 }
 
-/**
- * Everything changed in the worktree since `wt.baseCommit` (edits, new untracked files, deletions,
- * mode changes, binaries), whether or not the agent committed. The worktree's index is not modified.
- * If the agent moved HEAD so that the baseline is no longer an ancestor of it, the changes are those
- * since the fork point instead (see deltaOrigin / "Moved HEAD" in the file header).
- * Throws a descriptive Error if the worktree cannot be read (e.g. unreadable files).
- */
 export async function collectDelta(wt: Worktree): Promise<Delta> {
 	const base = wt.baseCommit;
 	let tree: string;
@@ -1536,30 +1289,21 @@ export async function collectDelta(wt: Worktree): Promise<Delta> {
 	return delta;
 }
 
-/**
- * Mark the worktree's current state (or the state `delta` was computed from) as merged, so later
- * deltas only contain newer changes. Called automatically after a successful merge; exported so a
- * caller can accept a manually resolved conflict.
- */
 export async function advanceBaseline(wt: Worktree, delta?: Delta): Promise<void> {
 	const meta = delta ? deltaMeta.get(delta) : undefined;
 	const tree = meta && meta.base === wt.baseCommit ? meta.tree : await snapshotWorkingState(wt.path);
 	const baseTree = await gitText(["rev-parse", `${wt.baseCommit}^{tree}`], { cwd: wt.path });
 	if (tree === baseTree) return;
-	// A HEAD the agent moved (own commits, another branch) becomes a second parent: if a later run
-	// returns to it, its merge base with the new baseline is that commit, not an older fork point, so
-	// what was merged here is neither offered again nor reverted.
+	// A moved HEAD must be a parent for later runs to recognize its changes as merged.
 	const head = await resolveHead(wt.path);
 	const parents = head && head !== wt.baseCommit ? [wt.baseCommit, head] : [wt.baseCommit];
 	const commit = await commitTree(wt.path, tree, parents, "pi: isolated task baseline (merged)");
-	// Detach (never move a branch the agent may have checked out - refs are shared with the parent).
+	// Worktrees share branch refs with the parent checkout.
 	await git(["update-ref", "--no-deref", "-m", "pi: advance task baseline", "HEAD", commit], { cwd: wt.path });
-	// Index := new baseline; working tree untouched (so `git status` in the worktree shows only new work).
 	await git(["reset", "-q", "--mixed", "HEAD"], { cwd: wt.path, allowFail: true });
 	wt.baseCommit = commit;
 }
 
-/** User-facing recovery instructions for a saved patch that could not be merged. */
 export function recoveryHint(patchFile: string, repoRoot: string): string {
 	return (
 		`Resolve manually: \`git apply --reject ${shellQuote(patchFile)}\` (working tree only; writes .rej files for conflicting hunks), run in ${repoRoot}. ` +
@@ -1567,10 +1311,6 @@ export function recoveryHint(patchFile: string, repoRoot: string): string {
 	);
 }
 
-/**
- * Apply the child's changes (collected now if `delta` is omitted) to the parent's working tree.
- * Never stages or commits; never throws. Merges into the same repoRoot are serialized.
- */
 export async function mergeDelta(wt: Worktree, delta?: Delta): Promise<MergeResult> {
 	const lockKey = worktreeMeta.get(wt)?.lockKey ?? (await realpathOr(wt.repoRoot));
 	return withRepoLock(lockKey, async () => {
@@ -1590,7 +1330,6 @@ export async function mergeDelta(wt: Worktree, delta?: Delta): Promise<MergeResu
 			try {
 				patchFile = await savePatch(wt, d);
 			} catch {
-				// reported below
 			}
 			return {
 				status: "error",
@@ -1616,7 +1355,6 @@ async function mergeLocked(wt: Worktree, d: Delta): Promise<MergeResult> {
 		};
 	}
 	if (!meta) {
-		// A delta without metadata is taken to be relative to what collectDelta() measures from now.
 		const raw = rawPatchOf(d);
 		const origin = await deltaOrigin(wt.path, wt.baseCommit, await snapshotWorkingState(wt.path));
 		meta = { raw, tree: await treeFromPatch(wt.path, origin.from, raw), base: wt.baseCommit, ...origin };
@@ -1624,12 +1362,9 @@ async function mergeLocked(wt: Worktree, d: Delta): Promise<MergeResult> {
 	}
 	const m = meta;
 	if (m.unrelated) {
-		// No fork point: the agent's work cannot be told apart from the history it checked out.
 		return conflict(wt, d, d.files, "the agent moved HEAD to a history unrelated to the task baseline, so its changes cannot be measured");
 	}
 	if (m.unsure && m.unsure.length > 0) {
-		// Could be the spawner's version edited further (deliver the edit) or a rewrite of the fork's
-		// version (keep the spawner's lines): not decidable, and a wrong guess loses or resurrects work.
 		return conflict(
 			wt,
 			d,
@@ -1637,7 +1372,6 @@ async function mergeLocked(wt: Worktree, d: Delta): Promise<MergeResult> {
 			`the agent moved HEAD off the task baseline and it cannot be told whether its version of ${m.unsure.join(", ")} builds on the baseline's or on the older committed one`,
 		);
 	}
-	// `m.from` is the baseline, or the fork point / a mix of both if the agent moved HEAD off it (see deltaOrigin).
 	const [delta, ctx] = await Promise.all([rawDiff(wt.path, m.from, m.tree), compareCtx(repoRoot)]);
 	const { paths: touched, pre: baseEntries, post: theirsEntries } = delta;
 	const files = d.files.length > 0 ? d.files : touched;
@@ -1653,7 +1387,6 @@ async function mergeLocked(wt: Worktree, d: Delta): Promise<MergeResult> {
 		return { status: "applied", message: message + movedNote(d), files };
 	};
 
-	// Classify each touched path of the parent working tree exactly (as git sees it: filters apply).
 	const working = await readStates(repoRoot, touched, ctx);
 	unblock(working, new Set(touched.filter((p) => baseEntries.has(p) && !theirsEntries.has(p))));
 	const large = tooLargeList(working);
@@ -1681,7 +1414,6 @@ async function mergeLocked(wt: Worktree, d: Delta): Promise<MergeResult> {
 		return finish(res, `Applied changes to ${pending.length} file(s) in ${repoRoot}${extra}.`);
 	}
 
-	// Parent changed some of the same files since the baseline: 3-way merge in object space.
 	const changedList = diverged.join(", ");
 	if (!(await gitAtLeast(2, 40))) {
 		return conflict(wt, d, files, `the parent also changed ${changedList}; a 3-way merge needs git >= 2.40`);
@@ -1743,7 +1475,6 @@ async function mergeError(wt: Worktree, d: Delta, files: string[], detail: strin
 	try {
 		patchFile = await savePatch(wt, d);
 	} catch {
-		// reported below
 	}
 	return {
 		status: "error",
@@ -1756,7 +1487,6 @@ async function mergeError(wt: Worktree, d: Delta, files: string[], detail: strin
 	};
 }
 
-/** Persist `delta` as a private patch file (survives worktree removal); returns its path. */
 export async function savePatch(wt: Worktree, delta: Delta): Promise<string> {
 	let dir: string;
 	try {
@@ -1774,10 +1504,10 @@ export async function savePatch(wt: Worktree, delta: Delta): Promise<string> {
 }
 
 async function isRegistered(cwd: string, wtPath: string): Promise<boolean> {
-	// `--porcelain -z` needs git >= 2.36; older git: newline-separated porcelain.
+	// `worktree list --porcelain` only supports `-z` from version 2.36.
 	const z = await gitAtLeast(2, 36);
 	const res = await git(["worktree", "list", "--porcelain", ...(z ? ["-z"] : [])], { cwd, allowFail: true });
-	if (res.code !== 0) return true; // unknown: let the caller prune
+	if (res.code !== 0) return true; // If registration is unknown the caller should still try pruning.
 	const records = z ? splitNul(res.stdout) : res.stdout.toString("utf8").split("\n");
 	const target = path.resolve(wtPath);
 	return records.some((l) => l.startsWith("worktree ") && path.resolve(l.slice(9)) === target);
@@ -1790,7 +1520,6 @@ async function destroy(wtPath: string, repoRoot: string, commonDir?: string): Pr
 		try {
 			if ((await fs.stat(dir)).isDirectory()) candidates.push(dir);
 		} catch {
-			// gone
 		}
 	}
 	let gitCwd: string | undefined;
@@ -1804,7 +1533,6 @@ async function destroy(wtPath: string, repoRoot: string, commonDir?: string): Pr
 				break;
 			}
 		} catch {
-			// git missing or dir unusable: try next
 		}
 	}
 	await fs.rm(wtPath, { recursive: true, force: true, maxRetries: 3 }).catch(() => {});
@@ -1812,42 +1540,33 @@ async function destroy(wtPath: string, repoRoot: string, commonDir?: string): Pr
 		try {
 			if (await isRegistered(gitCwd, wtPath)) await git(["worktree", "prune"], { cwd: gitCwd, allowFail: true });
 		} catch {
-			// ignore
 		}
 	}
-	await fs.rmdir(path.dirname(wtPath)).catch(() => {}); // only succeeds when empty
+	await fs.rmdir(path.dirname(wtPath)).catch(() => {});
 }
 
-/** Remove the worktree directory and its git registration. Idempotent; never throws. */
 export async function removeWorktree(wt: Worktree): Promise<void> {
 	liveWorktrees.delete(wt);
 	try {
 		await destroy(wt.path, wt.repoRoot, worktreeMeta.get(wt)?.commonDir);
 	} catch {
-		// never throw
 	}
 }
 
-/**
- * Keep `wt` on disk and stop tracking it: removeAllWorktrees() will not touch it and listWorktrees()
- * no longer returns it (e.g. it holds changes that could not be merged or saved).
- */
 export function retainWorktree(wt: Worktree): void {
 	liveWorktrees.delete(wt);
 }
 
-/** Remove every tracked worktree created by this process (e.g. on session shutdown). Never throws. */
 export async function removeAllWorktrees(): Promise<void> {
-	const all = [...liveWorktrees].reverse(); // nested (newer) first
+	// Remove child worktrees before the worktrees they were created from.
+	const all = [...liveWorktrees].reverse();
 	for (const wt of all) await removeWorktree(wt);
 }
 
-/** Worktrees created by this process that have not been removed or retained (the same objects). */
 export function listWorktrees(): Worktree[] {
 	return [...liveWorktrees];
 }
 
-/** One-line transcript summary of a merge. */
 export function formatMergeResult(r: MergeResult): string {
 	const shown = r.files.slice(0, 3).join(", ");
 	const more = r.files.length > 3 ? ` +${r.files.length - 3} more` : "";

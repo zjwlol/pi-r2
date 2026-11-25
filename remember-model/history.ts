@@ -1,9 +1,3 @@
-/**
- * Most-recently-used model history, persisted to ~/.pi/agent/model-history.json.
- *
- * Shared by every pi process; writes are atomic (tmp + rename) and merge with
- * what is on disk so concurrent sessions don't clobber each other.
- */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -11,7 +5,9 @@ import { dirname, join } from "node:path";
 export interface RecentModel {
 	provider: string;
 	id: string;
-	/** epoch ms */
+	/**
+	 * Milliseconds since the Unix epoch.
+	 */
 	lastUsed: number;
 }
 
@@ -21,7 +17,6 @@ interface HistoryFile {
 }
 
 export const MAX_RECENT = 10;
-/** Don't rewrite the file if the same model was recorded this recently. */
 const RECORD_THROTTLE_MS = 60_000;
 
 export const modelKey = (provider: string, id: string) => `${provider}\0${id}`;
@@ -33,7 +28,6 @@ export class ModelHistory {
 		return existsSync(this.file);
 	}
 
-	/** Newest first. Never throws. */
 	read(): RecentModel[] {
 		try {
 			const parsed = JSON.parse(readFileSync(this.file, "utf8")) as Partial<HistoryFile>;
@@ -54,7 +48,6 @@ export class ModelHistory {
 		this.merge([{ provider, id, lastUsed: at }], current);
 	}
 
-	/** Merge entries into the on-disk history, keeping the newest timestamp per model. */
 	merge(entries: RecentModel[], current = this.read()): void {
 		const byKey = new Map<string, RecentModel>();
 		for (const m of [...entries, ...current]) {
@@ -73,15 +66,11 @@ export class ModelHistory {
 			writeFileSync(tmp, `${JSON.stringify({ version: 1, models } satisfies HistoryFile, null, "\t")}\n`);
 			renameSync(tmp, this.file);
 		} catch {
-			// History is best-effort.
+			// A history write failure must not interrupt a session.
 		}
 	}
 }
 
-/**
- * Build an initial history from `model_change` entries in recent session files,
- * so /model is useful on the first run instead of starting empty.
- */
 export async function scanSessionsForModels(sessionsDir: string, maxFiles = 100): Promise<RecentModel[]> {
 	const files: { path: string; mtime: number }[] = [];
 	let projectDirs: string[];

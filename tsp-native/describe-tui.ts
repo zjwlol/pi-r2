@@ -1,27 +1,3 @@
-/**
- * pi-tui's building blocks as native nodes, wherever a container, dialog or
- * extension UI mounts them (oh-my-pi's `components/*.ts` describe()s):
- *
- * - `Input` → an `input` field (value, UTF-16 caret, prompt, placeholder).
- *   Keys stay pi's; the terminal's own selection edits come back as `edit` /
- *   `undo` (omp `Input.handleNativeEvent`).
- * - `SelectList` → omp's `omp.select`: a `list` of `item`s keyed by value
- *   (description as detail), the selection, a row cap; a pointer pick does what
- *   a click does in the TUI (select it, then `onSelect`).
- * - `SettingsList` → omp's `omp.settings`: the search field, a `list` of
- *   setting rows (label, current value, description) keyed by id, and the key
- *   hints; an open submenu replaces the list and describes itself.
- * - `TruncatedText` → one truncated text line; `Image` → an `image` backed by
- *   a content-addressed blob (alt text where the terminal draws none);
- *   `ScrollView` / `VStack` / `HStack` → col/row around their children.
- * - Object-literal components (`{ render, invalidate }`: extension widgets,
- *   `ui.custom` results, pi's collapsed bash preview, EMPTY components): an
- *   empty render is a hidden col, plain lines are text lines with their theme
- *   colours, box-drawn layouts an `ansi` block at the width they were laid out.
- *
- * Loaders (incl. `CancellableLoader`, a Loader subclass) keep describers.ts's
- * Loader describer (it owns their timers); `CountdownTimer` is no component.
- */
 import {
 	type Component,
 	getKeybindings,
@@ -41,7 +17,6 @@ import { ansi, col, type DescribeContext, EMPTY_NODE, type NativeChild, type Nat
 import { hasStyle, lineToSpans, spansThemeId } from "./spans.ts";
 import type { TspProps, TspSpace, TspSpan, TspText } from "./wire.ts";
 
-/** Loose view of private component state. */
 type Any = Record<string, any>;
 
 function is(component: Component, ctor: Function | undefined, name: string): boolean {
@@ -52,18 +27,14 @@ function is(component: Component, ctor: Function | undefined, name: string): boo
 	return false;
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
 function plain(s: unknown): string {
 	return typeof s === "string" ? stripAnsi(s).replaceAll("\x1b_pi:c\x07", "") : "";
 }
 
-/** {@link plain} as a one-line label: line breaks and whitespace runs collapse (omp `plainLine`). */
 function plainLine(s: unknown): string {
 	return plain(s).replace(/\s+/g, " ").trim();
 }
 
-/** Spans of one styled line without its trailing blanks; a plain string when nothing is styled. */
 function lineText(line: string): TspText {
 	const spans = lineToSpans(line.replaceAll("\x1b_pi:c\x07", ""));
 	while (spans.length > 0) {
@@ -78,7 +49,6 @@ function lineText(line: string): TspText {
 	return hasStyle(spans) ? spans : spans.map((sp) => sp.t).join("");
 }
 
-/** A styled one-line label as spans (plain text when unstyled), whitespace collapsed. */
 function labelText(s: unknown): TspText {
 	if (typeof s !== "string") return "";
 	const one = s.replace(/[\r\n]+/g, " ");
@@ -97,7 +67,6 @@ function textOf(t: TspText): string {
 	return typeof t === "string" ? t : t.map((sp) => sp.t).join("");
 }
 
-/** Keycap for one key id (`"ctrl+o"` → keys `["ctrl", "o"]`; omp `kbd`). */
 function kbd(key: string, nodeKey?: string): NativeNode {
 	const keys = key === "+" ? ["+"] : key.endsWith("++") ? [...key.slice(0, -2).split("+"), "+"] : key.split("+");
 	return node("kbd", { keys: keys.filter((part) => part.length > 0) }, undefined, nodeKey);
@@ -108,7 +77,6 @@ interface Hint {
 	readonly label: string;
 }
 
-/** The primary key of a pi-tui keybinding action as a hint; undefined when unbound (omp `actionHint`). */
 function actionHint(action: string, label: string): Hint | undefined {
 	try {
 		const [key] = (getKeybindings() as unknown as Any).getKeys(action) as string[];
@@ -118,7 +86,6 @@ function actionHint(action: string, label: string): Hint | undefined {
 	}
 }
 
-/** omp's `hintsRow`: keycaps with muted labels; a hint without keys is its label alone. */
 function hintsRow(hints: readonly (Hint | undefined)[], key = "hints"): NativeNode | undefined {
 	const groups: NativeChild[] = [];
 	for (const hint of hints) {
@@ -130,7 +97,6 @@ function hintsRow(hints: readonly (Hint | undefined)[], key = "hints"): NativeNo
 	return groups.length > 0 ? node("row", { gap: "md", wrap: true, role: "omp.overlay.hints" }, groups, key) : undefined;
 }
 
-/** Unique item keys (a repeated key gets its index appended, so every item stays addressable). */
 function uniqueKeys(values: readonly string[]): string[] {
 	const seen = new Set<string>();
 	return values.map((value, i) => {
@@ -144,20 +110,14 @@ function clampOffset(value: number, max: number): number {
 	return Number.isFinite(value) ? Math.min(Math.max(Math.trunc(value), 0), max) : 0;
 }
 
-// ── Input ───────────────────────────────────────────────────────────────
-
-/** Owners that re-run their filter when a terminal-side edit changes their search field's value. */
 const inputEditHooks = new WeakMap<Component, (value: string) => void>();
 
-/** pi's paste cleaning (`Input.handlePaste`): no line breaks, tabs as four spaces. */
 function singleLine(s: string): string {
 	return s.replace(/\r\n|\r|\n/g, "").replace(/\t/g, "    ");
 }
 
 /**
- * Apply a terminal-side edit (omp `Input.applyHostEdit`): replace `[from, to)`
- * with `text` and put the caret at `cursor`, one undo unit. Offsets are UTF-16
- * into the described value; stale edits (`len` mismatch) are dropped.
+ * Terminal edit offsets are measured in UTF-16 code units.
  */
 function applyInputEdit(c: Component, a: Any, edit: Extract<NativeUiEvent, { type: "edit" }>): void {
 	const value: string = a.value;
@@ -174,7 +134,6 @@ function applyInputEdit(c: Component, a: Any, edit: Extract<NativeUiEvent, { typ
 		a.pushUndo?.();
 		a.value = next;
 	}
-	// The caret as the terminal placed it, moved by what the cleaning changed in the insert.
 	let cursor = Number.isFinite(edit.cursor) ? Math.trunc(edit.cursor) : from + insert.length;
 	if (cursor >= from + raw.length) cursor += insert.length - raw.length;
 	else if (cursor > from) cursor = from + Math.min(insert.length, cursor - from);
@@ -223,9 +182,6 @@ const input: Describer = {
 	},
 };
 
-// ── SelectList ──────────────────────────────────────────────────────────
-
-/** The described item node per pi SelectItem (same node while what it shows is unchanged). */
 const selectItemNodes = new WeakMap<object, { sig: string; node: NativeNode }>();
 
 function selectItems(a: Any): Any[] | undefined {
@@ -256,7 +212,6 @@ function describeSelectItem(item: Any, key: string, mark: string, iconOf: ((item
 	if (cached?.sig === sig) return cached.node;
 	let shown: TspText = label;
 	if (marked > 0) {
-		// omp `setNativeMark`: the typed prefix marked where it leads the label.
 		const rest = labelPlain.slice(marked);
 		shown = rest ? [span(labelPlain.slice(0, marked), "mark"), span(rest)] : [span(labelPlain, "mark")];
 	}
@@ -296,7 +251,6 @@ const selectList: Describer = {
 		return col([list], { role: "omp.select" });
 	},
 	handleEvent: (c, event) => {
-		// A pointer pick does what a click does in the TUI (`handleMouse`): select the item, then `onSelect`.
 		if (event.type !== "select" && event.type !== "activate") return;
 		const a = c as Any;
 		const items = selectItems(a);
@@ -312,8 +266,6 @@ const selectList: Describer = {
 		a.onSelect?.(item);
 	},
 };
-
-// ── SettingsList ────────────────────────────────────────────────────────
 
 const settingItemNodes = new WeakMap<object, { sig: string; node: NativeNode }>();
 
@@ -363,7 +315,7 @@ const settingsList: Describer = {
 	fingerprint: (c) => {
 		const a = c as Any;
 		const search: Component | undefined = a.searchEnabled ? a.searchInput : undefined;
-		// A terminal-side edit of the search field filters as typing does (`handleInput` → `applyFilter`).
+		// Terminal edits bypass pi's settings input handler.
 		if (search && !inputEditHooks.has(search)) inputEditHooks.set(search, (value) => a.applyFilter?.(value));
 		const items = settingItems(a);
 		return [a.submenuComponent ?? null, items, items?.length, items ? settingValues(items) : "", a.selectedIndex, a.maxVisible, search ?? null, settingsQuery(a), spansThemeId()];
@@ -371,7 +323,6 @@ const settingsList: Describer = {
 	build: (c) => {
 		const a = c as Any;
 		const submenu: Component | null | undefined = a.submenuComponent;
-		// An open submenu replaces the list and describes itself (omp `SettingsList.describe`).
 		if (submenu) return col([submenu], { role: "omp.settings", gap: "sm" });
 		const items = settingItems(a);
 		if (!items) return null;
@@ -398,7 +349,6 @@ const settingsList: Describer = {
 		return col(children, { role: "omp.settings", gap: "sm" });
 	},
 	handleEvent: (c, event) => {
-		// omp: `select` moves the selection to the row, or activates it when it already is the selection; `activate` selects and activates.
 		if (event.type !== "select" && event.type !== "activate") return;
 		const a = c as Any;
 		if (a.submenuComponent) return;
@@ -411,8 +361,6 @@ const settingsList: Describer = {
 		if (event.type === "activate" || was) a.activateItem?.();
 	},
 };
-
-// ── TruncatedText ───────────────────────────────────────────────────────
 
 const truncatedText: Describer = {
 	name: "TruncatedText",
@@ -428,20 +376,17 @@ const truncatedText: Describer = {
 		const first = lineText(nl === -1 ? raw : raw.slice(0, nl));
 		const padded = Number(a.paddingY ?? 0) > 0;
 		if (textOf(first).trim() === "") return padded ? spacer("sm") : EMPTY_NODE;
-		// omp `TruncatedText.describe`: one line, cut at the end.
 		const line = text(first, { role: "pi.text", wrap: "none", truncate: "end", lines: 1 }, "t");
 		return padded ? col([spacer("sm", "a"), line, spacer("sm", "b")]) : line;
 	},
 };
 
-// ── Image ───────────────────────────────────────────────────────────────
-
-/** The backend's blob cap (blobs.ts MAX_BLOB_BYTES): a larger image is never sent, so it shows its alt text. */
+/**
+ * Match the backend's cap on decoded blob bytes.
+ */
 const MAX_IMAGE_BYTES = 16 * 1024 * 1024;
-/** Decoded bytes per image component and payload (hashing them once). */
 const imageBytes = new WeakMap<Component, { data: string; bytes: Uint8Array }>();
 
-/** The terminal draws blob images: an `image` kind and verified blob uploads (rsttyd advertises `blobs`). */
 function imageMode(cx: DescribeContext): boolean {
 	return cx.supports("image") && cx.feature("blobs");
 }
@@ -452,7 +397,6 @@ function imageAlt(a: Any): string {
 		const alt = plainLine(imageFallback(mime, a.dimensions, a.options?.filename));
 		if (alt) return alt;
 	} catch {
-		// fall through
 	}
 	const dims = a.dimensions;
 	return dims && Number.isFinite(dims.widthPx) && Number.isFinite(dims.heightPx) ? `[${mime}] ${dims.widthPx}x${dims.heightPx}` : `[${mime}]`;
@@ -491,7 +435,6 @@ const image: Describer = {
 			const bytes = imageBlobBytes(c, data);
 			if (bytes && bytes.byteLength > 0 && bytes.byteLength <= MAX_IMAGE_BYTES) {
 				const dims = a.dimensions;
-				// pi's cell caps (60 columns unless set) as `ch`/`lines` bounds; the terminal fits the image.
 				const maxW = cells(a.options?.maxWidthCells) ?? 60;
 				const maxH = cells(a.options?.maxHeightCells);
 				return node("image", {
@@ -508,9 +451,6 @@ const image: Describer = {
 	},
 };
 
-// ── Layout ──────────────────────────────────────────────────────────────
-
-/** Stand-in entries for a stack without `entries` (stable, so the fingerprint stays equal). */
 const plainEntries = new WeakMap<Component, Any>();
 
 function stackEntries(a: Any, cx: DescribeContext): Any[] {
@@ -533,7 +473,6 @@ function stackEntries(a: Any, cx: DescribeContext): Any[] {
 	});
 }
 
-/** A stack gap (cells or lines) as a spacing step. */
 function stackGap(gap: unknown, vertical: boolean): TspSpace | undefined {
 	const n = typeof gap === "number" && Number.isFinite(gap) ? Math.floor(gap) : 0;
 	if (n <= 0) return undefined;
@@ -545,7 +484,6 @@ function stackAlign(align: unknown): string | undefined {
 	return align === "start" || align === "center" || align === "end" ? align : undefined;
 }
 
-/** An HStack entry's flex constraints as a width slot (omp `nativeSlotProps("w", …)`); undefined when it has none. */
 function widthSlot(entry: Any): TspProps | undefined {
 	const grow = cells(entry.grow);
 	const basis = cells(entry.basis);
@@ -556,7 +494,6 @@ function widthSlot(entry: Any): TspProps | undefined {
 	return { grow, min: min === undefined ? undefined : { w: `${min}ch` }, max: max === undefined ? undefined : { w: `${max}ch` } };
 }
 
-/** Visible entries, computed by the fingerprint and reused by the build. */
 const stackFrames = new WeakMap<Component, Any[]>();
 
 function stackFingerprint(c: Component, cx: DescribeContext): readonly unknown[] {
@@ -597,7 +534,6 @@ const hStack: Describer = {
 	},
 };
 
-/** Other pi-tui stacks (the `Stack` base, subclasses): their entries in a col. */
 const stack: Describer = {
 	name: "Stack",
 	matches: (c) => Array.isArray((c as Any).entries) && is(c, undefined, "Stack"),
@@ -613,7 +549,6 @@ const stack: Describer = {
 	},
 };
 
-/** pi's ScrollView: its one child in a col (the surface scrolls; the TUI's viewport and scrollbar don't apply). */
 const scrollView: Describer = {
 	name: "ScrollView",
 	matches: (c) => is(c, ScrollView, "ScrollView"),
@@ -628,15 +563,11 @@ const scrollView: Describer = {
 	},
 };
 
-// ── Object-literal components ───────────────────────────────────────────
-
-/** A component written as an object literal (`{ render, invalidate }`), not an instance of any class. */
 function isObjectLiteral(c: Component): boolean {
 	const proto = Object.getPrototypeOf(c);
 	return (proto === Object.prototype || proto === null) && typeof (c as Any).render === "function";
 }
 
-/** The lines the fingerprint rendered, reused by the build. */
 const literalLines = new WeakMap<Component, string[]>();
 
 function renderLines(c: Component, cols: number): string[] {
@@ -648,10 +579,8 @@ function renderLines(c: Component, cols: number): string[] {
 	}
 }
 
-/** Box drawing, block elements and braille, or a column gap: a layout only a monospace grid keeps. */
 const GRID_RE = /[\u2500-\u259f\u2800-\u28ff]|\S {3,}\S/;
 
-/** Drop `n` leading characters (a shared indent of blanks) from a span list. */
 function dropLeading(content: TspText, n: number): TspText {
 	if (n <= 0) return content;
 	if (typeof content === "string") return content.slice(n);
@@ -668,7 +597,6 @@ function dropLeading(content: TspText, n: number): TspText {
 	return out;
 }
 
-/** An ANSI line without its trailing blanks (escapes kept; a reset closes any open style). */
 function trimAnsiEnd(line: string): string {
 	const trimmed = line.replace(/(?:\s|\x1b\[[0-9;:]*m)+$/, "");
 	return trimmed.includes("\x1b") ? `${trimmed}\x1b[0m` : trimmed;
@@ -707,5 +635,4 @@ const objectLiteral: Describer = {
 	build: (c, cx) => describeLines(literalLines.get(c) ?? renderLines(c, cx.cols), cx.cols),
 };
 
-/** Registered after the pickers and sheets, before describers.ts's generic ones (Loader, Text, Container…). */
 export const TUI_DESCRIBERS: readonly Describer[] = [input, selectList, settingsList, truncatedText, image, scrollView, vStack, hStack, stack, objectLiteral];

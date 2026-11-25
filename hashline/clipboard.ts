@@ -1,12 +1,7 @@
-/**
- * hashline/clipboard.ts: lower `CUT` / register `PUT` ops into inserts and deletes.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/clipboard.rs` (MIT).
- */
 import { ambiguousAnonymousPasteMessage, EMPTY_PASTE, emptyRegisterPasteWarning, emptyRegisterSpanPasteMessage } from "./messages.ts";
 import { hasClipboardEdit } from "./parser.ts";
 import { type Clipboard, type CutEdit, type Edit, forkClipboard, HashlineError } from "./types.ts";
 
-/** "throw": an unresolvable paste is an error. "drop": it is silently skipped. */
 export type EmptyPaste = "throw" | "drop";
 
 function describeCut(edit: CutEdit): string {
@@ -18,7 +13,6 @@ function knownRegisters(clipboard: Clipboard): string[] {
 	return clipboard.named ? [...clipboard.named.keys()].sort() : [];
 }
 
-/** The lines a paste writes; undefined when the paste is dropped. */
 function readRegister(
 	register: string | undefined,
 	span: boolean,
@@ -65,10 +59,6 @@ function writeRegister(edit: CutEdit, fileLines: readonly string[], clipboard: C
 	}
 }
 
-/**
- * Replace cut / paste edits by concrete inserts and deletes against the original `fileLines`
- * (`text.split("\n")`). Cuts write `clipboard`; pastes read it. Mutates `clipboard`.
- */
 export function resolveClipboardEdits(
 	edits: readonly Edit[],
 	fileLines: readonly string[],
@@ -107,7 +97,6 @@ export function resolveClipboardEdits(
 	return resolved;
 }
 
-/** Check that every paste has something to read, on a copy of `clipboard` (which is not changed). Throws like resolveClipboardEdits. */
 export function validateClipboardSequence(edits: readonly Edit[], clipboard: Clipboard): void {
 	const fork = forkClipboard(clipboard);
 	for (const edit of edits) {

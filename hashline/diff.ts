@@ -1,12 +1,4 @@
-/**
- * hashline/diff.ts: line diff (Myers, as jsdiff does it), the line map used by stale-tag recovery,
- * string similarity, and the numbered diff + compact preview printed in edit results.
- * Port of oh-my-pi `crates/pi-diff/src/lib.rs` (myers_diff, line_runs_str),
- * `crates/pi-edit/src/diff_string.rs` (LineDiff::numbered, build_compact_diff_preview) and
- * `crates/pi-edit/src/fuzzy.rs::similarity` (MIT). Pure: no imports.
- */
 
-/** A run of tokens with one classification, in forward order. */
 export interface Run {
 	count: number;
 	added: boolean;
@@ -30,7 +22,6 @@ function buildRuns(last: Component | undefined): Run[] {
 	return runs.reverse();
 }
 
-/** Myers O(ND) diff over token ids, with jsdiff's tie-breaking (so run structure matches upstream). */
 export function myersDiff(oldIds: readonly number[], newIds: readonly number[]): Run[] {
 	const oldLen = oldIds.length;
 	const newLen = newIds.length;
@@ -92,11 +83,9 @@ export function myersDiff(oldIds: readonly number[], newIds: readonly number[]):
 			best.set(diagonal, basePath);
 		}
 	}
-	// Unreachable: a diff always exists within oldLen + newLen edits.
 	return buildRuns(undefined);
 }
 
-/** Intern tokens as dense ids under exact equality. */
 export function intern(oldTokens: readonly string[], newTokens: readonly string[]): { oldIds: number[]; newIds: number[] } {
 	const ids = new Map<string, number>();
 	const assign = (token: string): number => {
@@ -110,7 +99,6 @@ export function intern(oldTokens: readonly string[], newTokens: readonly string[
 	return { oldIds: oldTokens.map(assign), newIds: newTokens.map(assign) };
 }
 
-/** jsdiff line tokens: each line WITH its `\n` terminator; the last line has none unless the text ends with `\n`. "" gives []. */
 export function lineTokens(text: string): string[] {
 	const tokens: string[] = [];
 	let start = 0;
@@ -126,13 +114,14 @@ export function lineTokens(text: string): string[] {
 	return tokens;
 }
 
-/** Myers runs over the line tokens of two texts. */
 export function lineRuns(oldText: string, newText: string): Run[] {
 	const { oldIds, newIds } = intern(lineTokens(oldText), lineTokens(newText));
 	return myersDiff(oldIds, newIds);
 }
 
-/** Map from `previous`'s 1-indexed line numbers to `current`'s, for lines an intervening change left untouched. */
+/**
+ * Line numbers in both texts start at 1.
+ */
 export function buildLineMap(previous: string, current: string): Map<number, number> {
 	const map = new Map<number, number>();
 	let previousLine = 1;
@@ -166,7 +155,6 @@ function levenshtein(a: readonly string[], b: readonly string[]): number {
 	return prev[b.length];
 }
 
-/** Similarity in [0, 1]: `1 - levenshtein / max length`, over code points. */
 export function similarity(a: string, b: string): number {
 	if (a === b) return 1;
 	if (a === "" || b === "") return 0;
@@ -175,16 +163,14 @@ export function similarity(a: string, b: string): number {
 	return 1 - levenshtein(ac, bc) / Math.max(ac.length, bc.length);
 }
 
-// ── numbered diff and compact preview ───────────────────────────────────
-
 export interface NumberedDiff {
-	/** Rows ` N|text` (context, old number), `-N|text` (removed, old number), `+N|text` (added, new number); "" separates hunks. */
 	diff: string;
-	/** 1-indexed first changed line in the new text. */
+	/**
+	 * One-based line number in the new text.
+	 */
 	firstChangedLine: number | undefined;
 }
 
-/** Numbered diff with `contextLines` of context around each change (upstream default 2). */
 export function generateNumberedDiff(oldText: string, newText: string, contextLines = 2): NumberedDiff {
 	const oldTokens = lineTokens(oldText);
 	const newTokens = lineTokens(newText);
@@ -257,8 +243,6 @@ export function generateNumberedDiff(oldText: string, newText: string, contextLi
 			newLine += 1;
 		}
 		if (middleSkip > 0) {
-			// Not upstream (it marks gaps only next to bracket-context rows): a blank row between hunks,
-			// which the compact preview prints as `…`.
 			output.push("");
 			oldLine += middleSkip;
 			newLine += middleSkip;
@@ -276,7 +260,6 @@ export function generateNumberedDiff(oldText: string, newText: string, contextLi
 }
 
 export interface CompactDiffPreview {
-	/** Post-edit numbered rows `N:text`; `…` marks skipped rows. Removed rows are not shown. */
 	preview: string;
 	addedLines: number;
 	removedLines: number;
@@ -284,7 +267,6 @@ export interface CompactDiffPreview {
 
 const ELISION = "…";
 
-/** Compact post-edit preview of a numbered diff; added runs longer than `2 * addedRunContext + 1` keep that many rows at each end. */
 export function buildCompactDiffPreview(diff: string, addedRunContext = 2): CompactDiffPreview {
 	const lines = diff === "" ? [] : diff.split("\n");
 	const edge = Math.max(1, addedRunContext);

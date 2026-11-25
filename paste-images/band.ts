@@ -1,18 +1,3 @@
-/**
- * The thumbnail band above the prompt: one entry per `[Image #N]` token in
- * the editor text.
- *
- * - ANSI: a dim `[Image #N] name · size` caption over a small pi-tui `Image`
- *   (Kitty / iTerm2), or the caption alone when the terminal draws no images.
- * - Native (tsp-native calls `describe`): a wrapping `row` of omp-style chip
- *   cards (`omp.composer.chips` / `omp.composer.chip`, as rsttyd and Tern
- *   style them; props as omp's prompt/attachment-chips.ts), each with an
- *   `image` node over a registered blob, else a `media` node by path, else
- *   the file name. While tsp-native's composer hosts the editor
- *   (`isComposerHosted()`), the composer shows that row inside its
- *   `omp.editor` col (through {@link ImageBand.chips}) and the band itself
- *   describes as a hidden col, so the chips aren't drawn twice.
- */
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, getCapabilities, Image, truncateToWidth } from "@earendil-works/pi-tui";
 import { isComposerHosted } from "../shared/composer-slots.ts";
@@ -20,7 +5,6 @@ import { registerTspBlob, releaseTspBlob } from "../shared/tsp-blobs.ts";
 import { formatBytes, imageToken } from "./detect.ts";
 import { base64Of, type DraftImage } from "./draft.ts";
 
-/** Plain-JSON TSP node, as tsp-native's `describe` contract takes it. */
 interface JsonNode {
 	readonly k: string;
 	readonly p?: Readonly<Record<string, unknown>>;
@@ -28,26 +12,24 @@ interface JsonNode {
 	readonly key?: string;
 }
 
-/** The parts of tsp-native's DescribeContext this band reads. */
 export interface DescribeCx {
 	supports(kind: string): boolean;
 	feature?(name: string): boolean;
 }
 
-/** What the terminal can show in a chip: `image` nodes over blobs, `media` nodes by path. */
 interface NativeMode {
 	readonly image: boolean;
 	readonly media: boolean;
 }
 
 const THUMB_COLS = 24;
-/** Blobs above this aren't sent (rsttyd MAX_BLOB). */
+/**
+ * The terminal rejects blobs larger than 16 MiB.
+ */
 const MAX_BLOB_BYTES = 16 * 1024 * 1024;
-/** Chip preview size (rsttyd fits it into a 36px square anyway). */
 const CHIP_MAX = { w: "12ch", h: "4lines" } as const;
 const HIDDEN: JsonNode = { k: "col", p: { hidden: true } };
 
-/** Thumbnail rows for `count` images: smaller as they add up, captions only past four. */
 function thumbRows(count: number): number {
 	if (count <= 2) return 6;
 	if (count <= 4) return 4;
@@ -63,7 +45,6 @@ export class ImageBand implements Component {
 	#lines?: { width: number; shown: readonly DraftImage[]; images: string | null; lines: string[] };
 	#native?: { shown: readonly DraftImage[]; image: boolean; media: boolean; node: JsonNode | null };
 	readonly #thumbs = new Map<DraftImage, { rows: number; image: Image }>();
-	/** Blob ids this band registered, per entry. */
 	readonly #blobs = new Map<DraftImage, string>();
 
 	readonly #theme: () => Theme;
@@ -72,7 +53,6 @@ export class ImageBand implements Component {
 		this.#theme = theme;
 	}
 
-	/** Show `shown` (the draft's current images); releases what left. */
 	sync(shown: readonly DraftImage[]): void {
 		if (shown === this.#shown) return;
 		const keep = new Set(shown);
@@ -82,7 +62,7 @@ export class ImageBand implements Component {
 		for (const [entry, id] of this.#blobs) {
 			if (keep.has(entry)) continue;
 			this.#blobs.delete(entry);
-			// The same picture pasted twice shares one blob: keep it while another chip shows it.
+			// Multiple chips can share the same blob ID.
 			if (!kept.has(id)) releaseTspBlob(id);
 		}
 		this.#shown = shown;
@@ -144,20 +124,14 @@ export class ImageBand implements Component {
 		return image;
 	}
 
-	/** Native description: a hidden col while the composer shows the chips (or there are none), else the chips row. */
 	describe(cx: DescribeCx): JsonNode {
 		if (isComposerHosted()) return HIDDEN;
 		return this.chips(cx) ?? HIDDEN;
 	}
 
-	/**
-	 * The chips row (`omp.composer.chips`), null while no image is shown; the
-	 * same node object while the images and the terminal's abilities are
-	 * unchanged.
-	 */
 	chips(cx: DescribeCx): JsonNode | null {
 		const shown = this.#shown;
-		// rsttyd advertises `blobs` only when it can verify what it receives; without it an image node stays empty.
+		// Image nodes stay empty without terminal blob support.
 		const mode: NativeMode = { image: cx.supports("image") && cx.feature?.("blobs") === true, media: cx.supports("media") };
 		const cached = this.#native;
 		if (cached && cached.shown === shown && cached.image === mode.image && cached.media === mode.media) return cached.node;

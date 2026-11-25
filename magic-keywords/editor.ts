@@ -1,20 +1,3 @@
-/**
- * Editor that paints magic keywords with an animated gradient while you type
- * (oh-my-pi style shimmer: one repaint every 70 ms while a keyword is on
- * screen and the editor is focused; static gradient otherwise). Each render
- * arms at most one frame, so the chain ends by itself once the editor is no
- * longer rendered (swapped out for a selector, replaced, ...).
- *
- * Under a TSP surface (the tsp-native extension sets `nativeMode`) the
- * terminal clocks the effect itself: `describeDecorations()` hands it the
- * keyword ranges as `shimmer` decorations and the ANSI gradient and its timer
- * stay off.
- *
- * Chips (shared/editor-chips.ts: ranges other extensions mark as selected
- * tokens, e.g. subagent's resolved `^model` tags) are drawn here too: a pill
- * painted over the rendered rows (chips.ts), or a decoration under a TSP
- * surface. The chip text stays ordinary, editable text.
- */
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { editorChips } from "../shared/editor-chips.ts";
 import { type ChipStyle, chipDecorations, paintChips, rowSlices, type VisualLine } from "./chips.ts";
@@ -26,13 +9,14 @@ const PERIOD_MS = 1800;
 
 const live = new Set<MagicEditor>();
 
-/** Cancel every editor's pending animation frame (session shutdown / reload). */
 export function stopAllEditors(): void {
 	for (const editor of live) editor.stopShimmer();
 	live.clear();
 }
 
-/** A TSP editor decoration (mirrors `TspEditorDecoration` in tsp-native/wire.ts; UTF-16 offsets). */
+/**
+ * Decoration offsets count UTF-16 code units.
+ */
 export interface EditorDecoration {
 	from: number;
 	to: number;
@@ -42,7 +26,6 @@ export interface EditorDecoration {
 
 const decorPatterns = new Map<string, RegExp>();
 
-/** Keyword occurrences in `text` (lines joined with "\n") as shimmer decorations, prose-only like the painter. */
 export function keywordDecorations(text: string): EditorDecoration[] {
 	const keywords = findKeywords(text);
 	if (keywords.length === 0) return [];
@@ -63,7 +46,6 @@ export function keywordDecorations(text: string): EditorDecoration[] {
 	return out.sort((a, b) => a.from - b.from);
 }
 
-/** pi-tui `Editor` state the chip painter reads (TS-private there, plain properties at runtime). */
 interface EditorLayoutInternals {
 	buildVisualLineMap?: (width: number) => VisualLine[];
 	lastWidth?: number;
@@ -72,11 +54,8 @@ interface EditorLayoutInternals {
 }
 
 export class MagicEditor extends CustomEditor {
-	/** Supplies the current theme's color mode/appearance; set by the extension. */
 	paintOptions?: () => Omit<PaintOptions, "phase">;
-	/** Supplies the escape sequences around a chip (theme colours); set by the extension. Unset: chips are not painted. */
 	chipStyle?: () => ChipStyle;
-	/** Set by tsp-native while a TSP surface draws this editor: no ANSI gradient, no repaint timer. */
 	nativeMode = false;
 	private timer?: ReturnType<typeof setTimeout>;
 
@@ -101,7 +80,6 @@ export class MagicEditor extends CustomEditor {
 		return this.paintChipRows(lines, text, width);
 	}
 
-	/** tsp-native hook: decorations over the editor text for the native `editor` node. */
 	describeDecorations(text: string): EditorDecoration[] {
 		const keywords = keywordDecorations(text);
 		const chips = editorChips(text);
@@ -109,7 +87,6 @@ export class MagicEditor extends CustomEditor {
 		return [...keywords, ...chipDecorations(chips)].sort((a, b) => a.from - b.from);
 	}
 
-	/** `rows` (what `render` produced for `text` at `width`) with the chips painted; `rows` itself when there is none or anything is unexpected. */
 	private paintChipRows(rows: string[], text: string, width: number): string[] {
 		if (!this.chipStyle) return rows;
 		try {
@@ -122,7 +99,7 @@ export class MagicEditor extends CustomEditor {
 			const visual = internals.buildVisualLineMap(lastWidth as number);
 			if (!Array.isArray(visual)) return rows;
 			const slices = rowSlices(visual, scrollOffset as number, renderedVisibleLineCount as number);
-			// The editor's own clamp of its padding (pi-tui Editor.render).
+			// Keep this clamp in sync with pi's editor padding.
 			const paddingX = Math.min(this.getPaddingX(), Math.max(0, Math.floor((width - 1) / 2)));
 			return paintChips(rows, this.getLines(), slices, paddingX, chips, this.chipStyle());
 		} catch {
@@ -130,7 +107,6 @@ export class MagicEditor extends CustomEditor {
 		}
 	}
 
-	/** Arm the next shimmer frame: one-shot, re-armed by the render it requests. */
 	private scheduleFrame(): void {
 		if (this.timer) return;
 		live.add(this);

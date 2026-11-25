@@ -1,7 +1,3 @@
-/**
- * hashline/parser.ts: turn the rows of one section body into low-level edits.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/parser.rs` (MIT), without the streaming variant.
- */
 import { isReadMetadataLine, stripOneLeadingHashlinePrefix } from "./format.ts";
 import * as M from "./messages.ts";
 import { type BlockTarget, isHunkHeaderText, type Token, tokenizeAll } from "./tokenizer.ts";
@@ -13,9 +9,7 @@ export const UNIFIED_HUNK_RE = /^@@\s+[-+]?\d+,\d+\s+[-+]?\d+,\d+\s+@@/;
 interface PayloadRow {
 	text: string;
 	lineNum: number;
-	/** Written without the `+` prefix. */
 	bare: boolean;
-	/** A bare row starting with `-`. */
 	minus: boolean;
 }
 interface Pending {
@@ -43,7 +37,6 @@ function targetRegister(target: BlockTarget): string | undefined {
 	return target.kind === "rem" || target.kind === "move" ? undefined : target.register;
 }
 
-/** Why `target` takes no body rows, if it takes none. */
 function bodylessMessage(target: BlockTarget, hadColon: boolean): string | undefined {
 	if (target.kind === "cut" || target.kind === "cut_block") return M.CUT_TAKES_NO_BODY;
 	if (target.kind === "rem" || target.kind === "move") return undefined;
@@ -52,13 +45,11 @@ function bodylessMessage(target: BlockTarget, hadColon: boolean): string | undef
 	return undefined;
 }
 
-/** `- item`: a dash, one space, then a non-space. */
 function markdownBullet(text: string): boolean {
 	const trimmed = text.trimStart();
 	return trimmed.startsWith("- ") && trimmed.length > 2 && !/\s/.test(trimmed[2]);
 }
 
-/** A top-level `N:TEXT` / `N|TEXT` row copied from read output: `[N, TEXT]`. */
 function parseSnapshotRow(text: string): [number, string] | undefined {
 	const trimmed = text.trimStart();
 	const split = trimmed.search(/[:|]/);
@@ -68,7 +59,6 @@ function parseSnapshotRow(text: string): [number, string] | undefined {
 	return [Number(number), trimmed.slice(split + 1)];
 }
 
-/** A bare `N.=M:` / `N-M:` header without a verb. */
 function parseBareRange(text: string): ParsedRange | undefined {
 	const trimmed = text.trim();
 	if (!trimmed.endsWith(":")) return undefined;
@@ -89,7 +79,6 @@ function preview48(trimmed: string): string {
 	return chars.length > 48 ? `${chars.slice(0, 48).join("")}…` : trimmed;
 }
 
-/** Rows of other patch formats: the message to reject them with. */
 function contaminationMessage(text: string): string | undefined {
 	const trimmed = text.trimStart();
 	if (["*** Update File:", "*** Add File:", "*** Delete File:", "*** Move to:"].some((p) => trimmed.startsWith(p))) {
@@ -115,14 +104,12 @@ function contaminationMessage(text: string): string | undefined {
 	return undefined;
 }
 
-/** A quoted string or a number (after dropping a trailing comma): a value, not a numbered row. */
 function literalValue(text: string): boolean {
 	const value = text.trim().replace(/,+$/, "").trim();
 	if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) return true;
 	return /^[+-]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|inf|infinity|nan)$/i.test(value);
 }
 
-/** When every bare body row carries a copied `N:` prefix (and the rest is not just values), strip one prefix from each. */
 function stripUniformBarePrefixes(rows: PayloadRow[]): void {
 	let saw = false;
 	let allLiteral = true;
@@ -139,17 +126,14 @@ function stripUniformBarePrefixes(rows: PayloadRow[]): void {
 	}
 }
 
-/** Whether an edit list reads or writes a clipboard register. */
 export function hasClipboardEdit(edits: readonly Edit[]): boolean {
 	return edits.some((e) => e.kind === "cut" || e.kind === "paste" || (e.kind === "block" && (e.mode === "cut" || e.mode === "paste_after" || e.register !== undefined)));
 }
 
-/** Whether a deferred block op (`N*`) is present. */
 export function hasBlockEdit(edits: readonly Edit[]): boolean {
 	return edits.some((e) => e.kind === "block");
 }
 
-/** Whether any edit is anchored on a concrete source line (everything except head/tail inserts and pastes). */
 export function hasAnchorScopedEdit(edits: readonly Edit[]): boolean {
 	return edits.some((e) => {
 		if (e.kind === "delete" || e.kind === "cut" || e.kind === "block") return true;
@@ -158,7 +142,6 @@ export function hasAnchorScopedEdit(edits: readonly Edit[]): boolean {
 	});
 }
 
-/** The source lines the edits anchor on, ascending, without duplicates. */
 export function collectAnchorLines(edits: readonly Edit[]): number[] {
 	const lines = new Set<number>();
 	const cursor = (c: Cursor) => {
@@ -376,7 +359,6 @@ class Executor {
 		}
 	}
 
-	/** Decide what bare `-` rows mean: literal Markdown bullets (kept), unified-diff old rows (dropped), or an error. */
 	resolveMinusRows(rows: PayloadRow[]): PayloadRow[] {
 		const minus = rows.filter((row) => row.minus);
 		if (minus.length === 0) return rows;
@@ -413,7 +395,6 @@ class Executor {
 		this.edits.push({ kind: "block", line, payloads, mode, register, lineNum, index: this.nextIndex() });
 	}
 
-	/** Two hunks on the same lines: an exact repeat keeps the later one (warning), any other overlap is an error. */
 	normalizeOverlaps(): void {
 		const hunks = new Map<number, { lines: Set<number>; clipboard: boolean }>();
 		const hunk = (lineNum: number) => {
@@ -468,7 +449,6 @@ class Executor {
 	}
 }
 
-/** Parse one section body (the rows under a `[path#TAG]` header). Throws HashlineError("parse"). */
 export function parsePatch(diff: string): Parsed {
 	const executor = new Executor();
 	for (const token of tokenizeAll(diff)) executor.feed(token);

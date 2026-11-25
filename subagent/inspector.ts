@@ -1,25 +1,3 @@
-/**
- * Agent inspector: oh-my-pi's Agent Hub (packages/tui/src/overlays/agent-hub.ts) and its in-hub
- * transcript viewer (agent-transcript-viewer.ts), for vanilla pi.
- *
- * - Roster: every subagent of the session (nested ones grouped under the agent that spawned them,
- *   or a flat status-ordered list), live status and stats, and a detail pane for the selected agent
- *   on wide terminals (Tab toggles it on narrow ones).
- * - Transcript: a live view of one agent's conversation, drawn with pi's own message components
- *   (user, assistant, tool calls), plus an input line that messages the agent as the user (steers a
- *   running agent, wakes an idle one; its reply comes back to the main transcript). A message that
- *   reached the agent over irc is an IRC card (`✉ irc from → agent` over the body), not the
- *   model-facing `<irc from="…">` envelope it was injected as.
- *
- * Opened with ctrl+s / alt+a (oh-my-pi's app.session.observe / app.agents.hub), a deliberate ←← on
- * an empty editor (only when there are subagents), or /agents. The same keys (or ←← / Esc) close it.
- *
- * Natively (tsp-native, a TSP terminal) the roster is omp's `picker` sheet (agent rows with usage
- * columns, the selected agent as the side preview) and the transcript a full overlay of pi's message
- * components (irc cards as `omp.irc.message` nodes) plus a native message field; keys stay this
- * component's, pointer events come back through handleNativeEvent to the same handlers.
- */
-
 import {
 	AssistantMessageComponent,
 	CustomMessageComponent,
@@ -66,34 +44,18 @@ import {
 } from "./native.ts";
 import { activityText, formatRow, type RowSnapshot, snapshotChild, statRun, statusIcon } from "./render.ts";
 
-// ---------------------------------------------------------------------------------------------
-// Gestures
-
 /**
- * Double-← gesture bounds (oh-my-pi input-controller.ts). Terminals synthesize bursts of arrow keys
- * (click-to-move-cursor in iTerm2/WezTerm/kitty/tmux arrive sub-millisecond apart in one read), and
- * three or more rapid taps are a burst too; a deliberate human double tap is tens of ms apart.
+ * Clicking to move the cursor can emit a burst of arrow keys.
  */
 export const LEFT_DOUBLE_TAP_MIN_GAP_MS = 40;
 export const LEFT_DOUBLE_TAP_MAX_GAP_MS = 500;
-/** Double-tap window of the roster's ←← "close" gesture (oh-my-pi agent-hub.ts LEFT_TAP_WINDOW_MS). */
 export const LEFT_TAP_WINDOW_MS = 500;
-/** Keys that open the inspector from the editor and close it from inside (alt+a = app.agents.hub, ctrl+s = app.session.observe). */
 export const HUB_KEYS = ["ctrl+s", "alt+a"] as const;
-/** Redraw cadence while open (spinners, durations, streaming transcripts). */
 const TICK_MS = 150;
-/** Natively the roster redraws every this many ticks (its run times count in seconds). */
 const NATIVE_ROSTER_TICKS = 7;
-/** Second ctrl+x within this window kills the agent shown in the transcript view. */
 const KILL_CONFIRM_MS = 3000;
-/** Body lines of a collapsed IRC card in the transcript view (the main transcript's irc message shows as many). */
 const IRC_CARD_PREVIEW_LINES = 6;
 
-/**
- * Deliberate double-tap detector (oh-my-pi #detectLeftDoubleTap): true only on the second tap of a
- * fresh sequence landing [MIN_GAP, MAX_GAP) after the first. Closer taps, or any third-and-later tap
- * before a quiet gap, are a burst and never fire.
- */
 export class LeftDoubleTap {
 	private last = 0;
 	private count = 0;
@@ -114,7 +76,6 @@ export class LeftDoubleTap {
 		return false;
 	}
 
-	/** A key-repeat event (held key): part of a burst, never a gesture. */
 	burst(now = Date.now()): void {
 		this.last = now;
 		this.count = Math.max(this.count, 2);
@@ -122,9 +83,7 @@ export class LeftDoubleTap {
 }
 
 export interface InspectorOpenOptions {
-	/** Opened by the editor's ←← gesture: a single ← right after it closes again (oh-my-pi armCloseTap). */
 	armCloseTap?: boolean;
-	/** Open this agent's transcript directly. */
 	agentId?: string;
 }
 
@@ -136,7 +95,6 @@ export interface HubKeyDeps {
 	open: (opts: InspectorOpenOptions) => void;
 }
 
-/** The main prompt editor has focus (not a selector, dialog or overlay). pi's editor is a CustomEditor. */
 export function mainEditorFocused(tui: TUI | undefined): boolean {
 	const focused = (tui as { getFocusedComponent?: () => unknown } | undefined)?.getFocusedComponent?.() as
 		| { getText?: unknown; onAction?: unknown }
@@ -146,10 +104,7 @@ export function mainEditorFocused(tui: TUI | undefined): boolean {
 }
 
 /**
- * `ctx.ui.onTerminalInput` handler (runs before the focused component). Only while the main editor
- * has focus: ctrl+s / alt+a open the inspector (pi binds ctrl+s only inside its selectors, which keep
- * it), and a deliberate ←← on an empty editor opens it when there are subagents (oh-my-pi
- * requireContent). Every other key, including ← in a non-empty editor, passes through untouched.
+ * Pi runs terminal input hooks before the focused component handles the key.
  */
 export function createHubKeyHandler(deps: HubKeyDeps): (data: string) => { consume?: boolean } | undefined {
 	const taps = new LeftDoubleTap();
@@ -174,7 +129,6 @@ export function createHubKeyHandler(deps: HubKeyDeps): (data: string) => { consu
 	};
 }
 
-/** Show the inspector as a full-screen overlay; resolves when it closes. */
 export function openInspector(ui: ExtensionUIContext, hub: AgentHub, opts: InspectorOpenOptions = {}): Promise<void> {
 	return ui.custom<void>(
 		(tui, theme, keybindings, done) => new AgentInspector({ hub, tui, theme, keybindings, done: () => done(), ...opts }),
@@ -184,9 +138,6 @@ export function openInspector(ui: ExtensionUIContext, hub: AgentHub, opts: Inspe
 		},
 	);
 }
-
-// ---------------------------------------------------------------------------------------------
-// Layout helpers
 
 const BOX = { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│", teeR: "├", teeL: "┤", teeD: "┬", teeU: "┴" };
 const STATUS_ORDER: Record<string, number> = { running: 0, pending: 1, idle: 2, failed: 3, aborted: 4 };
@@ -219,7 +170,6 @@ function lastActivity(c: Child): number {
 	return Math.max(c.createdAt, c.startedAt ?? 0, c.runStartedAt ?? 0, c.finishedAt ?? 0);
 }
 
-/** `3 tools · 2 req · 1.2%/200k · $0.02` (render.ts statRun without its leading separator). */
 function usageText(s: RowSnapshot, theme: Theme): string {
 	const run = statRun(s, theme);
 	const sep = theme.fg("dim", " · ");
@@ -267,7 +217,6 @@ function splitRow(f: Frame, left: string, right: string, leftWidth: number): str
 	return `${bar} ${pad(left, leftWidth)} ${bar} ${pad(right, rightWidth)} ${bar}`;
 }
 
-/** A plain horizontal rule with an optional dim label on the right. */
 function rule(f: Frame, label = ""): string {
 	const { theme, width } = f;
 	if (!label) return theme.fg("border", BOX.h.repeat(width));
@@ -275,30 +224,24 @@ function rule(f: Frame, label = ""): string {
 	return theme.fg("border", BOX.h.repeat(Math.max(0, width - visibleWidth(l) - 2))) + theme.fg("dim", l) + theme.fg("border", BOX.h.repeat(2));
 }
 
-// ---------------------------------------------------------------------------------------------
-// Inspector
-
 export interface InspectorDeps extends InspectorOpenOptions {
 	hub: AgentHub;
 	tui: TUI;
 	theme: Theme;
 	keybindings: KeybindingsManager;
 	done: () => void;
-	/** Terminal rows (tests); default the TUI's terminal. */
 	rows?: () => number;
 }
 
 type Notice = { text: string; tone: "error" | "warning" | "success" | "muted" };
 type ViewMode = "tree" | "flat";
 
-/** Placement of the overlay wrapping the inspector natively (tsp-native reads `nativeOverlay`). */
 interface NativeOverlay {
 	size: "full";
 	role: string;
 	head: TspSpan[];
 }
 
-/** Kinds the native roster (a picker sheet with its preview) and transcript are drawn with. */
 const ROSTER_KINDS = ["picker", "row", "text", "badge", "kv", "section", "spinner", "elapsed"] as const;
 const TRANSCRIPT_KINDS = ["col", "row", "text", "badge", "input", "kbd", "spacer"] as const;
 
@@ -312,7 +255,6 @@ function sameDeps(a: readonly unknown[] | undefined, b: readonly unknown[]): boo
 	return true;
 }
 
-/** pi-tui Editor internals the native field edits through (duck-typed; absent → setText). */
 interface EditorInternals {
 	state?: { lines: string[]; cursorLine: number; cursorCol: number };
 	lastAction?: unknown;
@@ -323,7 +265,6 @@ interface EditorInternals {
 	onChange?: (text: string) => void;
 }
 
-/** The draft as one string and the caret as an offset into it. */
 function editorDraft(editor: Editor): { text: string; cursor: number } {
 	const lines = editor.getLines();
 	const { line, col } = editor.getCursor();
@@ -332,7 +273,9 @@ function editorDraft(editor: Editor): { text: string; cursor: number } {
 	return { text: lines.join("\n"), cursor: offset + col };
 }
 
-/** Apply a terminal-side edit (UTF-16 offsets over the draft; stale when `len` mismatches), as tsp-native's editor describer does. */
+/**
+ * Host edit offsets count UTF-16 code units.
+ */
 function applyHostEdit(editor: Editor, ev: { from: number; to: number; text: string; cursor: number; len: number }): void {
 	const current = editorDraft(editor).text;
 	if (ev.len !== current.length) return;
@@ -364,7 +307,6 @@ function applyHostEdit(editor: Editor, ev: { from: number; to: number; text: str
 	if (changed) a.onChange?.(next);
 }
 
-/** The last segment of a node keypath (the node's own key). */
 function leafKey(key: string): string {
 	const slash = key.lastIndexOf("/");
 	return slash < 0 ? key : key.slice(slash + 1);
@@ -387,22 +329,17 @@ export class AgentInspector implements Component, Focusable {
 	private disposed = false;
 	private closed = false;
 	private _focused = false;
-	/** Bumped on every hub change (part of the native memo's signature). */
 	private version = 0;
-	/** Last native roster description and the state it was built from. */
 	private native: { sig: string; node: NativeUiNode } | undefined;
-	/** Agent whose pointer kill waits on the picker's confirmation strip. */
 	private killConfirm: string | undefined;
 	private overlay: { id: string; value: NativeOverlay } | undefined;
-	/** The last frame was described natively (describe ran after render). */
 	private nativeShown = false;
 
 	constructor(private readonly deps: InspectorDeps) {
 		if (deps.armCloseTap) this.lastLeftTap = Date.now();
 		this.timer = setInterval(() => {
 			this.frame++;
-			// Natively the terminal animates spinners and timers: the roster only needs its run times (~1s);
-			// a transcript keeps the cadence (it picks up streaming messages when described).
+			// The terminal animates native spinners and timers between redraws.
 			if (!this.nativeShown || this.transcript || this.frame % NATIVE_ROSTER_TICKS === 0) this.requestRender();
 		}, TICK_MS);
 		this.timer.unref?.();
@@ -426,7 +363,6 @@ export class AgentInspector implements Component, Focusable {
 		this.transcript?.setFocused(value);
 	}
 
-	/** Which view is showing (tests). */
 	get view(): "list" | "transcript" {
 		return this.transcript ? "transcript" : "list";
 	}
@@ -469,7 +405,6 @@ export class AgentInspector implements Component, Focusable {
 		return Math.max(8, rows);
 	}
 
-	/** Roster rows in display order (tree: spawn order with nesting; flat: status, then recency), filtered. */
 	rows(): Child[] {
 		const { hub } = this.deps;
 		const all =
@@ -489,8 +424,6 @@ export class AgentInspector implements Component, Focusable {
 		this.selectedId = rows[0]?.id;
 		return rows.length ? 0 : -1;
 	}
-
-	// ---------- input ----------
 
 	handleInput(data: string): void {
 		if (isKeyRelease(data)) return;
@@ -512,7 +445,6 @@ export class AgentInspector implements Component, Focusable {
 	private handleListInput(data: string): void {
 		const kb = this.deps.keybindings;
 		if (this.killConfirm) {
-			// Any key dismisses a pointer kill's confirmation strip; Esc does only that.
 			this.killConfirm = undefined;
 			if (matchesKey(data, "escape")) return;
 		}
@@ -603,7 +535,6 @@ export class AgentInspector implements Component, Focusable {
 		this.notice = undefined;
 	}
 
-	/** Kill an agent (and its subagents) as the user; its owner still gets an aborted result. */
 	kill(c: Child): void {
 		if (c.status === "aborted") {
 			this.setNotice({ text: `${c.id} is already killed.`, tone: "muted" });
@@ -637,14 +568,13 @@ export class AgentInspector implements Component, Focusable {
 		this.transcript = undefined;
 	}
 
-	// ---------- native (tsp-native) ----------
-
-	/** The roster is its own sheet (a root `picker`, no overlay wrapper); the transcript sits in a full overlay. */
+	/**
+	 * A root picker renders without the overlay wrapper.
+	 */
 	nativeSheet(cx: NativeComponentContext): boolean {
 		return !this.transcript && supportsAll(cx, ROSTER_KINDS);
 	}
 
-	/** The transcript's overlay: a full-size panel sheet titled with the agent. */
 	get nativeOverlay(): NativeOverlay | undefined {
 		const id = this.transcript?.id;
 		if (id === undefined) return undefined;
@@ -657,7 +587,6 @@ export class AgentInspector implements Component, Focusable {
 		return this.overlay.value;
 	}
 
-	/** omp's agent hub: the roster as a `picker` with the selected agent's preview, or the transcript view. */
 	describe(cx: NativeComponentContext): NativeUiNode | null {
 		const described = this.transcript ? this.transcript.describe(cx) : this.describeRoster(cx);
 		this.nativeShown = described !== null;
@@ -690,7 +619,6 @@ export class AgentInspector implements Component, Focusable {
 			this.killConfirm ?? "",
 			meter ? 1 : 0,
 			progress ? 1 : 0,
-			// Run times count up while anything runs.
 			ticking ? Math.floor(now / 1000) : 0,
 			rows.map((c) => c.id).join(","),
 			...all.map(hubSignature),
@@ -698,8 +626,7 @@ export class AgentInspector implements Component, Focusable {
 		if (this.native?.sig === sig) return this.native.node;
 		const q = query.trim();
 		const tree = this.mode === "tree" && !q;
-		// Rows age from the signature's one-second bucket: a rebuild within the second (a selection move, a filter
-		// keystroke, a notice) then yields deep-equal items, which the reconciler does not re-send.
+		// Use the signature's clock bucket to avoid resending unchanged rows.
 		const clock = ticking ? Math.floor(now / 1000) * 1000 : now;
 		const items = rows.map((c) => hubPickerItem(c, { now: clock, depth: tree ? Math.max(0, c.depth - 1) : undefined, showOwner: !tree, query: q || undefined }));
 		const showQuery = this.filterEditing || query !== "";
@@ -744,7 +671,6 @@ export class AgentInspector implements Component, Focusable {
 		return node;
 	}
 
-	/** Pointer events on the native hub: the same paths as the keys. */
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (this.closed) return;
 		if (this.transcript) {
@@ -771,7 +697,6 @@ export class AgentInspector implements Component, Focusable {
 					break;
 			}
 		} else if (event.type === "action" && event.act === "transcript") {
-			// A preview "Recent activity" row.
 			const c = selected();
 			if (c) this.openTranscript(c.id);
 		}
@@ -784,7 +709,6 @@ export class AgentInspector implements Component, Focusable {
 				if (c) this.openTranscript(c.id);
 				return;
 			case "kill":
-				// A click asks first (the picker's confirmation strip); the `x` key kills at once.
 				if (c && c.status !== "aborted") this.killConfirm = c.id;
 				else if (c) this.kill(c);
 				return;
@@ -816,8 +740,6 @@ export class AgentInspector implements Component, Focusable {
 				return;
 		}
 	}
-
-	// ---------- render ----------
 
 	render(width: number): string[] {
 		this.nativeShown = false;
@@ -918,7 +840,6 @@ export class AgentInspector implements Component, Focusable {
 		return lines;
 	}
 
-	/** Tree rails of `c` (oh-my-pi treeBranch/treeContinuation): connectors hang under the owner's status icon. */
 	private rails(c: Child): { head: string; cont: string } {
 		if (this.mode !== "tree" || this.filter.getValue().trim() || c.depth <= 1) return { head: "", cont: "" };
 		const { hub } = this.deps;
@@ -935,7 +856,6 @@ export class AgentInspector implements Component, Focusable {
 		return { head: above + (isLast(c) ? "└─ " : "├─ "), cont: above + (isLast(c) ? "   " : "│  ") };
 	}
 
-	/** One roster entry: status row (render.ts formatRow), task, current activity. */
 	entryLines(c: Child, selected: boolean, width: number): string[] {
 		const t = this.deps.theme;
 		const snap: RowSnapshot = snapshotChild(c, 0, Date.now(), false);
@@ -969,7 +889,6 @@ export class AgentInspector implements Component, Focusable {
 					];
 			lines.push(...empty.slice(0, budget).map((l) => clip(l, width)));
 		} else {
-			// Entries (each a few lines) in a window that keeps the selection visible.
 			const entries = rows.map((c, k) => this.entryLines(c, k === selectedIdx, width));
 			const starts: number[] = [];
 			let total = 0;
@@ -982,7 +901,7 @@ export class AgentInspector implements Component, Focusable {
 				this.rosterTop = 0;
 				lines.push(...flatLines);
 			} else {
-				const room = Math.max(1, budget - 2); // overflow markers
+				const room = Math.max(1, budget - 2);
 				const selStart = starts[selectedIdx] ?? 0;
 				const selEnd = selStart + (entries[selectedIdx]?.length ?? 1);
 				if (selStart < this.rosterTop) this.rosterTop = selStart;
@@ -1007,7 +926,6 @@ export class AgentInspector implements Component, Focusable {
 		return clip(this.deps.theme.fg(n.tone, flat(n.text)), width);
 	}
 
-	/** Detail pane of the selected agent (oh-my-pi #renderDetailPanel). */
 	detailLines(c: Child | undefined, width: number, height: number): string[] {
 		const t = this.deps.theme;
 		if (!c) return [t.fg("dim", "Select an agent to inspect")];
@@ -1062,9 +980,6 @@ export class AgentInspector implements Component, Focusable {
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// Transcript view (oh-my-pi agent-transcript-viewer.ts)
-
 type AnyMessage = { role: string; [k: string]: any };
 
 function userText(m: AnyMessage): string {
@@ -1076,7 +991,6 @@ function userText(m: AnyMessage): string {
 		.join("\n");
 }
 
-/** Cheap change signature of a streaming assistant message. */
 function streamSig(m: AnyMessage): string {
 	const parts = Array.isArray(m.content) ? m.content : [];
 	return parts
@@ -1100,10 +1014,8 @@ class TranscriptView {
 	private lastBody = { total: 0, budget: 1 };
 	private killArmedAt = 0;
 	private readonly taps = new LeftDoubleTap();
-	/** Native: the transcript's components without pi's spacers (the column's gap spaces them), per children array. */
 	private entriesMemo: { from: readonly Component[]; comps: readonly NativeUiChild[] } | undefined;
 	private nativeMemo: { deps: readonly unknown[]; node: NativeUiNode } | undefined;
-	/** Drawn natively (describe, not render, ran last): the terminal scrolls, so j/k/g/G stay the editor's. */
 	private nativeDrawn = false;
 
 	constructor(
@@ -1139,7 +1051,6 @@ class TranscriptView {
 		return this.deps.hub.children.get(this.id);
 	}
 
-	/** Esc: clear a non-empty draft first, else back to the roster. */
 	private escape(): "back" | undefined {
 		if (this.editor && this.editor.getText().trim() !== "") {
 			this.editor.setText("");
@@ -1148,7 +1059,6 @@ class TranscriptView {
 		return "back";
 	}
 
-	/** ctrl+x (or the Kill button): the first press arms, a second one within KILL_CONFIRM_MS kills. */
 	private armKill(): void {
 		const child = this.child();
 		if (!child || child.status === "aborted") {
@@ -1177,8 +1087,6 @@ class TranscriptView {
 		if (child) this.follow = true;
 	}
 
-	// ---------- transcript model ----------
-
 	private toolComponent(name: string, id: string, args: unknown, child: Child): ToolExecutionComponent {
 		const session = child.session as { getToolDefinition?: (n: string) => any } | undefined;
 		let def: any;
@@ -1196,7 +1104,6 @@ class TranscriptView {
 			case "user": {
 				const text = userText(msg);
 				if (!text) return [];
-				// A message delivered over irc (a steer, a wake, a continuation): a card per message, not its envelope.
 				const frames = parseIrcFrames(text);
 				if (frames?.length) {
 					return frames.flatMap((frame, i) => {
@@ -1241,7 +1148,6 @@ class TranscriptView {
 		}
 	}
 
-	/** Bring the components in line with the agent's session (cheap when nothing changed). */
 	sync(): void {
 		const child = this.child();
 		const session = child?.session as { messages?: AnyMessage[]; state?: { streamingMessage?: AnyMessage; pendingToolCalls?: ReadonlySet<string> } } | undefined;
@@ -1261,7 +1167,7 @@ class TranscriptView {
 		let k = 0;
 		while (k < this.entries.length && k < msgs.length && this.entries[k]!.msg === msgs[k]) k++;
 		if (k < this.entries.length) {
-			// History rewritten (compaction, retry): rebuild from scratch.
+			// Pi can replace earlier messages during compaction or retries.
 			this.entries = [];
 			this.tools.clear();
 			this.hasContent = false;
@@ -1329,8 +1235,6 @@ class TranscriptView {
 		this.container.invalidate();
 	}
 
-	// ---------- input ----------
-
 	private scrollBy(n: number): void {
 		const { total, budget } = this.lastBody;
 		const max = Math.max(0, total - budget);
@@ -1357,13 +1261,12 @@ class TranscriptView {
 		}
 		const empty = !this.editor || this.editor.getText().trim() === "";
 		if (empty) {
-			// Once the user starts typing a message, the editor owns every key.
 			const page = Math.max(1, this.lastBody.budget - 2);
 			if (matchesKey(data, "left")) {
 				if (isKeyRepeat(data)) this.taps.burst();
 				else if (this.taps.tap()) return "back";
 			} else if (this.nativeDrawn) {
-				// Natively the terminal scrolls the transcript: every other key is the message field's.
+				// The terminal handles native transcript scrolling.
 			} else if (data === "j" || matchesKey(data, "down")) {
 				this.scrollBy(1);
 				return undefined;
@@ -1395,9 +1298,6 @@ class TranscriptView {
 		return undefined;
 	}
 
-	// ---------- native (tsp-native) ----------
-
-	/** The primary key of a keybinding, for a button's keycap (`ctrl+o`). */
 	private keyOf(binding: string, fallback: string): string {
 		try {
 			const keys = (this.deps.keybindings as unknown as { getKeys?: (b: string) => string[] }).getKeys?.(binding);
@@ -1407,13 +1307,11 @@ class TranscriptView {
 		}
 	}
 
-	/** The agent's messages are pi's own components (described by tsp-native's describers) and irc cards, plus a native message field. */
 	describe(cx: NativeComponentContext): NativeUiNode | null {
 		if (!supportsAll(cx, TRANSCRIPT_KINDS)) return null;
 		this.nativeDrawn = true;
 		this.sync();
 		const child = this.child();
-		// Killed while open: read-only from now on.
 		if (this.editor && (!child || child.status === "aborted")) this.editor = undefined;
 		const now = Date.now();
 		const draft = this.editor ? editorDraft(this.editor) : undefined;
@@ -1469,7 +1367,6 @@ class TranscriptView {
 		return node;
 	}
 
-	/** Pointer and host-edit events on the native transcript: the same paths as the keys. */
 	handleNativeEvent(event: NativeUiEvent): "back" | "close" | undefined {
 		const leaf = leafKey(event.key);
 		switch (event.type) {
@@ -1511,15 +1408,12 @@ class TranscriptView {
 		}
 	}
 
-	// ---------- render ----------
-
 	render(width: number, height: number, frame: number): string[] {
 		this.nativeDrawn = false;
 		this.sync();
 		const t = this.deps.theme;
 		const f: Frame = { theme: t, width };
 		const child = this.child();
-		// Killed while open: read-only from now on.
 		if (this.editor && (!child || child.status === "aborted")) this.editor = undefined;
 		const header: string[] = [];
 		header.push(clip(` ${t.bold(t.fg("accent", "Agent Hub"))}${t.fg("dim", " · ")}${t.fg("accent", this.id)}`, width));
@@ -1566,7 +1460,6 @@ class TranscriptView {
 	}
 }
 
-/** A one-line note in the transcript (a `$ command`, a compaction marker), in a theme colour. */
 class NoteLeaf implements Component {
 	private native: NativeUiNode | undefined;
 
@@ -1589,11 +1482,6 @@ class NoteLeaf implements Component {
 	invalidate(): void {}
 }
 
-/**
- * A message that reached the agent over irc, in place of the model-facing `<irc from="…">` envelope it was
- * injected as: `✉ irc from → to` over the body (the main transcript's irc message, index.ts renderEvent;
- * natively the `omp.irc.message` node of native.ts). Collapsed it shows the first lines, expanded all as markdown.
- */
 class IrcCard implements Component {
 	private readonly body: string;
 	private expanded = false;

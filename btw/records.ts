@@ -1,15 +1,3 @@
-/**
- * `/btw` records: the topic / turn types and every pure helper the views and the controller share.
- *
- * Ports oh-my-pi `packages/tui/src/overlays/btw-history.ts` (types, turn accessors, `<inject>`
- * parsing, copy text), `packages/coding-agent/src/session/btw-turn.ts` (`beginBtwTurn`,
- * `patchLatestBtwTurn`), the record schema of `packages/coding-agent/src/session/btw-history.ts`
- * (`parseRecord`, `snapshotRecord`, the sort order), `dedupeEphemeralReply` of
- * `session/messages.ts` (without its byte cap) and the display sanitizers of
- * `tui/src/overlays/extensions/display-text.ts` / `tui/src/chrome/error-block.ts`.
- *
- * No runtime import of pi packages and only erasable TypeScript: plain `node` loads this file.
- */
 import { randomBytes } from "node:crypto";
 import type { ImageContent } from "@earendil-works/pi-ai";
 
@@ -17,7 +5,6 @@ export type BtwStatus = "running" | "complete" | "cancelled" | "error" | "interr
 
 export interface BtwTurn {
 	question: string;
-	/** Images attached to the question, sent again with it on later follow-ups. */
 	images?: readonly ImageContent[];
 	answer: string;
 	status: BtwStatus;
@@ -28,41 +15,30 @@ export interface BtwTurn {
 
 export interface BtwRecord extends BtwTurn {
 	id: string;
-	/** Session leaf when the topic was asked; the branch point of `b`. */
 	leafId: string | null;
-	/** Display heading for the topic, e.g. `/sitrep`; `question` keeps the full text sent to the model. */
 	title?: string;
 	followUps?: readonly BtwTurn[];
 }
 
-/** An answer around its `<inject>` block: the steering prompt a side answer drafted for the main session. */
 export interface InjectParts {
 	before: string;
 	inject: string;
 	after: string;
-	/** False while no opener has a close: the block may still be streaming, so it runs to the end. */
 	closed: boolean;
 }
 
-/** Send state of one turn's `<inject>` block in this pi process. */
 export type InjectMark = "ready" | "sending" | "sent";
 
-/** Labels a steering prompt that has not been sent yet. */
 export const INJECT_LABEL = "Inject into main session";
-/** Labels a sent steering prompt. */
 export const INJECTED_LABEL = "Injected into main session";
-
-// ───────────────────────────── turn bookkeeping ─────────────────────────────
 
 const RECORD_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
 
-/** Time-sortable id matching /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/: base36 ms, "-", 10 random hex chars. */
 export function newRecordId(now: number = Date.now()): string {
 	const stamp = Number.isFinite(now) && now >= 0 ? Math.floor(now) : 0;
 	return `${stamp.toString(36)}-${randomBytes(5).toString("hex")}`;
 }
 
-/** The topic's display heading: its title, else the opening question. */
 export function getTopicLabel(record: BtwRecord): string {
 	return record.title ?? record.question;
 }
@@ -75,18 +51,15 @@ export function getTurns(record: BtwRecord): readonly BtwTurn[] {
 	return [record, ...(record.followUps ?? [])];
 }
 
-/** getTurns, with a titled topic's first question shown as its title. */
 export function getDisplayTurns(record: BtwRecord): readonly BtwTurn[] {
 	const turns = getTurns(record);
 	return record.title === undefined ? turns : [{ ...turns[0]!, question: record.title }, ...turns.slice(1)];
 }
 
-/** Identifies one turn of a topic, its latest by default: a follow-up gets a new key, so per-answer marks reset. */
 export function getTurnKey(record: BtwRecord, turnIndex: number = record.followUps?.length ?? 0): string {
 	return `${record.id}:${turnIndex}`;
 }
 
-/** Copy the most recent nonblank answer, preserving its original whitespace. */
 export function getCopyText(record: BtwRecord): string | undefined {
 	if (record.followUps) {
 		for (let index = record.followUps.length - 1; index >= 0; index--) {
@@ -97,7 +70,6 @@ export function getCopyText(record: BtwRecord): string | undefined {
 	return record.answer.trim() ? record.answer : undefined;
 }
 
-/** New topic (id from newRecordId, title when given) or `previous` with a running turn appended; `history` = previous's turns. */
 export function beginTurn(
 	question: string,
 	leafId: string | null,
@@ -120,7 +92,6 @@ export function beginTurn(
 	return { record, history: previous ? getTurns(previous) : undefined };
 }
 
-/** Patch the record's latest turn (the last follow-up, else the record itself). */
 export function patchLatestTurn(record: BtwRecord, patch: Partial<BtwTurn>): BtwRecord {
 	const followUps = record.followUps;
 	if (followUps?.length) {
@@ -129,17 +100,11 @@ export function patchLatestTurn(record: BtwRecord, patch: Partial<BtwTurn>): Btw
 	return { ...record, ...patch };
 }
 
-// ───────────────────────────── <inject> blocks ─────────────────────────────
-
 const INJECT_OPEN = "<inject>";
 const INJECT_CLOSE = "</inject>";
 
 /**
- * Split an answer at its last closed `<inject>` block: the last opener that has a close
- * after it, paired with the first close after it. A tag merely mentioned in prose,
- * before or after the block, cannot capture it. Without a closed block, the last opener
- * runs to the end (`closed: false`); display it only while the answer still streams.
- * Linear: the last opener before the last close is the last one with any close after it.
+ * An unpaired tag in model prose must not hide a closed block.
  */
 export function splitInject(answer: string): InjectParts | undefined {
 	const lastClose = answer.lastIndexOf(INJECT_CLOSE);
@@ -163,30 +128,27 @@ export function splitInject(answer: string): InjectParts | undefined {
 	};
 }
 
-/** A block's text as shown and as sent: control sequences stripped, tabs expanded, trimmed. */
 export function formatInjectText(inject: string): string {
 	return sanitizeDisplayText(inject).trim();
 }
 
-/** The steering prompt to send, exactly as the block shows it; undefined while unclosed or blank. */
 export function getInject(answer: string): string | undefined {
 	const parts = splitInject(answer);
 	const text = parts?.closed ? formatInjectText(parts.inject) : "";
 	return text || undefined;
 }
 
-/** A topic's steering prompt: only its latest turn's, once that turn completed. */
 export function getRecordInject(record: BtwRecord): string | undefined {
 	const latest = getLatestTurn(record);
 	return latest.status === "complete" ? getInject(latest.answer) : undefined;
 }
 
-// ───────────────────────────── validation ─────────────────────────────
-
 const STATUSES: readonly BtwStatus[] = ["running", "complete", "cancelled", "error", "interrupted"];
 const TURN_KEYS: readonly string[] = ["question", "images", "answer", "status", "createdAt", "updatedAt", "error"];
 const RECORD_KEYS: readonly string[] = [...TURN_KEYS, "id", "leafId", "title", "followUps"];
-/** Largest time value a `Date` can hold. */
+/**
+ * Date cannot represent a larger millisecond timestamp.
+ */
 const MAX_TIMESTAMP = 8.64e15;
 
 function invalid(detail: string): Error {
@@ -248,10 +210,6 @@ function parseTurn(source: Record<string, unknown>, allowed: readonly string[], 
 	};
 }
 
-/**
- * Validate untrusted JSON: known keys only, status enum, finite timestamps within `0…8.64e15`, a
- * file-name-safe id. Returns a fresh plain object; throws `Error("Invalid BTW history record…")`.
- */
 export function parseRecord(value: unknown): BtwRecord {
 	if (!isPlainObject(value)) throw invalid("must be an object");
 	const turn = parseTurn(value, RECORD_KEYS, "");
@@ -268,7 +226,7 @@ export function parseRecord(value: unknown): BtwRecord {
 			return parseTurn(item, TURN_KEYS, `followUps[${index}].`);
 		});
 	}
-	// Ids become file names (`entry-<id>.json`): never let one leave the history directory.
+	// Record IDs must be safe as filenames.
 	if (!RECORD_ID.test(id)) throw new Error("Invalid BTW history record id");
 	return {
 		...turn,
@@ -279,7 +237,6 @@ export function parseRecord(value: unknown): BtwRecord {
 	};
 }
 
-/** Deep-frozen copy; with `recover`, running turns become interrupted. */
 export function snapshotRecord(record: BtwRecord, recover: boolean = false): BtwRecord {
 	const freezeImages = (images: readonly ImageContent[]): readonly ImageContent[] =>
 		Object.freeze(images.map((image) => Object.freeze({ ...image })));
@@ -296,43 +253,36 @@ export function snapshotRecord(record: BtwRecord, recover: boolean = false): Btw
 	});
 }
 
-/** Newest first by createdAt, ties by id ascending. */
 export function sortRecords(records: Iterable<BtwRecord>): BtwRecord[] {
 	return [...records].sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-// ───────────────────────────── display text ─────────────────────────────
-
 const TAB_SPACES = "   ";
 /**
- * Terminal control sequences, removed whole so their parameters never show as text: OSC and the
- * other string sequences (DCS, SOS, PM, APC) up to BEL / ST or the end of their line, CSI, and the
- * short `ESC x` forms.
+ * Remove whole control sequences to keep their parameters out of terminal text.
  */
 const ANSI_RE =
 	/(?:\x1b\]|\x9d)[^\x07\x1b\x9c\n]*(?:\x07|\x1b\\|\x9c)?|(?:\x1b[PX^_]|[\x90\x98\x9e\x9f])[^\x1b\x9c\n]*(?:\x1b\\|\x9c)?|(?:\x1b\[|\x9b)[0-?]*[ -\/]*[@-~]|\x1b[ -\/]*[0-~]/g;
-/** C0 without "\t" and "\n" (CR included), DEL and C1. */
 const CONTROL_RE = /[\x00-\x08\x0B-\x1F\x7F-\x9F]/g;
-/** Half of a surrogate pair on its own: not displayable, not encodable. */
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
 export function replaceTabs(text: string): string {
 	return text.replaceAll("\t", TAB_SPACES);
 }
 
-/** Drop ANSI/OSC sequences and C0/C1 controls except "\n" and "\t", then replaceTabs. Call before theming. */
+/**
+ * Sanitize untrusted text before adding theme control sequences.
+ */
 export function sanitizeDisplayText(text: string): string {
 	return replaceTabs(text.replace(ANSI_RE, "").replace(CONTROL_RE, "").replace(LONE_SURROGATE_RE, ""));
 }
 
-/** sanitizeDisplayText on one row: newlines become spaces so untrusted text cannot add rows; trimmed. */
 export function sanitizeDisplayLine(text: string): string {
 	return sanitizeDisplayText(text)
 		.replace(/[\r\n]+/g, " ")
 		.trim();
 }
 
-/** One line: message of an Error or String(value), sanitized, whitespace collapsed, "Unknown error" when blank, cut to maxLength (default 240) with "…". */
 export function sanitizeErrorLine(error: unknown, maxLength: number = 240): string {
 	const message = error instanceof Error ? error.message : String(error);
 	const line =
@@ -345,7 +295,6 @@ export function sanitizeErrorLine(error: unknown, maxLength: number = 240): stri
 	return limit === 0 ? "" : `${chars.slice(0, limit - 1).join("")}…`;
 }
 
-/** Runs of more than 3 identical consecutive lines become the line plus `[…N×]`. */
 export function dedupeReply(text: string): string {
 	if (!text) return text;
 	const lines = text.split("\n");
@@ -365,11 +314,11 @@ export function dedupeReply(text: string): string {
 	return out.join("\n");
 }
 
-// ───────────────────────────── inject marks ─────────────────────────────
-
 const INJECT_MARKS = Symbol.for("pi-extended.btw.injects");
 
-/** Marks per turn key, on globalThis[Symbol.for("pi-extended.btw.injects")], so they outlive /reload and session switches. */
+/**
+ * Keep these marks across reloads and session switches.
+ */
 export function injectMarks(): Map<string, InjectMark> {
 	const holder = globalThis as unknown as { [INJECT_MARKS]?: Map<string, InjectMark> };
 	let marks = holder[INJECT_MARKS];

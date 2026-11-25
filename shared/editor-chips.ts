@@ -1,27 +1,15 @@
 /**
- * Chips in the prompt editor, shared like `composer-slots.ts` (this directory
- * has no index.ts, so pi doesn't load it as an extension).
- *
- * A chip is a range of the draft that an extension marks as a "selected"
- * token (subagent: a `^model` tag that resolves to a model). The extension
- * that owns the editor (magic-keywords' MagicEditor) asks for the chips on
- * every render and draws them: a pill in the ANSI rows, a decoration on
- * tsp-native's `editor` node. Providers only say where; the look is the
- * editor's.
- *
- * The state lives on `globalThis` under a registered symbol, so every module
- * copy jiti loads (one per extension, a fresh one per reload) shares it.
- * With no provider registered, or no editor asking, nothing happens.
+ * Chip ranges use half-open UTF-16 offsets into the draft joined with `\n`.
  */
-
-/** A range of the draft, as UTF-16 offsets into the editor's lines joined by "\n": `from` inclusive, `to` exclusive. */
 export interface EditorChip {
 	from: number;
 	to: number;
 }
 
 export interface EditorChipProvider {
-	/** The chips of `text`. Called on every editor render: must be synchronous, cheap and cached. */
+	/**
+	 * The editor calls providers on every render.
+	 */
 	chips(text: string): readonly EditorChip[];
 }
 
@@ -42,11 +30,6 @@ function registry(): ChipRegistry {
 	return current;
 }
 
-/**
- * Register `provider` under `key` (replacing any provider already there).
- * Returns the function that removes it; that function does nothing when
- * another provider has taken the key since.
- */
 export function registerEditorChipProvider(key: string, provider: EditorChipProvider): () => void {
 	const { providers } = registry();
 	providers.set(key, provider);
@@ -55,12 +38,6 @@ export function registerEditorChipProvider(key: string, provider: EditorChipProv
 	};
 }
 
-/**
- * The chips every registered provider reports for `text`: valid ranges only
- * (integers with 0 <= from < to <= text.length), sorted by `from`, and never
- * overlapping (of two that overlap, the one starting first stays). A provider
- * that throws or returns a non-array counts as having none. Never throws.
- */
 export function editorChips(text: string): readonly EditorChip[] {
 	const { providers } = registry();
 	if (providers.size === 0) return NO_CHIPS;

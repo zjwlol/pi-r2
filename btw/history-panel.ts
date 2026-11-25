@@ -1,22 +1,3 @@
-/**
- * The "BTW history" overlay: this session's side questions, newest first, beside the selected
- * topic's whole conversation, with a one-line follow-up composer. Port of oh-my-pi
- * `packages/tui/src/overlays/btw-history-panel.ts` (`BtwHistoryPanel`; its SplitPane / ScrollView
- * layout is done here with the arithmetic of ./chrome.ts).
- *
- * - ANSI (`render(width)`): a full-screen frame with a `History (N)` list pane and a `Details`
- *   pane; under 96 columns only the focused pane; without room for a frame (width < 12 or
- *   height < 8) a label row, the body and one hint row. Every row fits `width`.
- * - Native (tsp-native): `nativeOverlay` asks for the `omp.overlay.btwHistory` sheet, `describe`
- *   returns the mail-style reader (list, thread, composer, action bar) and `handleNativeEvent`
- *   routes button and list events to the same paths as the keys. Memo contract: the same node
- *   object while nothing shown changed.
- *
- * The follow-up composer is a pi-tui `Input`. Vanilla's `Input.handleInput` does not report
- * unhandled keys, so the line / page keys it has no use for are taken before it and scroll the
- * answer above. Selecting or copying here never promotes anything into the chat.
- */
-
 import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
@@ -81,9 +62,7 @@ import {
 } from "./records.ts";
 
 export interface BtwHistoryInject {
-	/** How a finished turn's closed block shows; undefined = plain text. A running turn always shows its block as pending. */
 	state(record: BtwRecord, turnIndex: number): "pending" | "sent" | undefined;
-	/** Whether the inject key may send the record's latest block now. */
 	canSend(record: BtwRecord): boolean;
 	send(record: BtwRecord): void;
 }
@@ -95,25 +74,22 @@ export interface BtwHistoryPanelOptions {
 	onCopy(record: BtwRecord): void;
 	onCancel(record: BtwRecord): void;
 	canFollowUp?(record: BtwRecord): boolean;
-	/** Promote this answer into a branch; false keeps the branch hint hidden. */
 	canBranch?(record: BtwRecord): boolean;
 	onBranch?(record: BtwRecord): void;
-	/** Resolves true when the follow-up turn started. `signal` aborts when the draft is dropped. */
+	/**
+	 * The signal aborts when the draft is dropped.
+	 */
 	onFollowUp?(record: BtwRecord, question: string, signal: AbortSignal): Promise<boolean>;
-	/** Called from dispose(): the overlay is gone, however it closed. */
 	onDispose?(): void;
 	requestRender(): void;
 	getHeight(): number;
-	/** Native flow: Esc closes even while the selected topic runs (it keeps streaming), `x` cancels it. */
 	escapeHides?: boolean;
-	/** `btw.inject` hooks, given only while it is on for this view. */
 	inject?: BtwHistoryInject;
 	injectKey: string;
 }
 
 type InjectState = "pending" | "sent";
 
-/** A turn's `<inject>` block as displayed apart from its prose. */
 interface InjectBlock {
 	parts: InjectParts;
 	state: InjectState;
@@ -130,13 +106,11 @@ interface RenderedTurn {
 	turn: Pick<BtwTurn, "question" | "answer" | "status" | "error" | "createdAt">;
 	question: Markdown;
 	answer: Markdown;
-	/** How the answer's `<inject>` block showed; `undefined` when it rendered as plain text. */
 	block: InjectState | undefined;
 	lines: readonly string[];
 	width: number;
 }
 
-/** The visible inputs of the last native description; any change rebuilds it. */
 interface NativeMemo {
 	records: readonly BtwRecord[];
 	selectedId: string | undefined;
@@ -164,14 +138,13 @@ const NOTICE = {
 	failed: "Could not start the follow-up. Your draft is kept; enter to retry.",
 } as const;
 
-/** Rows moved by Shift+Up / Shift+Down in the answer pane. */
 const FAST_SCROLL_ROWS = 5;
 
 function bound(data: string, action: Keybinding, fallback: KeyId): boolean {
 	try {
 		if (getKeybindings().matches(data, action)) return true;
 	} catch {
-		// No registry yet: the fixed key below.
+		// pi may not have initialized keybindings yet.
 	}
 	return matchesKey(data, fallback);
 }
@@ -190,10 +163,6 @@ function cut(line: string, width: number): string {
 	return width > 0 ? truncateToWidth(line, width, "…") : "";
 }
 
-/**
- * Exactly `height` rows of `width` cells showing `rows` (already windowed). With more logical
- * rows than fit, the last column is a scrollbar (muted track, accent thumb) at `offset`.
- */
 function viewport(theme: Theme, rows: readonly string[], width: number, height: number, total: number, offset: number): string[] {
 	const overflow = total > height && width > 0 && height > 0;
 	const contentWidth = overflow ? width - 1 : width;
@@ -214,7 +183,6 @@ function viewport(theme: Theme, rows: readonly string[], width: number, height: 
 	return out;
 }
 
-/** Hints joined with ` · `, packed whole into rows of `width` cells. */
 function packHints(theme: Theme, hints: readonly string[], width: number): string[] {
 	const separator = theme.fg("muted", " · ");
 	const rows: string[] = [];
@@ -235,7 +203,6 @@ function packHints(theme: Theme, hints: readonly string[], width: number): strin
 	return rows;
 }
 
-/** A status worth naming next to an answer natively; an answered question needs none. */
 function describeStatus(status: BtwTurn["status"]): TspSpan[] | undefined {
 	switch (status) {
 		case "running":
@@ -252,7 +219,6 @@ function describeStatus(status: BtwTurn["status"]): TspSpan[] | undefined {
 }
 
 export class BtwHistoryPanel implements Component, Focusable {
-	/** Set by the TUI when focus changes; passed on to the follow-up input. */
 	focused = false;
 
 	private readonly options: BtwHistoryPanelOptions;
@@ -261,7 +227,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 	private selectedId: string | undefined;
 	private focus: "list" | "answer" = "list";
 	private listScroll = 0;
-	/** Topics per list page, from the last frame. */
 	private listPage = 1;
 	private composer: FollowUpComposer | undefined;
 	private followUpPending = false;
@@ -269,7 +234,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 	private copiedId: string | undefined;
 	private copiedText: string | undefined;
 
-	// Details pane: built rows, a line offset, and whether it follows the newest row.
 	private turns: RenderedTurn[] = [];
 	private detailLines: string[] = [];
 	private detailRecord: BtwRecord | undefined;
@@ -279,11 +243,9 @@ export class BtwHistoryPanel implements Component, Focusable {
 	private detailInject: InjectState | undefined;
 	private detailScroll = 0;
 	private followLatest = false;
-	/** Rows and viewport height of the Details pane in the last frame; scroll keys clamp against them. */
 	private detailTotal = 0;
 	private detailRows = 1;
 
-	// Geometry of the last frame; the wheel hit-tests against it.
 	private bodyTop = 0;
 	private bodyRows = 1;
 	private wide = false;
@@ -318,12 +280,10 @@ export class BtwHistoryPanel implements Component, Focusable {
 			this.followLatest = false;
 			this.detailScroll = 0;
 		}
-		// One side question has nothing to pick: its answer keeps the arrow keys.
 		if (records.length === 1) this.focus = "answer";
 		this.options.requestRender();
 	}
 
-	/** Visual confirmation that `c` copied this record's answer to the clipboard. */
 	markCopied(recordId: string, text: string): void {
 		this.copiedId = recordId;
 		this.copiedText = text;
@@ -331,7 +291,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		this.options.requestRender();
 	}
 
-	/** Select the record and open its follow-up input; false when it cannot follow up or an input is already open. */
 	openFollowUp(recordId: string): boolean {
 		if (this.composer || this.disposed) return false;
 		const index = this.records.findIndex((record) => record.id === recordId);
@@ -342,7 +301,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		return true;
 	}
 
-	/** Select the record with Details focused, read from the top (a just-asked /btw). */
 	showRecord(recordId: string): void {
 		const index = this.records.findIndex((record) => record.id === recordId);
 		if (index === -1) return;
@@ -352,7 +310,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 	}
 
 	invalidate(): void {
-		// Recreate Markdown with the current theme, keeping the scroll offset.
 		this.detailRecord = undefined;
 		this.turns = [];
 		this.detailDirty = true;
@@ -367,8 +324,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		this.composer = undefined;
 		this.options.onDispose?.();
 	}
-
-	// ---------- selection and follow-up ----------
 
 	private selectedIndex(): number {
 		return Math.max(
@@ -393,7 +348,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		return !this.followUpPending && !!this.options.onFollowUp && !!this.options.canFollowUp?.(record);
 	}
 
-	/** The confirmation survives only while the record still holds the copied text. */
 	private isCopied(record: BtwRecord): boolean {
 		return record.id === this.copiedId && getCopyText(record) === this.copiedText;
 	}
@@ -418,7 +372,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		};
 		this.composer = composer;
 		this.focus = "answer";
-		// Following up reads from the newest turn, right above the composer.
 		this.followLatest = true;
 		this.options.requestRender();
 	}
@@ -469,7 +422,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		this.options.requestRender();
 	}
 
-	/** The turn's `<inject>` block to show apart from its prose, if any (see {@link BtwHistoryInject.state}). */
 	private injectBlock(record: BtwRecord, turn: BtwTurn, index: number): InjectBlock | undefined {
 		const inject = this.options.inject;
 		const parts = inject ? splitInject(turn.answer) : undefined;
@@ -482,14 +434,11 @@ export class BtwHistoryPanel implements Component, Focusable {
 		return record ? this.options.inject?.state(record, getTurns(record).length - 1) : undefined;
 	}
 
-	// ---------- input ----------
-
 	handleInput(data: string): void {
 		if (this.disposed || isKeyRelease(data)) return;
 		const composer = this.composer;
 		if (composer) {
-			// The input owns every key it has a use for, including the panel's letter shortcuts and
-			// pasted text; the line and page keys it ignores still scroll the answer above.
+			// Take scroll keys first because pi's input cannot report unhandled keys.
 			if (!this.scrollDetail(data, false)) composer.input.handleInput(data);
 			this.options.requestRender();
 			return;
@@ -522,7 +471,7 @@ export class BtwHistoryPanel implements Component, Focusable {
 			this.sendInject(record);
 			return;
 		}
-		// Legacy terminals deliver Ctrl+/ (and Ctrl+_) as US without the Kitty protocol.
+		// Legacy terminals can send \x1f for Ctrl+/ and Ctrl+_.
 		if (
 			matchesKey(data, "tab") ||
 			matchesKey(data, "shift+tab") ||
@@ -530,7 +479,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 			matchesKey(data, "ctrl+_") ||
 			data === "\x1f"
 		) {
-			// One side question has nothing to pick: its answer keeps the arrow keys.
 			if (this.records.length > 1) this.focus = this.focus === "list" ? "answer" : "list";
 		} else if (matchesKey(data, "right")) {
 			this.focus = "answer";
@@ -551,11 +499,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		this.options.requestRender();
 	}
 
-	/**
-	 * Apply an answer-pane scroll key against the last frame's geometry. A scroll stops following
-	 * the newest row unless it is End. Home / End count only with `edges` (the composer's input
-	 * uses them for its own line).
-	 */
 	private scrollDetail(data: string, edges: boolean): boolean {
 		const page = Math.max(1, this.detailRows - 1);
 		let next: number;
@@ -576,20 +519,13 @@ export class BtwHistoryPanel implements Component, Focusable {
 		return true;
 	}
 
-	/**
-	 * The wheel follows the pointer: over the history list it moves the selection, over the reader
-	 * it scrolls the answer. A narrow frame shows one pane, so the wheel follows that one; the wide
-	 * frame decides by column because both panes share the body rows.
-	 */
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (this.disposed || event.type !== "wheel" || !event.wheelDelta) return undefined;
 		const line = event.y - this.bodyTop;
-		// A notch on the frame or on the rows below the body (composer, hints) belongs to no pane.
 		if (line < 0 || line >= this.bodyRows) return undefined;
 		const overList = this.wide ? event.x >= 2 && event.x < 2 + this.leftWidth : this.focus === "list";
 		if (overList) {
-			// A follow-up composer holds the record it was opened for; moving the selection would
-			// show one topic while Enter submits to another.
+			// The draft stays bound to its original topic until it closes.
 			if (this.composer) return { handled: true, render: false };
 			this.select(this.selectedIndex() + Math.sign(event.wheelDelta));
 		} else {
@@ -599,8 +535,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		this.options.requestRender();
 		return { handled: true };
 	}
-
-	// ---------- ANSI ----------
 
 	render(width: number): string[] {
 		const theme = this.theme;
@@ -649,7 +583,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		}
 		const list = wide || this.focus === "list" ? this.renderList(wide ? panes.left : inner, bodyRows) : undefined;
 
-		// Wheel hit-testing reads the geometry of the frame it already shows.
 		this.bodyTop = framed ? 2 : height >= 3 ? 1 : 0;
 		this.bodyRows = bodyRows;
 		this.wide = wide;
@@ -696,7 +629,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 			: this.theme.fg("muted", `  ${label}`);
 	}
 
-	/** What the keys do now, in hint order. */
 	private hints(record: BtwRecord | undefined, inner: number): string[] {
 		const theme = this.theme;
 		if (this.composer) {
@@ -722,7 +654,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		return hints;
 	}
 
-	/** The list pane: `height` rows of `width` cells. A pane under 36 columns takes two rows per topic. */
 	private renderList(width: number, height: number): string[] {
 		const theme = this.theme;
 		const rowSpan = width < 36 && height >= 2 ? 2 : 1;
@@ -738,7 +669,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		const selectedIndex = this.selectedIndex();
 		this.listScroll = listWindow(selectedIndex, this.listScroll, this.records.length, this.listPage);
 		const totalRows = this.records.length * rowSpan;
-		// The rightmost column is the scrollbar's when the list overflows.
 		const contentWidth = Math.max(0, width - (totalRows > height ? 1 : 0));
 		const lines: string[] = [];
 		const now = new Date();
@@ -783,7 +713,7 @@ export class BtwHistoryPanel implements Component, Focusable {
 		const question = cached?.question ?? new Markdown("", 0, 0, getMarkdownTheme());
 		const answer = cached?.answer ?? new Markdown("", 0, 0, getMarkdownTheme());
 		if (turn.question !== previous?.question) question.setText(sanitizeDisplayText(turn.question));
-		// A block's state can change while the answer stays the same, so the plain text is reset on every miss.
+		// The cached Markdown can be stale when switching out of block view.
 		if (!block) answer.setText(sanitizeDisplayText(turn.answer));
 		const status = STATUS[turn.status];
 		const lines = [
@@ -820,7 +750,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		};
 	}
 
-	/** Every row of the Details pane for `width` cells (the last one stays free for the scrollbar). */
 	private buildDetail(record: BtwRecord | undefined, width: number): string[] {
 		const theme = this.theme;
 		if (record?.id !== this.detailRecord?.id) this.turns = [];
@@ -860,9 +789,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		return lines;
 	}
 
-	// ---------- native ----------
-
-	/** A large sheet (the list beside the reader), palette-sized while there is nothing to list. */
 	get nativeOverlay(): { role: string; anchor: "center"; size: "lg" | "md"; head: string } {
 		return this.records.length > 0 ? SHEET : EMPTY_SHEET;
 	}
@@ -893,9 +819,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		) {
 			return memo.node;
 		}
-		// The body row fills the sheet: the list and the reader scroll on their own, so the list
-		// stays put while a long answer scrolls. With one side question the list is noise: the
-		// reader alone.
 		const children: NativeChild[] = [];
 		if (record) {
 			const reader = node(
@@ -909,8 +832,8 @@ export class BtwHistoryPanel implements Component, Focusable {
 		} else {
 			children.push(this.describeEmpty());
 		}
+		// The native sheet pins its last child as the footer.
 		children.push(this.describeActions(record, canFollowUp, canBranch, copied, canInject));
-		// The sheet is the frame (`nativeOverlay`); its last row is the pinned footer.
 		const described = col(children, { gap: "none" });
 		this.native = {
 			records: this.records,
@@ -930,7 +853,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		return described;
 	}
 
-	/** Pointer events on the native sheet: the same paths as the keys, each re-checking its condition. */
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (this.disposed) return;
 		if (event.type === "action") {
@@ -975,16 +897,10 @@ export class BtwHistoryPanel implements Component, Focusable {
 		if (index === -1) return;
 		this.select(index);
 		this.focus = "list";
-		// Enter on a history row opens the follow-up input.
 		if (event.type === "activate") this.openFollowUp(event.item);
 		this.options.requestRender();
 	}
 
-	/**
-	 * The questions, newest first, as two-line rows: the question, then its time, follow-up count
-	 * and any status other than answered. While the reader has the keys the selection rests
-	 * (`omp.btw.list.idle`).
-	 */
 	private describeList(): NativeNode {
 		const now = new Date();
 		const items = this.records.map((record) => {
@@ -992,7 +908,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 			const detail: TspSpan[] = [span(listStamp(record.createdAt, now), "mono")];
 			if (followUps > 0) detail.push(span(` · ${followUps} follow-up${followUps === 1 ? "" : "s"}`));
 			const status = describeStatus(getLatestTurn(record).status);
-			// The question is markdown: its `code` reads as mono, without the backticks.
 			const label = sanitizeDisplayLine(getTopicLabel(record))
 				.split(/`([^`]+)`/)
 				.flatMap((part, index) => (part ? [span(part, index % 2 === 1 ? "mono" : undefined)] : []));
@@ -1007,7 +922,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		);
 	}
 
-	/** The selected side question as a short document: the asked question titles each answer. */
 	private describeThread(record: BtwRecord): NativeNode {
 		const turns = getDisplayTurns(record);
 		const children: NativeChild[] = turns.map((turn, index) =>
@@ -1018,7 +932,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 	}
 
 	private describeTurn(turn: BtwTurn, index: number, block: InjectBlock | undefined, topicCreatedAt: number): NativeNode {
-		// A follow-up asked on the topic's day needs only its time; a later one needs its date too.
 		const meta: TspSpan[] =
 			index === 0
 				? [span(fullStamp(turn.createdAt))]
@@ -1028,12 +941,10 @@ export class BtwHistoryPanel implements Component, Focusable {
 					];
 		const status = describeStatus(turn.status);
 		if (status) meta.push(span("  ·  "), ...status);
-		// The question stays markdown so its inline code and links render.
 		const children: NativeChild[] = [
 			md(sanitizeDisplayText(turn.question), { role: index === 0 ? "omp.btw.question" : "omp.btw.followup" }),
 			text(meta, { role: "omp.btw.meta", truncate: "end", lines: 1 }),
 		];
-		// A failed turn with no text says only why it failed.
 		if (turn.answer.trim() || !turn.error) {
 			const stream = turn.status === "running";
 			const answer = block
@@ -1049,13 +960,11 @@ export class BtwHistoryPanel implements Component, Focusable {
 		if (turn.status === "interrupted") {
 			children.push(text([span("Not resumed in this view.", "muted")], { role: "omp.btw.note" }));
 		}
+		// Native reveal runs again if the key changes.
 		const described = node("col", { role: "omp.btw.turn" }, children, `turn-${index}`);
-		// A follow-up that just started can sit below the fold of the scrolling reader: bring its
-		// question to the top when the turn is added (not again while it streams: same key).
 		return index > 0 && turn.status === "running" ? { ...described, reveal: "start" } : described;
 	}
 
-	/** The follow-up field under the newest answer, where the conversation continues. */
 	private describeComposer(composer: FollowUpComposer): NativeNode {
 		composer.input.focused = this.focused;
 		const children: NativeChild[] = [composer.input];
@@ -1067,7 +976,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 				}),
 			);
 		}
-		// The field opens under the newest answer, which may be below the fold: scroll it into view.
 		return { ...node("col", { role: "omp.btw.composer", gap: "sm" }, children, "composer"), reveal: "end" };
 	}
 
@@ -1090,10 +998,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 		);
 	}
 
-	/**
-	 * The footer: what the selected answer allows on the left, Close and the one primary action
-	 * (Follow up, or Send while composing) in the corner. Buttons mirror the keys.
-	 */
 	private describeActions(
 		record: BtwRecord | undefined,
 		canFollowUp: boolean,
@@ -1119,7 +1023,6 @@ export class BtwHistoryPanel implements Component, Focusable {
 			if (copied) buttons.push(text([span(`${GLYPH.check} Copied`, "success")], { role: "omp.btw.copied" }));
 		}
 		buttons.push(null);
-		// Clicking Close always dismisses the sheet; its keycap names Esc only where Esc does too.
 		buttons.push(actionButton("Close", "close", running && !hides ? undefined : { keys: "escape" }));
 		if (canFollowUp) buttons.push(actionButton("Follow up", "follow-up", { keys: "f", tone: "accent" }));
 		return actionBar(buttons);

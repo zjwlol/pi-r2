@@ -1,32 +1,17 @@
 /**
- * Chip painting for the prompt editor: turns chip ranges (shared/editor-chips.ts,
- * offsets into the draft) into a pill on the rows pi-tui's `Editor.render`
- * produced, and into decorations for tsp-native's `editor` node.
- *
- * Pure: no imports, so it runs (and is probed) under plain node.
- *
- * The rows are not searched for the token text. The editor says which slice
- * of which logical line each row shows (`rowSlices`, from pi-tui's own visual
- * line map, the same one its mouse handling uses), so a tag wrapped over two
- * rows is painted on both and a tag inside `code` is never painted by
- * accident. Only zero-width SGR escapes are inserted, so visible width is
- * unchanged.
+ * Chip ranges use half-open UTF-16 offsets into the draft joined with `\n`.
  */
-
-/** A chip range: UTF-16 offsets into the editor's lines joined by "\n" (`from` inclusive, `to` exclusive). */
 export interface ChipRange {
 	from: number;
 	to: number;
 }
 
-/** One entry of pi-tui's `Editor.buildVisualLineMap`: the slice of a logical line that one visual line shows. */
 export interface VisualLine {
 	logicalLine: number;
 	startCol: number;
 	length: number;
 }
 
-/** Rendered row `row` shows `lines[line].slice(startCol, startCol + length)`. */
 export interface RowSlice {
 	row: number;
 	line: number;
@@ -34,32 +19,26 @@ export interface RowSlice {
 	length: number;
 }
 
-/** Escape sequences written before (`open`) and after (`close`) each painted piece of a chip. */
 export interface ChipStyle {
 	open: string;
 	close: string;
 }
 
-/** The two theme lookups a chip needs; pi's `Theme` (ctx.ui.theme) has both. */
 export interface ChipTheme {
 	getBgAnsi(token: "customMessageBg"): string;
 	getFgAnsi(token: "customMessageLabel"): string;
 }
 
-/** A TSP editor decoration for a chip (same shape as `EditorDecoration` in editor.ts). */
 export interface ChipDecoration {
 	from: number;
 	to: number;
 	s: string;
 }
 
-/** Style tokens of a chip on tsp-native's `editor` node: accent colour, bold, tinted background. */
 export const CHIP_DECOR_STYLE = "accent strong mark";
 
-// CSI, string sequences (OSC/APC/DCS/PM, ended by BEL or ST), or a 2-byte escape. Same as paint.ts.
 const ESC_RE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|[\]_P^][\s\S]*?(?:\x07|\x1b\\)|[\s\S])/y;
 
-/** Visible text of `row` (escape sequences removed) and, per visible UTF-16 unit, its index in `row`. */
 function visibleMap(row: string): { plain: string; map: number[] } {
 	let plain = "";
 	const map: number[] = [];
@@ -79,7 +58,6 @@ function visibleMap(row: string): { plain: string; map: number[] } {
 	return { plain, map };
 }
 
-/** Offset of the start of each line in `lines.join("\n")`. */
 export function lineStarts(lines: readonly string[]): number[] {
 	const out: number[] = [];
 	let at = 0;
@@ -90,32 +68,17 @@ export function lineStarts(lines: readonly string[]): number[] {
 	return out;
 }
 
-/**
- * Which slice of the draft each content row shows. `visual` is the editor's
- * whole visual line map; the rows on screen are `visibleCount` of them from
- * `scrollOffset`. Row 0 is the top border, so the first content row is row 1.
- */
 export function rowSlices(visual: readonly VisualLine[], scrollOffset: number, visibleCount: number): RowSlice[] {
 	const out: RowSlice[] = [];
 	for (let i = 0; i < visibleCount; i++) {
 		const v = visual[scrollOffset + i];
 		if (!v) break;
+		// Pi reserves the first rendered row for the top border.
 		out.push({ row: i + 1, line: v.logicalLine, startCol: v.startCol, length: v.length });
 	}
 	return out;
 }
 
-/**
- * `rows` with every chip painted: `style.open` before and `style.close` after
- * each piece of a chip that a row shows.
- *
- * - `lines`: the editor's logical lines (`chips` are offsets into them joined by "\n").
- * - `slices`: from `rowSlices`. Rows no slice names (borders, the autocomplete list) are never touched.
- * - `paddingX`: spaces the editor put left of the text on every content row.
- *
- * Returns `rows` itself (the same array) when nothing was painted. A row whose
- * visible text is not `paddingX` spaces + its slice is left as it is.
- */
 export function paintChips(
 	rows: string[],
 	lines: readonly string[],
@@ -132,10 +95,8 @@ export function paintChips(
 		const line = lines[slice.line];
 		const base = starts[slice.line];
 		if (row === undefined || line === undefined || base === undefined || slice.length <= 0) continue;
-		// The slice as offsets into the joined text.
 		const from = base + slice.startCol;
 		const to = from + slice.length;
-		// The pieces of chips inside this slice, as offsets into the slice.
 		const pieces: { a: number; b: number }[] = [];
 		for (const chip of chips) {
 			if (chip.from >= to || chip.to <= from) continue;
@@ -164,12 +125,6 @@ export function paintChips(
 	return out ?? rows;
 }
 
-/**
- * A chip in the ANSI editor: bold `customMessageLabel` text on `customMessageBg`
- * (the pair pi draws its `[skill]` and custom message labels with, so it reads
- * in every theme), then bold, foreground and background back to the terminal's
- * defaults. Same shape as oh-my-pi's `chipPillStyle`.
- */
 export function chipStyleFor(theme: ChipTheme): ChipStyle {
 	return {
 		open: `${theme.getBgAnsi("customMessageBg")}${theme.getFgAnsi("customMessageLabel")}\x1b[1m`,
@@ -177,7 +132,6 @@ export function chipStyleFor(theme: ChipTheme): ChipStyle {
 	};
 }
 
-/** The chips as decorations for tsp-native's `editor` node, in the order given. */
 export function chipDecorations(chips: readonly ChipRange[]): ChipDecoration[] {
 	return chips.map((chip) => ({ from: chip.from, to: chip.to, s: CHIP_DECOR_STYLE }));
 }

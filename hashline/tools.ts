@@ -1,14 +1,3 @@
-/**
- * hashline/tools.ts: the `read` and `edit` tools that replace pi's built-ins while hashline is on.
- *
- * read: pi's built-in read runs first (path resolution, access errors, images). A text result is then
- * replaced by the anchored view: `[PATH#TAG]` + `LINE:TEXT` rows, and the file's content is recorded
- * in the store under its tag.
- * edit: `{ input }` holds `[PATH#TAG]` sections of hashline ops; patcher.ts applies them.
- *
- * Rendering: both tools reuse pi's built-in renderers (`details.diff` for the TUI, `details.patch`
- * for tsp-native's edit card).
- */
 import * as fs from "node:fs";
 import * as nodePath from "node:path";
 import {
@@ -43,14 +32,12 @@ export interface HashlineRuntime {
 // biome-ignore lint/suspicious/noExplicitAny: tool definitions are registered type-erased, like any customTools entry.
 type AnyTool = ToolDefinition<any, any, any>;
 
-/** The path printed in headers: relative to `cwd` (with `/`) when inside it, else absolute. */
 export function displayPathFor(absolute: string, cwd: string): string {
 	const relative = nodePath.relative(cwd, absolute);
 	if (relative === "" || relative === ".." || relative.startsWith(`..${nodePath.sep}`) || nodePath.isAbsolute(relative)) return absolute;
 	return relative.split(nodePath.sep).join("/");
 }
 
-/** The file's text for anchoring: undefined for a missing / non-regular / oversized / binary / non-UTF-8 file. */
 function readAnchorableText(absolute: string): { text: string } | { reason: string } | undefined {
 	let stat: fs.Stats;
 	try {
@@ -80,7 +67,7 @@ export function createHashlineReadTool(runtime: HashlineRuntime): AnyTool {
 		async execute(toolCallId, params: { path: string; offset?: number | null; limit?: number | null }, signal, onUpdate, ctx) {
 			const cwd = ctx.cwd;
 			const builtin = createReadToolDefinition(cwd) as AnyTool;
-			// Throws for a missing / unreadable file, as the built-in does.
+			// Run pi's read first to preserve its errors and image handling.
 			const result = await builtin.execute(toolCallId, params, signal, onUpdate, ctx);
 			const first = result.content[0];
 			const isImage = result.content.some((block: { type: string }) => block.type === "image");
@@ -107,14 +94,16 @@ export function createHashlineReadTool(runtime: HashlineRuntime): AnyTool {
 	};
 }
 
-/** Run `fn` holding pi's file mutation queue for every path (in sorted order, so two calls cannot deadlock). */
 async function withQueues<T>(paths: readonly string[], fn: () => T): Promise<T> {
+	// Acquire the queues in sorted order to avoid deadlocks.
 	const sorted = [...new Set(paths)].sort();
 	const step = (index: number): Promise<T> => (index >= sorted.length ? Promise.resolve().then(fn) : withFileMutationQueue(sorted[index], () => step(index + 1)));
 	return step(0);
 }
 
-/** `details` of a successful edit: pi's display diff and unified patch (what the built-in renderer and tsp-native read). */
+/**
+ * Pi's edit renderer reads `details.diff`.
+ */
 export function editDetails(outcome: EditOutcome): { diff: string; patch: string; firstChangedLine?: number; files: { path: string; op: string; moveTo?: string }[] } {
 	const diffs: string[] = [];
 	const patches: string[] = [];
@@ -143,7 +132,7 @@ const editSchema = Type.Object({
 
 export function createHashlineEditTool(runtime: HashlineRuntime): AnyTool {
 	const builtin = createEditToolDefinition(process.cwd()) as AnyTool;
-	/** The built-in renderer reads `args.path`: give it the first section's path. */
+	// Pi's edit renderer expects `args.path`.
 	const withPath = (args: unknown): unknown => {
 		const input = (args as { input?: unknown } | undefined)?.input;
 		const path = typeof input === "string" ? firstHeaderPath(input) : undefined;
@@ -156,7 +145,7 @@ export function createHashlineEditTool(runtime: HashlineRuntime): AnyTool {
 		promptSnippet: EDIT_PROMPT_SNIPPET,
 		promptGuidelines: [...EDIT_PROMPT_GUIDELINES],
 		parameters: editSchema,
-		// Edits share the snapshot store and the clipboard registers: one at a time.
+		// Edits to different files still share clipboard state.
 		executionMode: "sequential",
 		renderShell: builtin.renderShell,
 		renderCall: builtin.renderCall ? (args, theme, context) => (builtin.renderCall as NonNullable<AnyTool["renderCall"]>)(withPath(args), theme, context) : undefined,

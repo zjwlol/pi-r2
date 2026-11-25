@@ -205,6 +205,7 @@ export class CompletionProbe {
 			const { replyText } = await runSideTurn({
 				stream: () => session.modelRuntime.streamSimple(model, { messages }, {
 					signal,
+					onPayload: session.agent.onPayload,
 					sessionId: session.sessionId,
 					disableContinuation: true,
 					reasoning: thinking === "off" ? undefined : thinking,

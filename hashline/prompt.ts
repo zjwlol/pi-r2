@@ -1,9 +1,3 @@
-/**
- * hashline/prompt.ts: the model-facing text of the hashline `edit` and `read` tools.
- * EDIT_DESCRIPTION is oh-my-pi `crates/pi-edit/prompts/hashline.md` (MIT) with the block forms (`N*`)
- * and the Markdown-heading-block rule removed (this port has no syntax parser), and `read`/`search`
- * reduced to `read` (grep output carries no anchors here). Pure: no imports.
- */
 
 export const EDIT_DESCRIPTION = `Hashline patches existing files; new files: \`write\`. Each file: \`[PATH#TAG]\`, \`TAG\` required 4-hex snapshot from latest \`read\` or \`edit\` result. Numbers: original \`LINE:TEXT\`, never hunk-shifted.
 
@@ -43,7 +37,6 @@ export const EDIT_PROMPT_GUIDELINES = [
 	"After every edit the file's tag and line numbers change: continue from the header and rows in the edit result, or read the file again.",
 ];
 
-/** Appended to the built-in read tool's description. */
 export const READ_DESCRIPTION_SUFFIX =
 	" Text files come back as a `[PATH#TAG]` header followed by `LINE:TEXT` rows: the header and the line numbers are what `edit` takes. The header and the `LINE:` prefixes are not part of the file.";
 

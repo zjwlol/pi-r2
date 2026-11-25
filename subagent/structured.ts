@@ -1,41 +1,12 @@
-/**
- * Structured subagent output: a `yield` tool that validates a child's final result against a JSON
- * Schema, plus the prompt text that tells the child to use it. Modeled on oh-my-pi's
- * `tools/yield.ts`, `tools/output-schema-validator.ts`, `prompts/tools/yield.md`,
- * `prompts/system/subagent-yield-reminder.md` and the yield parts of `subagent-system-prompt.md`.
- *
- * Standalone: no imports from the rest of the extension. The hub wires it up:
- *  1. `normalizeSchema(item.outputSchema ?? agent.output)` → schema (or an error to fail fast).
- *  2. `const state = createYieldState()`; pass `createYieldTool(schema, state, options?)` in the
- *     child's `customTools` (and add `"yield"` to any `tools` allowlist); replace the child's completion
- *     section with `structuredCompletionPrompt(schema)`.
- *  3. After each run (`await session.prompt(...)`) check `state.submitted`; if false, re-prompt with
- *     `yieldReminder(schema, n)` for n = 1..MAX_YIELD_REMINDERS, then fail the task.
- *  4. `state.error` set → task failed with that reason; otherwise the result is `state.data`
- *     (render with `formatStructuredData`).
- *
- * Validation happens in two places, both driven by the same `interpretYieldArgs` logic:
- *  - `prepareArguments` runs on the raw tool-call arguments BEFORE pi's own TypeBox validation, so
- *    schema violations reach the model with this module's issue list + format hint (and count as
- *    attempts) instead of pi's generic "Validation failed" text.
- *  - `execute` re-checks (it is also the entry point for direct calls) and records the result.
- * The `data` parameter embeds a sanitized, self-contained copy of the schema (refs inlined,
- * `nullable` converted, only keywords this validator implements) so the model sees the real shape
- * and pi's TypeBox validator can never be stricter than, or crash on, what we accept.
- */
-
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 export type JsonSchema = Record<string, unknown>;
 
-/** How many times the hub re-prompts a child whose run ended without a successful `yield`. */
 export const MAX_YIELD_REMINDERS = 3;
 
-/** Name of the tool returned by {@link createYieldTool}. */
 export const YIELD_TOOL_NAME = "yield";
 
-/** Default budget for {@link formatStructuredData}. */
 export const DEFAULT_STRUCTURED_DATA_MAX_CHARS = 20_000;
 
 const FORMAT_HINT = 'Submit success as {"data": <value matching the output schema>} or failure as {"error": "message"}.';
@@ -47,8 +18,7 @@ const MAX_TOOL_SCHEMA_NODES = 5000;
 const JSON_TYPES = new Set(["string", "number", "integer", "boolean", "object", "array", "null"]);
 
 /**
- * Filler strings non-strict providers put in the optional `error` field next to valid `data`
- * (oh-my-pi PLACEHOLDER_YIELD_ERRORS). Only ignored when `data` is present.
+ * Non-strict providers may put filler in `error` alongside valid `data`.
  */
 const PLACEHOLDER_ERRORS = new Set([
 	"ignore",
@@ -62,10 +32,6 @@ const PLACEHOLDER_ERRORS = new Set([
 	"undefined",
 	"unused",
 ]);
-
-// ---------------------------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------------------------
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -121,7 +87,6 @@ function showPath(path: string): string {
 
 const regexCache = new Map<string, RegExp | null>();
 
-/** Compile a JSON Schema `pattern` (unicode mode first, like TypeBox); null when invalid. */
 function compilePattern(pattern: string, unicodeOnly = false): RegExp | null {
 	const key = `${unicodeOnly ? "u" : "*"}${pattern}`;
 	const cached = regexCache.get(key);
@@ -142,7 +107,6 @@ function compilePattern(pattern: string, unicodeOnly = false): RegExp | null {
 	return re;
 }
 
-/** Resolve a local JSON pointer `$ref` ("#", "#/$defs/X", "#/definitions/X", any "#/..."). */
 function resolveRef(root: unknown, ref: string): unknown {
 	if (ref === "#") return root;
 	if (!ref.startsWith("#/")) return undefined;
@@ -191,7 +155,7 @@ function matchesType(value: unknown, type: string): boolean {
 		case "null":
 			return value === null;
 		default:
-			return true; // unknown type names are ignored (normalizeSchema reports them)
+			return true;
 	}
 }
 
@@ -202,11 +166,6 @@ function isMultipleOf(value: number, divisor: number): boolean {
 	return Math.abs(quotient - Math.round(quotient)) < 1e-9;
 }
 
-// ---------------------------------------------------------------------------------------------
-// normalizeSchema
-// ---------------------------------------------------------------------------------------------
-
-/** Accepts a JSON Schema object, a JSON string of one, `true` (any JSON value); null/false/undefined -> no schema. */
 export function normalizeSchema(input: unknown): { schema?: JsonSchema; error?: string } {
 	if (input === undefined || input === null || input === false) return {};
 	if (input === true) return { schema: {} };
@@ -227,7 +186,6 @@ export function normalizeSchema(input: unknown): { schema?: JsonSchema; error?: 
 	}
 	let schema: JsonSchema;
 	try {
-		// Private, JSON-clean copy: drops functions/undefined, rejects cycles and BigInt.
 		schema = JSON.parse(JSON.stringify(input)) as JsonSchema;
 	} catch (e) {
 		return { error: `output schema is not JSON-serializable: ${e instanceof Error ? e.message : String(e)}` };
@@ -255,7 +213,6 @@ const NON_NEGATIVE_INT_KEYWORDS = [
 ] as const;
 const NUMBER_KEYWORDS = ["minimum", "maximum"] as const;
 
-/** Light structural checks so author mistakes fail the task up front, not every `yield` call. */
 function lintSchema(node: unknown, at: string, root: JsonSchema, out: string[], depth: number): void {
 	if (out.length >= 20) return;
 	if (typeof node === "boolean") return;
@@ -337,19 +294,6 @@ function lintSchema(node: unknown, at: string, root: JsonSchema, out: string[], 
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// validateAgainstSchema
-// ---------------------------------------------------------------------------------------------
-
-/**
- * Validation issues ("/path: message", root shown as "(root)"); empty array = valid.
- * Supports type (incl. arrays of types, integer, null), nullable, enum, const, $ref (local JSON
- * pointers incl. #/$defs and #/definitions), properties, required, additionalProperties (bool|schema),
- * patternProperties, min/maxProperties, items (schema or draft-07 tuple + additionalItems),
- * prefixItems, min/maxItems, uniqueItems, min/maxLength (code points), pattern, minimum/maximum,
- * exclusiveMinimum/exclusiveMaximum (number or draft-04 boolean), multipleOf, allOf/anyOf/oneOf/not.
- * Unknown keywords (format, if/then/else, ...) are ignored.
- */
 export function validateAgainstSchema(schema: JsonSchema, value: unknown): string[] {
 	const out: string[] = [];
 	checkNode(schema, value, "", schema, 0, out);
@@ -371,7 +315,6 @@ function checkNode(schema: unknown, value: unknown, path: string, root: JsonSche
 		out.push(`${showPath(path)}: value is missing`);
 		return;
 	}
-	// OpenAPI-style `nullable: true` admits null on top of whatever the schema says.
 	if (value === null && schema.nullable === true) return;
 
 	if (typeof schema.$ref === "string") {
@@ -385,7 +328,7 @@ function checkNode(schema: unknown, value: unknown, path: string, root: JsonSche
 		);
 		if (types.length > 0 && !types.some((t) => matchesType(value, t))) {
 			out.push(`${showPath(path)}: expected ${types.join(" or ")}, got ${describeValue(value)}`);
-			return; // other keywords would only add noise
+			return;
 		}
 	}
 
@@ -430,8 +373,6 @@ function collect(schema: unknown, value: unknown, path: string, root: JsonSchema
 }
 
 function unionFailure(keyword: "anyOf" | "oneOf", path: string, results: string[][]): string {
-	// Closest variant: fewest issues, but a variant whose very type differs at this path is the
-	// least informative (e.g. for 3 vs [string, integer>=10] point at the integer branch).
 	const typeMiss = `${showPath(path)}: expected `;
 	const score = (issues: string[]) => issues.length + (issues.some((i) => i.startsWith(typeMiss)) ? 1000 : 0);
 	let best = 0;
@@ -443,13 +384,8 @@ function unionFailure(keyword: "anyOf" | "oneOf", path: string, results: string[
 	return `${showPath(path)}: must match ${quantifier} of ${results.length} ${keyword} variants; closest is #${best + 1}: ${shown}${more}`;
 }
 
-/** Prefix of the issue `checkNode` pushes when the value's type is wrong at the root. */
 const ROOT_TYPE_MISS = `${showPath("")}: expected `;
 
-/**
- * True when the issues of a root-level value include a root type mismatch, directly or folded into
- * a root anyOf/oneOf line by {@link unionFailure} (no variant takes the value's type).
- */
 function hasRootTypeMiss(issues: string[]): boolean {
 	return issues.some(
 		(i) => i.startsWith(ROOT_TYPE_MISS) || (i.startsWith(`${showPath("")}: must match `) && i.includes(`: ${ROOT_TYPE_MISS}`)),
@@ -508,7 +444,6 @@ function checkArray(
 	if (typeof schema.maxItems === "number" && value.length > schema.maxItems) {
 		out.push(`${p}: must have at most ${schema.maxItems} item(s) (got ${value.length})`);
 	}
-	// Tuple prefix: 2020-12 `prefixItems` (+ `items` for the rest) or draft-07 array `items` (+ `additionalItems`).
 	let prefix: unknown[] | undefined;
 	let rest: unknown;
 	if (Array.isArray(schema.prefixItems)) {
@@ -601,12 +536,7 @@ function formatIssues(issues: string[]): string {
 	return shown.join("\n");
 }
 
-// ---------------------------------------------------------------------------------------------
-// Tool-facing schema (what the model and pi's TypeBox validator see for `data`)
-// ---------------------------------------------------------------------------------------------
-
 const ANNOTATION_KEYWORDS = ["title", "description", "default", "examples"] as const;
-/** Keywords copied verbatim into the tool schema, each with the value shape TypeBox can compile. */
 const COPY_KEYWORDS: ReadonlyArray<readonly [string, (v: unknown) => boolean]> = [
 	["enum", Array.isArray],
 	["const", () => true],
@@ -635,21 +565,13 @@ function isNonNegativeInt(v: unknown): v is number {
 }
 
 /**
- * Self-contained copy of `root` for the tool's `data` parameter: local `$ref`s inlined (recursive
- * ones become `{}` with a note), `nullable` turned into a `"null"` type/branch, draft-04 boolean
- * exclusive bounds and draft-07 tuple `items` rewritten to 2020-12, `format` moved into the
- * description, invalid patterns and every keyword this validator does not implement dropped.
- * With `openItems`, arrays that leave `items` out get an explicit `items: {}` (same meaning: any
- * item, also the open tail after `prefixItems`) for providers that reject itemless arrays.
- * pi validates tool arguments with TypeBox against this, so it must never be stricter than
- * {@link validateAgainstSchema} and must always compile.
+ * This schema must compile in pi and accept every value `validateAgainstSchema` accepts.
  */
 function toToolSchema(root: JsonSchema, openItems = false): Record<string, unknown> {
 	try {
 		const out = sanitizeNode(root, root, [], { left: MAX_TOOL_SCHEMA_NODES, openItems });
 		if (JSON.stringify(out).length <= MAX_TOOL_SCHEMA_CHARS) return out;
 	} catch {
-		// node budget exhausted (ref fan-out) or unserializable: fall back to a loose schema
 	}
 	return { description: "Value matching the output schema given in your instructions (schema too large to inline here)." };
 }
@@ -662,7 +584,7 @@ function sanitizeNode(
 ): Record<string, unknown> {
 	if (--budget.left < 0) throw new Error("tool schema too large");
 	if (node === false) return { not: {} };
-	if (!isRecord(node)) return {}; // true, undefined, malformed
+	if (!isRecord(node)) return {};
 
 	const out: Record<string, unknown> = {};
 	let inlined: Record<string, unknown> | undefined;
@@ -689,7 +611,6 @@ function sanitizeNode(
 		const note = `(format: ${node.format})`;
 		out.description = typeof out.description === "string" ? `${out.description} ${note}` : note;
 	}
-	// Bounds: draft-04 booleans -> 2020-12 numbers.
 	for (const [bound, exclusive] of [
 		["minimum", "exclusiveMinimum"],
 		["maximum", "exclusiveMaximum"],
@@ -727,8 +648,7 @@ function sanitizeNode(
 	} else if (node.items !== undefined) {
 		out.items = sanitizeNode(node.items, root, refStack, budget);
 	}
-	// Codex rejects a tool schema with an array that has no `items` ("array schema must define items").
-	// Omitted `items` means "any item" (also the open tail after prefixItems), so state it.
+	// Some providers require `items` on every array in a tool schema.
 	if (budget.openItems && out.items === undefined) {
 		const t = out.type;
 		if (t === "array" || (Array.isArray(t) && t.includes("array")) || (t === undefined && out.prefixItems !== undefined)) {
@@ -751,7 +671,6 @@ function sanitizeNode(
 		: result;
 }
 
-/** Make a sanitized schema also accept `null` (OpenAPI `nullable: true`). */
 function addNull(schema: Record<string, unknown>): Record<string, unknown> {
 	const simple =
 		schema.type !== undefined && !["allOf", "anyOf", "oneOf", "not", "const"].some((k) => hasOwn(schema, k));
@@ -769,20 +688,11 @@ function addNull(schema: Record<string, unknown>): Record<string, unknown> {
 	return wrapped;
 }
 
-// ---------------------------------------------------------------------------------------------
-// yield tool
-// ---------------------------------------------------------------------------------------------
-
 export interface YieldState {
-	/** True once a call succeeded with valid `data` or reported an `error`. */
 	submitted: boolean;
-	/** Latest accepted payload (cleared when an `error` is reported). */
 	data?: unknown;
-	/** Failure reason from `{error}` (cleared when valid `data` is submitted). */
 	error?: string;
-	/** Number of REJECTED yield calls (invalid data, conflicting/missing fields). */
 	attempts: number;
-	/** Model-facing text of the most recent rejection, for the hub's failure message. */
 	lastRejection?: string;
 }
 
@@ -790,7 +700,6 @@ export function createYieldState(): YieldState {
 	return { submitted: false, attempts: 0 };
 }
 
-/** Reset for a new parent-initiated turn on a kept-alive child (keeps `attempts`). */
 export function resetYieldState(state: YieldState): void {
 	state.submitted = false;
 	state.data = undefined;
@@ -810,14 +719,12 @@ type YieldCheck =
 	| { kind: "error"; error: string }
 	| { kind: "rejected"; reason: string; issues: string[] };
 
-/** Shared interpretation of raw `yield` arguments (strict-mode nulls, filler errors, JSON-string data). */
 function interpretYieldArgs(schema: JsonSchema, raw: unknown): YieldCheck {
 	let args = raw;
 	if (typeof args === "string") {
 		try {
 			args = JSON.parse(args);
 		} catch {
-			// handled below
 		}
 	}
 	if (!isRecord(args)) {
@@ -858,7 +765,6 @@ function interpretYieldArgs(schema: JsonSchema, raw: unknown): YieldCheck {
 	let issues = validateAgainstSchema(schema, data);
 	let decoded = false;
 	if (issues.length > 0 && typeof data === "string") {
-		// A JSON-encoded payload string: adopt the decoded value when it is valid (lossless recovery).
 		try {
 			const parsed: unknown = JSON.parse(data);
 			if (parsed !== null) {
@@ -867,15 +773,11 @@ function interpretYieldArgs(schema: JsonSchema, raw: unknown): YieldCheck {
 					data = parsed;
 					issues = [];
 				} else if (hasRootTypeMiss(issues)) {
-					// The schema takes no string here, so the string was meant as the decoded value:
-					// report that value's violations, not "expected object, got string". A string the
-					// schema accepts type-wise keeps its own violations (maxLength, ...).
 					issues = parsedIssues;
 					decoded = true;
 				}
 			}
 		} catch {
-			// not JSON: keep original issues
 		}
 	}
 	if (issues.length > 0) {
@@ -906,14 +808,6 @@ const YIELD_DESCRIPTION = `Submit your final result to the agent that assigned t
 - Failure: {"error": "<what you tried and the exact blocker>"} — only when genuinely blocked.
 Never both; never put result fields at the top level or pass "data" as a JSON string. If the call is rejected, fix the listed issues and call yield again. A successful call ends your run — call it alone, as the last action.`;
 
-/**
- * `yield` tool (label "Submit Result"). Params { data?: <schema>, error?: string }. Exactly one of
- * data/error. Invalid data → isError result listing issues + format hint (state otherwise
- * unchanged, attempts++). Valid → state.submitted=true, short ack with terminate: true so the run
- * ends. `error` → state.submitted=true, state.error set. Calling again after success overwrites.
- * `options.openArrayItems`: give arrays without `items` an explicit `items: {}` in the `data`
- * parameter schema (Codex refuses itemless arrays: "array schema must define items").
- */
 export function createYieldTool(
 	schema: JsonSchema,
 	state: YieldState,
@@ -943,8 +837,7 @@ export function createYieldTool(
 		],
 		parameters,
 		executionMode: "sequential",
-		// Runs on raw arguments before pi's TypeBox validation: normalize and give the model our
-		// issue list (thrown errors become isError tool results; execute is skipped).
+		// pi runs `prepareArguments` before validating tool arguments.
 		prepareArguments(args: unknown) {
 			const check = interpretYieldArgs(schema, args);
 			if (check.kind === "rejected") throw new Error(reject(state, check));
@@ -979,13 +872,8 @@ export function createYieldTool(
 			};
 		},
 	};
-	// Erase the param generic (renderCall is contravariant in it), like any customTools entry.
 	return tool as unknown as ToolDefinition;
 }
-
-// ---------------------------------------------------------------------------------------------
-// Prompt text
-// ---------------------------------------------------------------------------------------------
 
 function fenced(text: string, lang: string): string {
 	const longest = Math.max(2, ...[...text.matchAll(/`+/g)].map((m) => m[0].length));
@@ -1005,7 +893,6 @@ function isUnconstrained(schema: JsonSchema): boolean {
 	return Object.keys(schema).every((k) => (ANNOTATION_KEYWORDS as readonly string[]).includes(k) || k === "$schema");
 }
 
-/** System prompt section replacing the normal completion rules for structured children. */
 export function structuredCompletionPrompt(schema: JsonSchema): string {
 	const schemaBlock = isUnconstrained(schema)
 		? "Output schema for `data`: any JSON value (no constraints). Prefer an object with clearly named fields."
@@ -1030,7 +917,9 @@ You NEVER give up due to uncertainty, missing information obtainable via tools o
 You MUST keep going until this ticket is closed. This matters.`;
 }
 
-/** User-turn reminder when a run ended without a successful yield (attempt is 1-based). */
+/**
+ * Reminder attempts are one-based.
+ */
 export function yieldReminder(schema: JsonSchema, attempt: number): string {
 	const n = Math.max(1, Math.floor(attempt));
 	const isFinal = n >= MAX_YIELD_REMINDERS;
@@ -1054,7 +943,6 @@ Output schema for \`data\`: ${isUnconstrained(schema) ? "any JSON value" : compa
 </system-reminder>`;
 }
 
-/** Pretty JSON for the parent-facing <task-result> envelope, truncated to maxChars with a marker. */
 export function formatStructuredData(data: unknown, maxChars: number = DEFAULT_STRUCTURED_DATA_MAX_CHARS): string {
 	let text: string;
 	try {

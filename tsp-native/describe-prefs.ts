@@ -1,32 +1,8 @@
-/**
- * pi's settings UIs as omp's native settings window (oh-my-pi overlays/settings-selector.ts `#describePrefs`,
- * components/settings-list.ts `prefsSections`/`prefsEditing`, native/picker.ts).
- *
- * - `/settings` (SettingsSelectorComponent) → a ROOT `prefs` node: pi's flat SettingsList laid out as pages and
- *   sections (each a contiguous run of pi's order, so ↑/↓ walk the page top to bottom and on to the next page), rows
- *   with typed controls: `switch` for true/false, `number` steppers for numeric steps, `choice` for the rest
- *   (segmented or a popup menu), `action` buttons for submenus. The page shown is the focused row's (pi's selection),
- *   so keys and pointer agree; while pi's search has text the rows are the matches grouped by page.
- * - Open submenus: a SettingsList submenu (Warnings, the automatic theme menu) becomes a nested section of rows under
- *   its row; a short SelectSubmenu (the theme list) is the row's popup menu (`editing.option` follows pi's highlight;
- *   pointing at an option previews it); a long or searchable one and every SteppedSubmenu step (per-model thinking)
- *   is a picker over the page (the `prefs` child the terminal puts in its editor slot).
- * - `pi config` (ConfigSelectorComponent) → `prefs`: a page per write scope (Tab), a section per source and resource
- *   type, a switch per resource (global) or inherit/load/unload (project).
- * - First-time setup (FirstTimeSetupComponent) → a `picker` per step.
- *
- * Keys stay pi's (the search field's text and caret come from pi's own Input). Pointer events go through the path
- * the keys take: a value change selects the row and presses Enter when that is the value Enter cycles to, else sets
- * it through the list's own `onChange` (SettingsList `activateItem`'s path); submenus open and confirm with Enter and
- * close with Esc, fed to the list's `handleInput`, so every callback pi runs (persisting, theme previews and their
- * revert) runs on a click too.
- */
 import { type Component, getKeybindings } from "@earendil-works/pi-tui";
 import type { Describer } from "./describers.ts";
 import { col, type NativeChild, type NativeNode, type NativeUiEvent, node, stripAnsi } from "./node.ts";
 import type { TspProps, TspText } from "./wire.ts";
 
-/** Loose view of private component state. */
 type Any = Record<string, any>;
 
 function is(component: unknown, ctor: Function | undefined, name: string): boolean {
@@ -42,7 +18,6 @@ function plain(s: unknown): string {
 	return typeof s === "string" ? stripAnsi(s).replaceAll("\x1b_pi:c\x07", "") : "";
 }
 
-/** {@link plain} as one line: line breaks and whitespace runs collapse (omp `plainLine`). */
 function plainLine(s: unknown): string {
 	return plain(s).replace(/\s+/g, " ").trim();
 }
@@ -61,14 +36,11 @@ function kids(c: unknown): Component[] {
 	return Array.isArray(children) ? children : [];
 }
 
-/** A search Input's text and caret. */
 function inputState(input: Any | undefined): { value: string; cursor: number } {
 	const value = typeof input?.getValue === "function" ? String(input.getValue()) : String(input?.value ?? "");
 	const raw = Number(input?.cursor);
 	return { value, cursor: Number.isFinite(raw) ? Math.max(0, Math.min(value.length, raw)) : value.length };
 }
-
-// ── Keys fed to the components (their own Enter/Esc/Space/Tab paths) ────
 
 const NAMED_KEYS: Readonly<Record<string, string>> = {
 	enter: "\r",
@@ -81,7 +53,9 @@ const NAMED_KEYS: Readonly<Record<string, string>> = {
 	down: "\x1b[B",
 };
 
-/** The legacy bytes of a key id (pi-tui's `matchesKey` accepts them with or without the kitty protocol). */
+/**
+ * Pi accepts legacy key bytes even in extended keyboard mode.
+ */
 function keyBytes(key: string): string | undefined {
 	const parts = key.toLowerCase().split("+");
 	const base = parts.pop() ?? "";
@@ -92,15 +66,13 @@ function keyBytes(key: string): string | undefined {
 }
 
 /**
- * The primary key bound to `binding`, else `fallback` (pi's default). A bundled pi keeps its own keybindings
- * manager; ours then knows only pi-tui's ids, so app ids fall back to their defaults.
+ * Bundled pi keeps a separate keybindings manager.
  */
 function boundKey(binding: string, fallback: string): string {
 	try {
 		const keys = (getKeybindings() as unknown as { getKeys(id: string): string[] }).getKeys(binding);
 		if (Array.isArray(keys) && typeof keys[0] === "string" && keys[0] !== "") return keys[0];
 	} catch {
-		// no keybindings manager
 	}
 	return fallback;
 }
@@ -115,7 +87,6 @@ const BINDINGS: Readonly<Record<Binding, readonly [string, string]>> = {
 	tab: ["tui.input.tab", "tab"],
 };
 
-/** Run what pressing `binding` runs: its key goes through `target.handleInput`. */
 function press(target: Any | undefined, binding: Binding): boolean {
 	if (!target || typeof target.handleInput !== "function") return false;
 	const [id, fallback] = BINDINGS[binding];
@@ -125,7 +96,6 @@ function press(target: Any | undefined, binding: Binding): boolean {
 	return true;
 }
 
-/** Keycap names for a key id (`"escape"` → `["esc"]`). */
 function keyCaps(key: string): string[] {
 	return key
 		.split("+")
@@ -137,8 +107,6 @@ function capsOf(binding: Binding): string[] {
 	const [id, fallback] = BINDINGS[binding];
 	return keyCaps(boundKey(id, fallback));
 }
-
-// ── Wire shapes (omp `TspPrefsProps`, `TspPickerProps`) ─────────────────
 
 interface PrefsOption {
 	value: string;
@@ -243,7 +211,6 @@ function picker(p: PickerProps): NativeNode {
 
 type PickerEvent = { readonly kind: "select" | "activate"; readonly item: string } | { readonly kind: "action"; readonly act: string; readonly value: string | undefined };
 
-/** omp's `pickerEvent`: the pointer event for the picker at keypath `key` ("" = the component's root). */
 function pickerEvent(event: NativeUiEvent, key = ""): PickerEvent | undefined {
 	if (event.key.replaceAll("^", "") !== key) return undefined;
 	switch (event.type) {
@@ -257,7 +224,6 @@ function pickerEvent(event: NativeUiEvent, key = ""): PickerEvent | undefined {
 	}
 }
 
-/** omp's `pickerFuzzyHits`: each query token's first substring, else its characters in order. */
 function fuzzyHits(label: string, query: string): [number, number][] | undefined {
 	const tokens = query
 		.toLowerCase()
@@ -301,8 +267,6 @@ function hitsFor(items: readonly PickerItem[], ids: readonly string[], query: st
 	return out;
 }
 
-// ── SelectSubmenu / SteppedSubmenu: picker sheets ───────────────────────
-
 interface SubOption {
 	value: string;
 	label?: string;
@@ -317,12 +281,10 @@ function listSelected(list: Any | undefined): SubOption | undefined {
 	return listItems(list)[Number(list?.selectedIndex) || 0];
 }
 
-/** Every option of a SelectSubmenu (its list holds the filtered ones while it filters). */
 function submenuOptions(m: Any): SubOption[] {
 	return Array.isArray(m.allOptions) ? m.allOptions : listItems(m.selectList);
 }
 
-/** pi marks the current option with a leading check (`✓ dark`, `  light`). */
 function optionLabel(o: SubOption): string {
 	return plainLine(o.label || o.value).replace(/^✓\s*/, "");
 }
@@ -331,7 +293,6 @@ function optionCurrent(o: SubOption): boolean {
 	return plain(o.label).trimStart().startsWith("✓");
 }
 
-/** A SelectSubmenu's title (its first Text) and the description lines between it and the field or list. */
 function submenuTexts(m: Any): { title: string; description: string[] } {
 	const children = kids(m);
 	const first = children.find(isText);
@@ -367,7 +328,6 @@ function submenuItems(all: SubOption[]): PickerItem[] {
 	return items;
 }
 
-/** A SelectSubmenu as an `md` picker sheet (omp `selectListPicker`): its options, filter, selection and check. */
 function submenuPicker(m: Any): NativeNode | null {
 	const list: Any | undefined = m.selectList;
 	if (!list || !Array.isArray(list.filteredItems)) return null;
@@ -411,17 +371,16 @@ function submenuFingerprint(m: Any | undefined): unknown[] {
 	return [m, m?.allOptions, list, list?.filteredItems, list?.filteredItems?.length, list?.selectedIndex, input?.value, input?.cursor];
 }
 
-/** Moves a SelectList's selection to `index` as its arrow keys do (the selection-change hook previews themes). */
 function selectIndex(list: Any, index: number, notify: boolean): void {
 	const items = listItems(list);
 	if (index < 0 || index >= items.length) return;
 	const changed = index !== Number(list.selectedIndex);
 	if (typeof list.setSelectedIndex === "function") list.setSelectedIndex(index);
 	else list.selectedIndex = index;
+	// Pi previews themes through this hook.
 	if (changed && notify) list.onSelectionChange?.(items[index]);
 }
 
-/** Selects option `value` in the SelectSubmenu `m`; false when it isn't shown. */
 function selectOption(m: Any, value: string, notify: boolean): boolean {
 	const list: Any | undefined = m.selectList;
 	if (!list) return false;
@@ -431,7 +390,6 @@ function selectOption(m: Any, value: string, notify: boolean): boolean {
 	return true;
 }
 
-/** omp's `routeSelectListPicker` on a SelectSubmenu: Enter and Esc go through the submenu's own `handleInput`. */
 function routeSubmenu(m: Any, ev: PickerEvent): void {
 	if (ev.kind === "action") {
 		switch (ev.act) {
@@ -467,7 +425,6 @@ const selectSubmenu: Describer = {
 	},
 };
 
-/** The step on screen: SteppedSubmenu renders (and takes keys through) its active SelectSubmenu only. */
 function activeStep(c: Component): Any | undefined {
 	const active = (c as Any).activeComponent;
 	return is(active, undefined, "SelectSubmenu") ? (active as Any) : undefined;
@@ -485,7 +442,7 @@ const steppedSubmenu: Describer = {
 		const ev = pickerEvent(event);
 		const active = activeStep(c);
 		if (!ev || !active) return;
-		// Esc and Enter go through the stepper: it moves between steps (and loops) itself.
+		// Only the stepper can move between steps.
 		if (ev.kind === "action" && (ev.act === "close" || ev.act === "cancel")) press(c as Any, "cancel");
 		else if (ev.kind === "action" && (ev.act === "confirm" || ev.act === "use")) press(c as Any, "confirm");
 		else if (ev.kind === "activate") {
@@ -493,8 +450,6 @@ const steppedSubmenu: Describer = {
 		} else routeSubmenu(active, ev);
 	},
 };
-
-// ── /settings: pages, sections, controls ────────────────────────────────
 
 interface SettingItem {
 	id: string;
@@ -512,7 +467,9 @@ interface PageDef {
 	lead: string;
 }
 
-/** The pages, each a contiguous run of pi's settings order (↓ at a page's last row lands on the next page's first). */
+/**
+ * Each page must cover a contiguous run of pi's settings.
+ */
 const SETTINGS_PAGES: readonly PageDef[] = [
 	{ id: "general", label: "General", icon: "sliders", lead: "Compaction, images and skill commands." },
 	{ id: "terminal", label: "Terminal", icon: "terminal", lead: "The editor, padding and how pi draws in your terminal." },
@@ -521,7 +478,6 @@ const SETTINGS_PAGES: readonly PageDef[] = [
 	{ id: "appearance", label: "Appearance", icon: "appearance", lead: "Layout mode, fullscreen behavior and the color theme." },
 ];
 
-/** Each known setting's page and section; a setting pi adds later joins the one before it in pi's order. */
 const SETTINGS_PLACES: Readonly<Record<string, readonly [page: string, section: string]>> = {
 	autocompact: ["general", "Context"],
 	"show-images": ["general", "Images"],
@@ -560,13 +516,10 @@ const SETTINGS_PLACES: Readonly<Record<string, readonly [page: string, section: 
 	theme: ["appearance", "Theme"],
 };
 
-/** Units of numeric steppers. */
 const NUMBER_UNITS: Readonly<Record<string, string>> = { "image-width-cells": "cells", "autocomplete-max-visible": "items" };
 
-/** Submenu rows whose submenu picks one of a list of values: a `choice` whose popup menu is the submenu. */
 const CHOICE_SUBMENUS: ReadonlySet<string> = new Set(["theme", "light-theme", "dark-theme"]);
 
-/** A submenu with more options than this (or a search field) opens as a picker over the page, not a popup menu. */
 const MENU_MAX = 12;
 
 interface Place {
@@ -609,7 +562,6 @@ function settingsListOf(a: Any): Any | undefined {
 	return kids(a).find((k) => is(k, undefined, "SettingsList")) as Any | undefined;
 }
 
-/** The rows a SettingsList shows (and its selection indexes): the filtered ones while it searches. */
 function displayItems(list: Any): SettingItem[] {
 	const items = list.searchEnabled ? list.filteredItems : list.items;
 	return Array.isArray(items) ? items : [];
@@ -619,7 +571,6 @@ function displayIndex(list: Any, id: string): number {
 	return displayItems(list).findIndex((item) => item?.id === id);
 }
 
-/** The row whose submenu is open (SettingsList keeps the index it opened from). */
 function openItemOf(list: Any): SettingItem | undefined {
 	if (!list.submenuComponent) return undefined;
 	const items = displayItems(list);
@@ -631,7 +582,6 @@ function onOff(v: string): string {
 	return v === "true" ? "on" : v === "false" ? "off" : v;
 }
 
-/** A theme setting as shown: `light/dark` is automatic mode. */
 function themeLabel(value: string): string {
 	if (value === "/") return "automatic";
 	const slash = value.indexOf("/");
@@ -640,7 +590,6 @@ function themeLabel(value: string): string {
 
 const IDENT = /^[a-z0-9][a-z0-9._-]*$/;
 
-/** A cycling row's typed control: a switch for true/false, a stepper for numeric steps, else a choice. */
 function valueControl(item: SettingItem): PrefsControl {
 	const values = (item.values ?? []).map(String);
 	const current = String(item.currentValue ?? "");
@@ -658,7 +607,6 @@ function valueControl(item: SettingItem): PrefsControl {
 	return { k: "choice", value: current, options, ...(mono ? { mono: true } : {}) };
 }
 
-/** A pointer value for a cycling row as the string pi stores (undefined when it is none of the row's values). */
 function valueString(item: SettingItem, value: unknown): string | undefined {
 	const values = (item.values ?? []).map(String);
 	let out: string | undefined;
@@ -668,7 +616,6 @@ function valueString(item: SettingItem, value: unknown): string | undefined {
 	return out !== undefined && values.includes(out) ? out : undefined;
 }
 
-/** The SelectSubmenu a submenu shows now (the theme menu's single-theme list, a stepper's step). */
 function leafSelect(sub: Any | undefined): Any | undefined {
 	if (!sub) return undefined;
 	if (is(sub, undefined, "SelectSubmenu")) return sub;
@@ -677,7 +624,6 @@ function leafSelect(sub: Any | undefined): Any | undefined {
 	return undefined;
 }
 
-/** The SettingsList a submenu shows now (Warnings, the automatic theme menu). */
 function leafList(sub: Any | undefined): Any | undefined {
 	if (!sub) return undefined;
 	if (is(sub, undefined, "SettingsList")) return sub;
@@ -690,7 +636,6 @@ function inlineMenu(m: Any): boolean {
 	return !m.searchInput && submenuOptions(m).length <= MENU_MAX;
 }
 
-/** How an open submenu shows: the row's popup menu, a nested section, a picker over the page, or a card. */
 type OpenView =
 	| { kind: "menu"; select: Any }
 	| { kind: "list"; list: Any }
@@ -706,19 +651,17 @@ function openView(sub: Any, choiceRow: boolean): OpenView {
 	return { kind: "card", child: sub as Component };
 }
 
-/** The popup choice of an open SelectSubmenu: its options (check marks dropped) and the stored value. */
 function menuControl(select: Any, current: string): PrefsControl {
 	const all = submenuOptions(select);
 	const options = all.map((o) => {
 		const detail = plainLine(o.description);
 		return { value: String(o.value), label: optionLabel(o), ...(detail ? { detail } : {}) };
 	});
-	// Automatic theme settings (`light/dark`) are the menu's `/` option.
+	// Pi's `/` menu option represents any automatic theme pair.
 	const value = options.some((o) => o.value === current) || !current.includes("/") || !options.some((o) => o.value === "/") ? current : "/";
 	return { k: "choice", value, options, style: "menu", ...(options.every((o) => IDENT.test(o.value)) ? { mono: true } : {}) };
 }
 
-/** Texts a submenu shows above its list (the automatic theme menu's title and explanation). */
 function submenuLead(sub: Any, list: Any): { title: string; lead: string } {
 	const texts: string[] = [];
 	const visit = (c: unknown, depth: number): void => {
@@ -744,7 +687,6 @@ function editorCard(child: Component): NativeNode {
 	return col([child], { role: "omp.prefs.editor" }, "editor");
 }
 
-/** A SettingsList item as a row (`id` namespaces a nested list's rows under their parent row). */
 function settingRow(item: SettingItem, id: string, themes?: readonly string[]): PrefsRow {
 	const label = plainLine(item.label) || item.id;
 	const hint = plainLine(item.description);
@@ -752,7 +694,7 @@ function settingRow(item: SettingItem, id: string, themes?: readonly string[]): 
 	let control: PrefsControl;
 	if (item.submenu) {
 		if (CHOICE_SUBMENUS.has(item.id)) {
-			// Closed, the menu knows only the stored value (the automatic theme menu knows its themes); opening it lists them.
+			// Pi only exposes the main theme choices while that submenu is open.
 			const names = themes && item.id !== "theme" ? [...themes] : [];
 			if (!names.includes(current)) names.unshift(current);
 			control = { k: "choice", value: current, options: names.map((n) => ({ value: n, label: item.id === "theme" ? themeLabel(n) : n })), style: "menu", ...(names.every((n) => IDENT.test(n)) ? { mono: true } : {}) };
@@ -770,7 +712,6 @@ interface OpenOut {
 	editing: PrefsEditing | null;
 }
 
-/** An open SettingsList submenu as a section of rows right under its row (ids `<row>/<item>`). */
 function nestedSection(parent: SettingItem, sub: Any, list: Any, page: string, searching: boolean, out: OpenOut): { section: PrefsSection; focus: string | null; lead: string } {
 	const themes: string[] | undefined = Array.isArray(sub.availableThemes) ? sub.availableThemes.map(String) : undefined;
 	const items = displayItems(list).filter((item) => item && typeof item.id === "string");
@@ -805,9 +746,7 @@ interface MenuState {
 	option?: string;
 }
 
-/** Popup menus the page opened on cycling rows (pi has no menu there): open while that row keeps pi's focus. */
 const ownMenus = new WeakMap<Component, MenuState>();
-/** The page shown last (kept while no row has the focus: a search without matches). */
 const lastPages = new WeakMap<Component, string>();
 
 interface PrefsView {
@@ -816,7 +755,6 @@ interface PrefsView {
 	sig: string;
 }
 
-/** /settings as a prefs page set: the focused row's page (or the matches), its sections, the open submenu. */
 function settingsView(c: Component): PrefsView | null {
 	const a = c as Any;
 	const list = settingsListOf(a);
@@ -866,7 +804,7 @@ function settingsView(c: Component): PrefsView | null {
 				const inner = nestedSection(item, sub, view.list, place.page, searching, out);
 				nested = { after: section, section: inner.section };
 				focus = inner.focus;
-				// Esc leaves it: Warnings applied each toggle already; the automatic theme menu cancels (Apply saves).
+				// Pi saves warning toggles immediately but waits for Apply to save theme pairs.
 				row.control = { k: "action", label: is(sub, undefined, "ThemeSubmenu") ? "Cancel" : "Done", act: "close" };
 				if (inner.lead) row.hint = inner.lead;
 				break;
@@ -891,7 +829,6 @@ function settingsView(c: Component): PrefsView | null {
 		page,
 		...(lead ? { lead } : {}),
 		...(query !== "" ? { query } : {}),
-		// The caret shows while the keys type into pi's search (not while a submenu takes them).
 		...(search && query !== "" && !sub ? { cursor: search.cursor } : {}),
 		sections,
 		focus,
@@ -900,22 +837,19 @@ function settingsView(c: Component): PrefsView | null {
 	return { props, children: out.children, sig: JSON.stringify(props) };
 }
 
-// ── /settings: pointer events through pi's keys ─────────────────────────
-
-/** Closes pi's open submenus with Esc (one level per press; a stepper steps back first, the theme menu reverts). */
+/**
+ * Pi closes at most one submenu level per Escape.
+ */
 function closeSubmenus(list: Any): void {
 	for (let i = 0; i < 8 && list.submenuComponent; i++) press(list, "cancel");
 }
 
-/** Closes what the open submenu's own list has open (the automatic theme menu's light/dark list). */
 function closeInner(list: Any, inner: Any): void {
 	for (let i = 0; i < 4 && inner.submenuComponent && list.submenuComponent; i++) press(list, "cancel");
 }
 
 /**
- * Sets cycling row `idx` of `target` to `value` the way pi does: Enter when that is the value Enter cycles to (the
- * key's own path), else what `activateItem` does with the chosen value (the row shows it, then `onChange` runs).
- * Keys go through `via` (the top list, which hands them to an open submenu's list).
+ * Pi routes keys to nested lists through the top list.
  */
 function applySetting(target: Any, idx: number, value: string, via: Any): void {
 	const item = displayItems(target)[idx];
@@ -932,7 +866,6 @@ function applySetting(target: Any, idx: number, value: string, via: Any): void {
 	target.onChange?.(item.id, value);
 }
 
-/** Picks `value` in row `idx`'s submenu: opens it with Enter, selects the option, confirms with Enter. */
 function chooseInSubmenu(target: Any, idx: number, value: string, via: Any): void {
 	const item = displayItems(target)[idx];
 	if (!item?.submenu) return;
@@ -948,7 +881,6 @@ function chooseInSubmenu(target: Any, idx: number, value: string, via: Any): voi
 	if (select && selectOption(select, value, false)) press(via, "confirm");
 }
 
-/** Opens row `idx`'s submenu (or runs a one-value row) with Enter. */
 function openRow(target: Any, idx: number, via: Any): void {
 	const item = displayItems(target)[idx];
 	if (!item) return;
@@ -961,7 +893,6 @@ function openRow(target: Any, idx: number, via: Any): void {
 	if (item.submenu || (Array.isArray(item.values) && item.values.length === 1)) press(via, "confirm");
 }
 
-/** Where a row id points: a top row, or a row of the open submenu's list (`<row>/<item>`). */
 function locate(list: Any, id: string): { target: Any; idx: number; item: SettingItem } | undefined {
 	const top = displayIndex(list, id);
 	if (top >= 0) return { target: list, idx: top, item: displayItems(list)[top]! };
@@ -973,7 +904,6 @@ function locate(list: Any, id: string): { target: Any; idx: number; item: Settin
 	return idx >= 0 ? { target: inner, idx, item: displayItems(inner)[idx]! } : undefined;
 }
 
-/** The SelectSubmenu whose popup menu row `id` shows now, if any. */
 function menuSelect(list: Any, id: string): Any | undefined {
 	const at = locate(list, id);
 	if (!at || !at.target.submenuComponent || openItemOf(at.target) !== at.item) return undefined;
@@ -1003,7 +933,7 @@ function settingsEvent(c: Component, event: NativeUiEvent): void {
 			}
 			if (act === "close") {
 				if (value === undefined) {
-					// The sheet's close: leave the submenus as Esc does (reverting a theme preview), then pi's own cancel.
+					// Escape must revert theme previews before the sheet closes.
 					ownMenus.delete(c);
 					closeSubmenus(list);
 					press(list, "cancel");
@@ -1031,7 +961,6 @@ function settingsEvent(c: Component, event: NativeUiEvent): void {
 		case "select": {
 			const eq = event.item.indexOf("=");
 			if (eq >= 0) {
-				// Pointing at a popup menu's option: pi's highlight follows (the theme menu previews it).
 				const id = event.item.slice(0, eq);
 				const option = event.item.slice(eq + 1);
 				const menu = ownMenus.get(c);
@@ -1058,7 +987,6 @@ function settingsEvent(c: Component, event: NativeUiEvent): void {
 			return;
 		}
 		case "activate": {
-			// A choice's menu button (closed): a submenu opens with Enter; a cycling row gets the page's own menu.
 			const at = locate(list, event.item);
 			if (!at) return;
 			ownMenus.delete(c);
@@ -1112,8 +1040,6 @@ const settingsSelector: Describer = {
 	handleEvent: (c, event) => settingsEvent(c, event),
 };
 
-// ── pi config: resources per write scope ────────────────────────────────
-
 type ResourceEntry = { type: "group"; group: Any } | { type: "subgroup"; subgroup: Any; group: Any } | { type: "item"; item: Any };
 
 function resourceEntries(rl: Any): ResourceEntry[] {
@@ -1133,7 +1059,6 @@ function tildePath(path: string): string {
 	return home && home !== "/" && path.startsWith(home) ? `~${path.slice(home.length)}` : path;
 }
 
-/** ResourceList's project override state of a resource; undefined when its internals don't match. */
 function overrideState(rl: Any, item: Any): "inherit" | "load" | "unload" | undefined {
 	try {
 		const state = rl.getProjectOverrideState?.(item);
@@ -1151,7 +1076,6 @@ function call<T>(fn: () => T, fallback: T): T {
 	}
 }
 
-/** The header's scope line (`~/.pi/agent/settings.json`, `.pi/settings.json · …`). */
 function scopeFile(header: Any | undefined): string {
 	if (!header || typeof header.render !== "function") return "";
 	const lines: unknown = call(() => header.render(240), [] as string[]);
@@ -1255,7 +1179,6 @@ function configEvent(c: Component, event: NativeUiEvent): void {
 	switch (event.type) {
 		case "action":
 			if (event.act === "page" && (event.value === "global" || event.value === "project") && event.value !== rl.writeScope) {
-				// Tab is pi's mode switch (only bound when the project mode is available).
 				if (a.header?.projectModeAvailable !== false) press(rl, "tab");
 			} else if (event.act === "close" && event.value === undefined) press(rl, "cancel");
 			return;
@@ -1271,7 +1194,7 @@ function configEvent(c: Component, event: NativeUiEvent): void {
 			const entry = resourceEntries(rl)[idx];
 			if (entry?.type !== "item") return;
 			rl.selectedIndex = idx;
-			// Space toggles (global) or cycles inherit → load/unload (project), saving each step as the key does.
+			// Pi saves each resource change on Space.
 			if (rl.writeScope === "project") {
 				if (event.value !== "inherit" && event.value !== "load" && event.value !== "unload") return;
 				for (let i = 0; i < 3 && overrideState(rl, entry.item) !== event.value; i++) rl.handleInput(" ");
@@ -1304,8 +1227,6 @@ const configSelector: Describer = {
 	handleEvent: (c, event) => configEvent(c, event),
 };
 
-// ── First-time setup: a picker per step ─────────────────────────────────
-
 const SETUP_FALLBACK: Readonly<Record<"theme" | "analytics", readonly string[]>> = {
 	theme: ["System (matches your terminal colors)", "Dark", "Light"],
 	analytics: ["Share anonymous usage data", "Don't share"],
@@ -1313,7 +1234,6 @@ const SETUP_FALLBACK: Readonly<Record<"theme" | "analytics", readonly string[]>>
 
 const THEME_ICONS: readonly string[] = ["monitor", "moon", "sun"];
 
-/** The dialog's welcome line, the step's question lines and its options (rows drawn `→ label` / `  label`). */
 function setupTexts(a: Any, step: "theme" | "analytics"): { welcome: string; question: string[]; options: string[] } {
 	const texts = kids(a)
 		.filter(isText)
@@ -1383,13 +1303,12 @@ const firstTimeSetup: Describer = {
 		}
 		const target = Number(ev.item.slice(1));
 		if (!ev.item.startsWith("o") || !Number.isInteger(target) || target < 0) return;
-		// ↑/↓ move the selection (the theme step previews each theme on the way, as the keys do).
 		const count = setupTexts(a, setupStep(a)).options.length;
 		if (target >= count) return;
+		// Pi previews each theme while handling the arrow keys.
 		for (let i = 0, at = setupIndex(a); i < count && at !== target; i++, at = setupIndex(a)) press(a, at < target ? "down" : "up");
 		if (ev.kind === "activate") press(a, "confirm");
 	},
 };
 
-/** Registered with the picker describers (describers.ts DESCRIBERS); class names only: pi runs from its bundle. */
 export const PREFS_DESCRIBERS: readonly Describer[] = [settingsSelector, configSelector, firstTimeSetup, selectSubmenu, steppedSubmenu];

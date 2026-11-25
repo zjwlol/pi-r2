@@ -1,27 +1,3 @@
-/**
- * word-predict (ported from oh-my-pi's "Word Autocomplete")
- *
- * While you type prose in the prompt editor, the rest of the word you are
- * probably typing is shown dim after the caret. Tab accepts it with a space
- * (a `.` or `)` typed next pulls back onto the word), → accepts it without;
- * typing on keeps or drops it. Predictions come from an N-gram engine that
- * learns the prompts you submit; it runs in a worker thread and keeps its
- * state in `<agentDir>/word-predict/`, shared by every pi process.
- *
- *   /word-predict [on|off|status]   switch it (persisted) or show its state
- *
- * Only in the interactive TUI: in print, JSON and RPC mode nothing is
- * started, patched or read.
- *
- * This file: events, the command and the runtime's lifecycle. The engine is
- * under engine/ (host.ts talks to it), the gates and ghost cache in
- * provider.ts, the editor integration in editor-hook.ts.
- *
- * Port of oh-my-pi `packages/coding-agent/src/modes/interactive-mode.ts` (MIT):
- * the wiring of the `spelling.autocomplete` setting to the provider and the
- * engine. The prompt feed replaces upstream's `history.db` rows (the `input`
- * and `user_bash` events here).
- */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,33 +7,26 @@ import { readStateMeta, STATE_FILE } from "./engine/store.ts";
 import { type HostStatus, PredictHost, readConfig, writeConfig } from "./host.ts";
 import { WordCompletionProvider } from "./provider.ts";
 
-/** The worker starts this long after the session, so its load does not compete with pi's startup. */
 const START_DELAY_MS = 300;
 const SUBCOMMANDS = ["on", "off", "status"] as const;
 
-/** One interactive session's state; exists only in TUI mode, between `session_start` and `session_shutdown`. */
 interface Runtime {
 	agentDir: string;
 	host: PredictHost;
 	provider: WordCompletionProvider;
-	/** The config's switch. */
 	enabled: boolean;
-	/** The active editor hook: set while enabled, unless pi-tui did not match. */
 	hook: EditorHookHandle | undefined;
-	/** Why the editor hook could not be installed; the extension is inert then. */
 	hookError: string | undefined;
 	startTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 function extensionDir(): string {
-	// jiti (pi's extension loader) provides __dirname; fall back to import.meta for native ESM.
 	// @ts-ignore TS1470: import.meta is fine at runtime; the type-check config may assume CommonJS output.
 	return typeof __dirname === "string" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
 }
 
 /**
- * pi writes this session to a file. What pi itself does not keep (`pi --no-session`) is not journaled either:
- * the journal would be the only place those prompts are stored.
+ * Pi's `--no-session` prompts must stay out of the journal.
  */
 function sessionPersisted(ctx: ExtensionContext): boolean {
 	try {
@@ -68,12 +37,10 @@ function sessionPersisted(ctx: ExtensionContext): boolean {
 }
 
 export default function (pi: ExtensionAPI) {
-	// Nothing at factory time (factories may run without a session).
+	// Pi may call the factory without a session.
 	let runtime: Runtime | undefined;
-	/** The "pi-tui does not match" warning was shown. */
 	let warned = false;
 
-	/** Hook the editor and schedule the worker. False, with a warning the first time, when pi-tui does not match. */
 	const activate = (rt: Runtime, ctx: ExtensionContext, delayMs: number): boolean => {
 		if (rt.hook) return true;
 		const hook = activateEditorHook({
@@ -101,7 +68,6 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	};
 
-	/** Unhook the editor (ghosts vanish, Tab and → are pi's again) and stop the worker, which persists first. */
 	const deactivate = async (rt: Runtime): Promise<void> => {
 		clearTimeout(rt.startTimer);
 		rt.startTimer = undefined;
@@ -111,7 +77,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			await rt.host.stop();
 		} catch {
-			// Nothing is lost: unpersisted prompts are in the journal.
+			// The journal already holds prompts the worker has not saved.
 		}
 	};
 
@@ -123,7 +89,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		// A session of this runtime that was never shut down.
 		await teardown();
 		const agentDir = getAgentDir();
 		const host = new PredictHost({ agentDir, extensionDir: extensionDir() });
@@ -145,15 +110,13 @@ export default function (pi: ExtensionAPI) {
 		await teardown();
 	});
 
-	// What the composer submits is what the engine learns: idle prompts, steers and follow-ups alike, as typed
-	// (paste markers expanded, before skill / template expansion). Slash commands never get here.
+	// Pi emits `input` before expanding skills and templates.
 	pi.on("input", (event, ctx) => {
 		const rt = runtime;
 		if (!rt?.hook || !rt.enabled || event.source !== "interactive" || !sessionPersisted(ctx)) return;
 		rt.host.observe(event.text);
 	});
 
-	// `!` / `!!` lines, stored as typed (upstream learns them through the same history).
 	pi.on("user_bash", (event, ctx) => {
 		const rt = runtime;
 		if (!rt?.hook || !rt.enabled || !sessionPersisted(ctx)) return;
@@ -206,12 +169,6 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-// ── /word-predict status ────────────────────────────────────────────────
-
-/**
- * `stopped` / `starting` / `loading` / `bootstrapping` / `ready` / `failed: <reason>`. An error the engine reports
- * is not the reason here: it has its own line (see `engineError`), because the engine can be `ready` with one.
- */
 function workerState(status: HostStatus): string {
 	if (status.worker === "failed") return `failed: ${status.error ?? "unknown reason"}`;
 	if (status.worker === "stopped") return "stopped";
@@ -221,12 +178,10 @@ function workerState(status: HostStatus): string {
 	return engineError(status) === undefined ? "failed: unknown reason" : "failed";
 }
 
-/** Longest engine error shown; the rest is cut with `…`. */
 const ERROR_LIMIT = 200;
 
 /**
- * What the engine says went wrong, as one line: also set while it is `ready` (an unwritable state directory, a
- * failed save or journal read leave it serving from memory), so it is shown whatever the phase.
+ * The engine can report an error and keep serving predictions.
  */
 function engineError(status: HostStatus): string | undefined {
 	const error: unknown = status.engine?.error;
@@ -259,7 +214,6 @@ async function statusText(rt: Runtime): Promise<string> {
 	const error = engineError(status);
 	if (error !== undefined) lines.push(`engine error: ${error}`);
 
-	// What was learned: the live engine's counts, else what the saved state says of itself.
 	let stateBytes: number | null = engine?.stateBytes ?? null;
 	let savedAt: number | null = engine?.savedAt ?? null;
 	if (engine) {

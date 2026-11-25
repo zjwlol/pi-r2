@@ -1,32 +1,3 @@
-/**
- * Per-task features layered on the hub through its ChildHooks seams (hub.ts):
- *
- *  outputSchema (structured.ts)
- *    spawn    schema = item.outputSchema ?? agent `output:`; invalid -> per-item error
- *    session  one YieldState + `yield` tool per child; ⁂ Completion = structuredCompletionPrompt
- *    settle   initial run: yielded data -> `data` (output = pretty JSON); {error} -> failed; no yield ->
- *             up to MAX_YIELD_REMINDERS reminder turns, then failed (with the last rejection). No
- *             reminders when the run itself errored/aborted. Follow-up (wake) runs: the reply relayed
- *             is the yielded data if the child yielded that turn, else its final text; no reminders.
- *             The state is reset after every settled run (so each turn needs its own `yield`) and when
- *             an owner resumes with subagent results (a `yield` is only accepted once they all settled).
- *             A run force-stopped at its request budget gets no reminders: no `yield` in its one forced
- *             final turn -> failed.
- *
- *  isolated (isolation.ts)
- *    spawn    cwd must be inside a git work tree -> else per-item error
- *    prepare  createWorktree(child.cwd) -> child.cwd = wt.cwd (nested agents inherit it: subagents of an
- *             isolated agent work in, or branch from and merge into, its worktree)
- *    settle   every settled run: completed -> mergeDelta into the parent's working tree; failed ->
- *             changes NOT applied, patch saved. The worktree is kept while the agent lives (it can be
- *             woken; unmerged changes are offered again by its next successful run). A follow-up run's
- *             merge reaches the owner as a hub notice even when no reply is relayed to it.
- *    dispose  kill / session end: unmerged changes -> patch saved (reported), worktree removed. If the
- *             changes cannot be collected or saved, the worktree is KEPT (`retainWorktree`: also skipped
- *             by the shutdown sweep) and the note says where. A merge that completed after a kill
- *             (never delivered) is reported too.
- */
-
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -70,15 +41,10 @@ import {
 
 interface FeatureState {
 	yield?: YieldState;
-	/** Reminders sent during the current (initial) purpose. */
 	reminders: number;
-	/** In-flight worktree work (creation, merge); dispose waits for it. */
 	busy: Promise<unknown>;
-	/** Last patch saved for this worktree (not saved twice for the same changes). */
 	lastPatch?: { patch: string; file: string };
-	/** Merge outcome of a settle that finished after the agent was killed (never delivered otherwise). */
 	orphanMerge?: MergeInfo;
-	/** Identity of the last reported non-applied merge (status + files + patch hash): repeats are not re-sent. */
 	lastReported?: { key: string; patchFile?: string };
 }
 
@@ -93,7 +59,6 @@ function stateOf(child: Child): FeatureState {
 	return st;
 }
 
-/** isolation's collect error without its "merge again" advice (used when the agent is gone). */
 function collectFailure(e: unknown): string {
 	return flat(errText(e).replace(/\s*Fix the problem in the worktree[^]*$/, ""), 300);
 }
@@ -124,7 +89,6 @@ function bool(v: unknown): boolean | undefined {
 	return undefined;
 }
 
-/** Item option wins (`outputSchema: false`/null disables an agent default); else the agent's `output:`. */
 export function resolveSchema(spec: Pick<SpawnSpec, "agent" | "item">): { schema?: Record<string, unknown>; error?: string } {
 	const item = spec.item ?? {};
 	if (Object.hasOwn(item, "outputSchema") && item.outputSchema !== undefined) {
@@ -139,7 +103,6 @@ export function resolveIsolated(spec: Pick<SpawnSpec, "agent" | "item">): boolea
 	return bool(spec.item?.isolated) ?? !!spec.agent.isolated;
 }
 
-/** Save `delta` unless the same changes were saved already (and that file still exists); returns the patch path. */
 async function savePatchOnce(wt: Worktree, delta: Delta, st: FeatureState): Promise<string> {
 	if (st.lastPatch && st.lastPatch.patch === delta.patch && fs.existsSync(st.lastPatch.file)) return st.lastPatch.file;
 	const file = await savePatch(wt, delta);
@@ -160,7 +123,6 @@ function mergeInfo(r: MergeResult, wt: Worktree, delta: Delta | undefined, st: F
 		case "empty":
 			return { status: "empty", files: [], message: "No file changes." };
 		case "conflict": {
-			// isolation's message names the patch, the recovery command and the kept worktree.
 			const base = r.patchFile && !r.message.includes("git apply --reject") ? `${r.message} ${recoveryHint(r.patchFile, wt.repoRoot)}` : r.message;
 			return {
 				status: "conflict",
@@ -181,23 +143,17 @@ function mergeInfo(r: MergeResult, wt: Worktree, delta: Delta | undefined, st: F
 	}
 }
 
-/** Run `fn` as tracked worktree work (dispose waits for it). */
 function track<T>(st: FeatureState, p: Promise<T>): Promise<T> {
 	st.busy = Promise.all([st.busy, p.catch(() => {})]);
 	return p;
 }
 
-/**
- * Identity of a non-applied outcome for notice dedupe: same status, files and patch content = same news.
- * Applied / empty outcomes have none (always reported / never reported).
- */
 function outcomeKey(m: MergeInfo, delta: Delta | undefined): string | undefined {
 	if (m.status === "applied" || m.status === "empty") return undefined;
 	const hash = delta ? createHash("sha256").update(delta.patch).digest("hex") : m.message;
 	return `${m.status}|${[...m.files].sort().join("\0")}|${hash}`;
 }
 
-/** Merge or save; with the dedupe key of the outcome. */
 async function settleWorktree(wt: Worktree, completed: boolean, st: FeatureState): Promise<{ merge: MergeInfo; key?: string }> {
 	let delta: Delta | undefined;
 	let merge: MergeInfo;
@@ -212,7 +168,6 @@ async function settleWorktree(wt: Worktree, completed: boolean, st: FeatureState
 	return { merge, key: outcomeKey(merge, delta) };
 }
 
-/** Owner (internal id) of the checkout `wt` merges into: the nearest ancestor whose worktree it is, else the main agent. */
 function checkoutOwner(hub: AgentHub, child: Child, wt: Worktree): string {
 	const inside = (p: string, root: string) => p === root || p.startsWith(`${root}${path.sep}`);
 	for (let cur = child; cur.ownerId !== PARENT_ID; ) {
@@ -224,7 +179,6 @@ function checkoutOwner(hub: AgentHub, child: Child, wt: Worktree): string {
 	return PARENT_ID;
 }
 
-/** Merge (completed run) or save as a patch without applying (failed / aborted run). */
 async function mergeOrSave(wt: Worktree, delta: Delta, completed: boolean, st: FeatureState): Promise<MergeInfo> {
 	if (completed) return mergeInfo(await mergeDelta(wt, delta), wt, delta, st);
 	if (!delta.patch.trim()) return { status: "empty", files: [], message: "No file changes." };
@@ -248,16 +202,13 @@ async function mergeOrSave(wt: Worktree, delta: Delta, completed: boolean, st: F
 	};
 }
 
-/** `yield` that refuses while the agent's own subagents still owe it a result or reply (`owedSubagents`; it must report after they settle). */
 function yieldTool(child: Child, state: YieldState): ToolDefinition {
-	// Codex refuses tool schemas with itemless arrays; vanilla pi-ai sends ours as written.
+	// This provider requires an items schema for each array.
 	const tool = createYieldTool(child.schema!, state, { openArrayItems: child.model?.api === "openai-codex-responses" });
 	const execute = tool.execute.bind(tool);
 	return {
 		...tool,
 		execute: (async (...args: Parameters<ToolDefinition["execute"]>) => {
-			// Only subagents that still owe a result or reply block it: one busy with a turn of its own after
-			// its result (a held peer message, a broadcast leg) sends this agent nothing more.
 			const active = owedSubagents(child);
 			if (active.length > 0) {
 				const ids = active.map((c) => c.id).join(", ");
@@ -300,7 +251,7 @@ export function createFeatureHooks(hub: AgentHub): ChildHooks {
 			const st = stateOf(child);
 			setPhase(child, "creating worktree…");
 			try {
-				// Tracked as a whole (incl. cleanup when killed meanwhile) so dispose never races it.
+				// Track creation and its cleanup together to prevent a race with disposal.
 				await track(
 					st,
 					(async () => {
@@ -349,10 +300,8 @@ export function createFeatureHooks(hub: AgentHub): ChildHooks {
 						o.data = y.data;
 						output = formatStructuredData(y.data);
 					} else if (status === "failed") {
-						// The run itself errored / was aborted: reminding would not help.
 						o.error = `${child.error || "run failed"} (no result was submitted with \`${YIELD_TOOL_NAME}\`)`;
 					} else if (child.budget.stop !== undefined) {
-						// Force-stopped at its request budget and asked once for a final `yield`: no reminder ladder.
 						status = "failed";
 						o.error = `Soft request budget exceeded (${child.budget.requests} requests; budget ${child.budget.limit}): no \`${YIELD_TOOL_NAME}\` when force-stopped`;
 					} else if (st.reminders < MAX_YIELD_REMINDERS) {
@@ -365,7 +314,6 @@ export function createFeatureHooks(hub: AgentHub): ChildHooks {
 							(y.lastRejection ? `; last rejection: ${flat(y.lastRejection)}` : "");
 					}
 				} else if (y.submitted) {
-					// Follow-up turn: relay what it yielded (else its final text, as for any agent).
 					if (y.error !== undefined) output = `Error (via yield): ${y.error}`;
 					else {
 						o.data = y.data;
@@ -377,7 +325,6 @@ export function createFeatureHooks(hub: AgentHub): ChildHooks {
 			}
 
 			const wt = child.worktree;
-			// Killed meanwhile: leave the changes to dispose (saved as a patch, not applied).
 			if (wt && child.status !== "aborted") {
 				setPhase(child, status === "completed" ? "merging worktree changes…" : "saving worktree changes…");
 				let merge: MergeInfo;
@@ -387,17 +334,13 @@ export function createFeatureHooks(hub: AgentHub): ChildHooks {
 				} finally {
 					setPhase(child, undefined);
 				}
-				// Killed while merging: this result is never delivered; dispose reports it instead.
+				// Disposal reports merges that finish after a kill.
 				if ((child.status as ChildStatus) === "aborted") st.orphanMerge = merge;
 				o.merge = merge;
-				// Same unresolved outcome as last reported (e.g. a conflict whose patch did not change)?
 				const prev = st.lastReported;
 				const repeat = key !== undefined && key === prev?.key;
-				// Keep pointing at the patch that was reported (isolation saves an identical copy per attempt).
 				st.lastReported = key === undefined ? undefined : repeat ? prev : { key, patchFile: merge.patchFile };
 				const reportedPatch = repeat ? (prev?.patchFile ?? merge.patchFile) : merge.patchFile;
-				// Follow-up runs: whoever owns the merged-into checkout must learn about it even if no
-				// reply goes to them (hub notice); unchanged conflicts are not re-sent.
 				if (!run.initial && merge.status !== "empty") {
 					if (repeat) {
 						o.replyNote = `<merge-summary>\nStill not merged: same ${merge.status === "conflict" ? "conflict" : "outcome"} as reported before${reportedPatch ? ` (patch ${reportedPatch})` : ""}; nothing new was applied.\n</merge-summary>`;
@@ -416,14 +359,14 @@ export function createFeatureHooks(hub: AgentHub): ChildHooks {
 		async dispose(child): Promise<DisposeInfo | void> {
 			const st = states.get(child);
 			if (!st) return;
-			await st.busy; // creation / merge still in flight
+			await st.busy;
 			const wt = child.worktree;
 			if (!wt) return;
-			child.worktree = undefined; // idempotent (start-failure dispose, then kill)
+			// Clear ownership before awaiting cleanup to prevent duplicate disposal.
+			child.worktree = undefined;
 			const messages: string[] = [];
 			const notes: string[] = [];
 			let merge: MergeInfo | undefined;
-			// A merge that finished after the kill was never delivered: the parent's checkout changed.
 			const orphan = st.orphanMerge;
 			if (orphan && orphan.status !== "empty") {
 				merge = orphan;
@@ -446,8 +389,7 @@ export function createFeatureHooks(hub: AgentHub): ChildHooks {
 				}
 			}
 			if (failure) {
-				// Never delete work we could not save: keep the worktree and stop tracking it, so the
-				// shutdown sweep (removeAllWorktrees) leaves it alone too.
+				// Untrack this worktree to protect it from the shutdown sweep.
 				retainWorktree(wt);
 				const msg = `Stopped, but ${failure}. Changes NOT saved; worktree kept at ${wt.path}. Recover them from there, then remove it with \`git worktree remove --force ${wt.path}\`.`;
 				messages.push(msg);

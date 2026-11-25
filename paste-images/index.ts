@@ -1,43 +1,3 @@
-/**
- * paste-images
- *
- * When a pasted/dropped image file path lands in the prompt editor (rsttyd
- * uploads a pasted image to `~/.local/state/rsttyd-uploads/paste-*.png` and
- * inserts that path; pi's own Ctrl+V writes a temp file and inserts its path;
- * terminals insert dropped files' paths), the path becomes an `[Image #N]`
- * token and a thumbnail band above the prompt shows the draft's images. On
- * submit every token's file is attached to the user message as image content
- * (the marker stays in the text). Deleting a token drops its image.
- *
- * The model is also told where each attached image lives: a prompt that
- * starts a run is followed by one hidden custom message (`display: false`,
- * type "paste-images.source") naming the source path of every `[Image #N]`
- * whose file still exists, so file tools can act on the file itself. A
- * steer / follow-up queued while the agent runs carries no such notice
- * (`before_agent_start` doesn't fire for it).
- *
- * Tokenising watches the editor text: a 150 ms poll (unref'd) plus a check
- * right after each raw terminal input, so it covers ANSI pastes and TSP
- * native edits (which never pass through terminal input) alike. Only paths
- * that arrived whole since the last look (a paste, drop or completion; not
- * typed character by character) are rewritten, and undoing a rewrite is
- * respected. Any image path pasted too late for the poll is tokenised at
- * submit.
- *
- * Detection: absolute, `~/` or `file://` paths ending in
- * .png/.jpg/.jpeg/.gif/.webp, optionally quoted or backslash-escaped, that
- * name a readable image file of at most 20 MB (checked by magic bytes).
- * Models without image input get the original paths back, with a warning.
- *
- * TSP native (tsp-native): the band's chips also go to tsp-native's composer
- * as an attachment provider (shared/composer-slots.ts, key "paste-images"),
- * which shows them inside its chat bar; while it does, the widget describes
- * as a hidden col.
- *
- * Commands: pi runs an extension command without the `input` event, so a
- * command that sends its text to a model itself (`/btw`) gets the draft's
- * images through the resolver registered in shared/draft-images.ts.
- */
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
@@ -48,13 +8,10 @@ import { type DescribeCx, ImageBand } from "./band.ts";
 import { Draft } from "./draft.ts";
 
 const WIDGET = "paste-images";
-/** This extension's key among the composer's attachment providers. */
 const SLOT = "paste-images";
 const POLL_MS = 150;
-/** customType of the hidden message that names the attached images' source paths. */
 const SOURCE_NOTICE = "paste-images.source";
 
-/** What the model is told about attached image `[Image #n]`: the file behind it. */
 function sourceNotice(n: number, path: string): string {
 	return [
 		`The user attached an image as \`[Image #${n}]\` in their visible message.`,
@@ -63,7 +20,6 @@ function sourceNotice(n: number, path: string): string {
 	].join("\n\n");
 }
 
-/** The parts of pi-tui's Editor (private members included) a rewrite touches. Duck-typed: MagicEditor etc. qualify. */
 interface EditorLike {
 	getText(): string;
 	getExpandedText?(): string;
@@ -71,7 +27,9 @@ interface EditorLike {
 	onChange?: (text: string) => void;
 	lastAction?: unknown;
 	preferredVisualCol?: unknown;
-	/** ≥ 0 while Up/Down browse the prompt history. */
+	/**
+	 * Pi uses a negative index outside history browsing.
+	 */
 	historyIndex?: number;
 	pushUndoSnapshot?(): void;
 	exitHistoryBrowsing?(): void;
@@ -87,9 +45,7 @@ function asEditor(component: unknown): EditorLike | undefined {
 }
 
 /**
- * The TUI's focused component. The exported `TUI` interface doesn't declare
- * it; the runtime class (`TuiBase`) has a public `getFocusedComponent()` over
- * a private `focusedComponent` field, so read either, duck-typed.
+ * Pi exposes the focused component at runtime but not in its TUI type.
  */
 function focusedOf(tui: TUI | undefined): unknown {
 	const t = tui as unknown as { getFocusedComponent?: () => unknown; focusedComponent?: unknown } | undefined;
@@ -104,7 +60,6 @@ function cursorOffset(editor: EditorLike): number {
 	return offset + cursorCol;
 }
 
-/** Replace the editor's text in place (one undo step), keeping the cursor at `cursor`. */
 function writeEditor(editor: EditorLike, text: string, cursor: number): void {
 	editor.cancelAutocomplete?.();
 	editor.exitHistoryBrowsing?.();
@@ -121,7 +76,6 @@ function writeEditor(editor: EditorLike, text: string, cursor: number): void {
 	editor.onChange?.(text);
 }
 
-/** The parts of tsp-native's DescribeContext the chips read, when `cx` has them. */
 function asDescribeCx(cx: unknown): DescribeCx | undefined {
 	const c = cx as Partial<DescribeCx> | null | undefined;
 	return c && typeof c.supports === "function" ? (c as DescribeCx) : undefined;
@@ -132,7 +86,6 @@ export default function (pi: ExtensionAPI) {
 	let ui: ExtensionUIContext | undefined;
 	let tui: TUI | undefined;
 	let band: ImageBand | undefined;
-	/** The chips row for tsp-native's composer: the band's, null while it shows nothing. */
 	const provider: ComposerAttachmentProvider = {
 		describe: (cx) => {
 			const describeCx = asDescribeCx(cx);
@@ -142,16 +95,14 @@ export default function (pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let unsubscribeInput: (() => void) | undefined;
 	let checkQueued = false;
-	/** The last non-empty editor text seen: what a submitted prompt is compared with (the editor is cleared by then). */
+	/**
+	 * Pi clears the editor before emitting `input`.
+	 */
 	let lastSeen = "";
 	/**
-	 * Source notices of submitted prompts, by the image content each is about,
-	 * until the run that prompt starts takes them. Keyed by the very object
-	 * handed to pi, so a prompt that never starts a run (no model, queued
-	 * behind another) can't pass its notices to a later one.
+	 * Pi passes the same image objects into `before_agent_start`.
 	 */
 	let pendingNotices = new WeakMap<ImageContent, string>();
-	/** The session's context: the model named in the resolver's warning. */
 	let session: ExtensionContext | undefined;
 
 	const editorText = (): string | undefined => {
@@ -168,10 +119,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * The editor text to work on: the focused main editor's own text (collapsed
-	 * `[paste #n …]` markers kept, so a rewrite in place leaves them alone) when
-	 * it is the editor pi reports, else pi's expanded text (rewritten through
-	 * setEditorText).
+	 * Pi's expanded text does not preserve collapsed paste markers.
 	 */
 	const observe = (): { text: string; editor?: EditorLike } | undefined => {
 		const expanded = editorText();
@@ -182,13 +130,11 @@ export default function (pi: ExtensionAPI) {
 				const raw = editor.getText();
 				if ((editor.getExpandedText?.() ?? raw) === expanded) return { text: raw, editor };
 			} catch {
-				// not an editor after all
 			}
 		}
 		return { text: expanded };
 	};
 
-	/** Look at the editor text: tokenise newly arrived image paths, then sync the band. */
 	const check = () => {
 		if (!ui) return;
 		const seen = observe();
@@ -196,7 +142,6 @@ export default function (pi: ExtensionAPI) {
 		const { text, editor } = seen;
 		const prev = draft.snapshot;
 		draft.snapshot = text;
-		// A recalled history entry isn't a paste: leave it as it was sent.
 		const browsing = editor !== undefined && typeof editor.historyIndex === "number" && editor.historyIndex >= 0;
 		const rewrite = browsing ? null : draft.tokenise(prev, text, editor ? cursorOffset(editor) : undefined);
 		if (rewrite) {
@@ -205,7 +150,7 @@ export default function (pi: ExtensionAPI) {
 				else ui.setEditorText(rewrite.text);
 				draft.snapshot = rewrite.text;
 			} catch {
-				// Editor gone mid-rewrite: the next look starts over from whatever is there.
+				// The next check can pick up a replacement editor.
 			}
 		}
 		if (draft.snapshot !== "") lastSeen = draft.snapshot;
@@ -215,7 +160,7 @@ export default function (pi: ExtensionAPI) {
 	const queueCheck = () => {
 		if (checkQueued) return;
 		checkQueued = true;
-		// After the focused component has applied this input, before the frame it requested.
+		// Check after pi handles the input and before the next render.
 		process.nextTick(() => {
 			checkQueued = false;
 			check();
@@ -223,11 +168,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * The images of a text that doesn't pass the `input` event
-	 * (shared/draft-images.ts). Scope "editor": a text submitted from this
-	 * editor, treated as the `input` handler treats a prompt, minus the source
-	 * notice (no run starts). Scope "detached": a text that never was in this
-	 * editor; its image paths are attached through a draft of its own.
+	 * Pi dispatches extension commands without emitting `input`.
 	 */
 	const resolver: DraftImageResolver = (text, { vision, scope }) => {
 		if (!ui) return undefined;
@@ -253,7 +194,7 @@ export default function (pi: ExtensionAPI) {
 				ui.notify(`paste-images: ${model} has no image input; sent ${count} image path${count > 1 ? "s" : ""} as text`, "warning");
 			}
 		} catch {
-			// UI or session already replaced: the plan still stands.
+			// Notification failures must not discard the submission plan.
 		}
 		if (plan.text === text && plan.images.length === 0) return undefined;
 		return { text: plan.text, images: plan.images };
@@ -264,7 +205,7 @@ export default function (pi: ExtensionAPI) {
 		timer = undefined;
 		unsubscribeInput?.();
 		unsubscribeInput = undefined;
-		// Only our own registration: a reloaded copy may already have taken the slot.
+		// A reloaded copy may already own the registration.
 		if (composerAttachments().includes(provider)) setComposerAttachments(SLOT, undefined);
 		if (getDraftImageResolver() === resolver) setDraftImageResolver(undefined);
 		session = undefined;
@@ -276,7 +217,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				ui.setWidget(WIDGET, undefined);
 			} catch {
-				// UI already torn down
+				// Pi may already have torn down the UI.
 			}
 		}
 		band = undefined;
@@ -301,13 +242,13 @@ export default function (pi: ExtensionAPI) {
 			{ placement: "aboveEditor" },
 		);
 		setComposerAttachments(SLOT, provider);
-		// Whatever the editor already holds (a restored draft) isn't a paste.
 		draft.snapshot = observe()?.text ?? "";
 		lastSeen = draft.snapshot;
 		unsubscribeInput = ctx.ui.onTerminalInput(() => {
 			queueCheck();
 			return undefined;
 		});
+		// Native editor updates bypass terminal input.
 		timer = setInterval(check, POLL_MS);
 		timer.unref?.();
 		session = ctx;
@@ -319,11 +260,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("input", async (event, ctx) => {
-		// Only prompts typed into this editor carry its tokens (RPC / extension messages have no draft).
 		if (!ui || event.source !== "interactive") return;
 		const plan = draft.prepareSubmit(event.text, {
 			vision: supportsImages(ctx),
-			// The editor is already cleared; what it last held tells which paths were pasted since the last look.
 			prev: lastSeen.trim(),
 		});
 		draft.prune(observe()?.text ?? "");
@@ -339,11 +278,10 @@ export default function (pi: ExtensionAPI) {
 			const count = plan.withheld.length;
 			ctx.ui.notify(`paste-images: ${model} has no image input; sent ${count} image path${count > 1 ? "s" : ""} as text`, "warning");
 		}
-		// A steer / follow-up is queued into the running agent: no before_agent_start will deliver a notice for it.
+		// Pi skips `before_agent_start` for steers and follow-ups.
 		if (!event.streamingBehavior) {
 			plan.attached.forEach((entry, i) => {
 				const image = plan.images[i];
-				// A file deleted since it was tokenised still sends (cached bytes), but its path is stale: no notice.
 				if (image && existsSync(entry.path)) pendingNotices.set(image, sourceNotice(entry.n, entry.path));
 			});
 		}
@@ -351,7 +289,6 @@ export default function (pi: ExtensionAPI) {
 		return { action: "transform", text: plan.text, images: [...(event.images ?? []), ...plan.images] };
 	});
 
-	// The run a submitted prompt starts: tell the model the attached images' source paths.
 	pi.on("before_agent_start", async (event) => {
 		if (event.messageType !== "user" || !event.images) return;
 		const notices: string[] = [];
@@ -366,7 +303,6 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-/** Whether the current model takes image input (unknown model: assume yes and let pi decide). */
 function supportsImages(ctx: ExtensionContext): boolean {
 	return ctx.model ? ctx.model.input.includes("image") : true;
 }

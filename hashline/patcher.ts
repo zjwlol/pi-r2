@@ -1,10 +1,3 @@
-/**
- * hashline/patcher.ts: run one edit call: split the input into sections, stage every file in memory
- * (any failure aborts before the first write), write, record the new snapshots and build the reply.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/patcher.rs`, `mod.rs::stage` and
- * `crates/pi-edit/src/session.rs::apply` / `format_file_text` (MIT), without the seen-line guard,
- * tree-sitter block resolution, notebooks, URL targets and host write hooks.
- */
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as nodePath from "node:path";
@@ -20,37 +13,31 @@ import { tryRecover } from "./recovery.ts";
 import type { EditStore } from "./store.ts";
 import { type ApplyResult, type Clipboard, type Edit, forkClipboard, HashlineError } from "./types.ts";
 
-/** Added rows kept at each end of a long added run in the reply preview. */
 const RESPONSE_ADDED_RUN_CONTEXT_LINES = 20;
 
 export type FileOpKind = "update" | "delete" | "noop";
 
-/** What happened to one file. */
 export interface FileOutcome {
-	/** Path as authored in the header (or the recovered path). */
 	path: string;
 	absolutePath: string;
 	op: FileOpKind;
-	/** Absolute destination of `MV`. */
 	moveTo: string | undefined;
-	/** LF-normalized, BOM-stripped text before / after. `after === before` for delete and noop. */
 	before: string;
 	after: string;
-	/** 1-indexed first changed line in `after`. */
+	/**
+	 * One-based line number in `after`.
+	 */
 	firstChangedLine: number | undefined;
 	warnings: string[];
-	/** This file's part of the reply. */
 	text: string;
 }
 
 export interface EditOutcome {
-	/** The reply for the model. */
 	text: string;
 	files: FileOutcome[];
 }
 
 export interface PatchOptions {
-	/** Directory relative paths resolve against. */
 	cwd: string;
 	store: EditStore;
 }
@@ -65,7 +52,6 @@ interface FileRead {
 	canonical: string;
 	bom: string;
 	ending: "\n" | "\r\n";
-	/** LF-normalized, BOM-stripped. */
 	text: string;
 }
 
@@ -84,7 +70,6 @@ interface StagedFile {
 	clipboardAfter: Clipboard;
 }
 
-/** `~` and `~/x` expand to the home directory; relative paths resolve against `cwd`. */
 export function resolvePath(authored: string, cwd: string): string {
 	let p = authored;
 	if (p === "~") p = os.homedir();
@@ -92,7 +77,6 @@ export function resolvePath(authored: string, cwd: string): string {
 	return nodePath.resolve(cwd, p);
 }
 
-/** Store key: the real path when the file exists, else the real path of its directory plus the file name. */
 export function canonicalKey(absolute: string): string {
 	try {
 		return fs.realpathSync(absolute);
@@ -105,7 +89,6 @@ export function canonicalKey(absolute: string): string {
 	}
 }
 
-/** Read a target; undefined when it does not exist. Throws for directories, special files and non-UTF-8 content. */
 function tryRead(resolved: Resolved): FileRead | undefined {
 	let stat: fs.Stats;
 	try {
@@ -125,14 +108,13 @@ function tryRead(resolved: Resolved): FileRead | undefined {
 	return { resolved, canonical: canonicalKey(resolved.absolute), bom, ending: detectLineEnding(text), text: normalizeToLf(text) };
 }
 
-/** The rejection for a section whose tag does not name the current content. Records the current content in the store. */
 function mismatch(section: PatchSection, canonical: string, normalized: string, expected: string, store: EditStore): HashlineError {
 	const actual = computeFileHash(normalized);
 	let anchorLines: number[] = [];
 	try {
 		anchorLines = collectAnchorLines(parseSection(section).edits);
 	} catch {
-		// A body that does not parse shows no context rows.
+		// Report the tag mismatch even when the body cannot be parsed.
 	}
 	store.record(canonical, normalized);
 	const details: M.MismatchDetails = {
@@ -147,7 +129,6 @@ function mismatch(section: PatchSection, canonical: string, normalized: string, 
 	return new HashlineError(M.mismatchKind(details), M.formatMismatchMessage(details));
 }
 
-/** Apply a section's edits: directly when the tag names the live content, else through the stale-tag paths. */
 function applyWithRecovery(section: PatchSection, canonical: string, normalized: string, edits: readonly Edit[], clipboard: Clipboard, store: EditStore): ApplyResult {
 	const expected = section.fileHash ?? "";
 	const liveMatches = computeFileHash(normalized) === expected.toUpperCase();
@@ -163,7 +144,7 @@ function applyWithRecovery(section: PatchSection, canonical: string, normalized:
 		const result = applyEdits(normalized, resolved, { clipboard, onEmptyPaste: "throw" });
 		return { ...result, warnings: [...resolveWarnings, ...result.warnings] };
 	}
-	// A bare `MV` / `REM` has no content edit to stand on: the tag is its only evidence.
+	// Reject stale tags on bare `MV` and `REM` before the unanchored fallback.
 	if (resolved.length === 0) throw mismatch(section, canonical, normalized, expected, store);
 	if (!hasAnchorScopedEdit(resolved)) {
 		const result = applyEdits(normalized, resolved, { clipboard, onEmptyPaste: "throw" });
@@ -174,10 +155,6 @@ function applyWithRecovery(section: PatchSection, canonical: string, normalized:
 	throw mismatch(section, canonical, normalized, expected, store);
 }
 
-/**
- * When the authored path does not exist: the one stored snapshot (inside `cwd`) with the same tag and
- * file name, to rebind the section to.
- */
 function recoverTarget(section: PatchSection, initial: Resolved, store: EditStore, cwd: string): { section: PatchSection; resolved: Resolved } | undefined {
 	if (fs.existsSync(initial.absolute) || section.fileHash === undefined) return undefined;
 	const name = nodePath.basename(initial.absolute);
@@ -197,7 +174,6 @@ function stageSection(original: PatchSection, options: PatchOptions, clipboard: 
 	const resolved = recovered ? recovered.resolved : initial;
 	const read = tryRead(resolved);
 	if (!read) throw new HashlineError("file_not_found", `File not found: ${section.path}. Use the write tool to create new files.`);
-	// A section with no tag (missing, or a placeholder like `#AUTO`) never applies.
 	const tag = original.fileHash;
 	if (tag === undefined) throw mismatch(section, read.canonical, read.text, "", store);
 	const previous = canonicalPaths.get(read.canonical);
@@ -233,14 +209,12 @@ function stageSection(original: PatchSection, options: PatchOptions, clipboard: 
 	};
 }
 
-/** Input whose only content is a header: name the file's current tag. */
 function headerOnlyError(path: string, cwd: string): HashlineError {
 	const read = tryRead({ absolute: resolvePath(path, cwd), display: path });
 	if (!read) return new HashlineError("file_not_found", `File not found: ${path}. Use the write tool to create new files.`);
 	return new HashlineError("header_only", M.formatHeaderOnlyMessage(path, computeFileHash(read.text)));
 }
 
-/** The absolute paths an input targets (section paths and MV destinations), without reading anything. Empty when the input does not parse. */
 export function patchTargetPaths(input: string, cwd: string): string[] {
 	const paths = new Set<string>();
 	try {
@@ -250,11 +224,11 @@ export function patchTargetPaths(input: string, cwd: string): string[] {
 				const parsed = parseSection(section);
 				if (parsed.fileOp?.kind === "move") paths.add(resolvePath(parsed.fileOp.dest, cwd));
 			} catch {
-				// Reported by applyHashlinePatch.
+				// Patch application reports invalid section bodies.
 			}
 		}
 	} catch {
-		// Reported by applyHashlinePatch.
+		// Patch application reports invalid section headers.
 	}
 	return [...paths];
 }
@@ -271,11 +245,6 @@ function formatFileText(file: StagedFile, header: string): string {
 	return warnings.length === 0 ? body : `${body}\n\nWarnings:\n${warnings.join("\n")}`;
 }
 
-/**
- * Apply an edit tool `input`. Synchronous: stages every section, then writes in order.
- * Throws HashlineError; nothing is written unless every section staged (a filesystem failure while
- * writing leaves the files written before it).
- */
 export function applyHashlinePatch(input: string, options: PatchOptions): EditOutcome {
 	const { cwd, store } = options;
 	const sections = splitSections(input, cwd);
@@ -285,6 +254,7 @@ export function applyHashlinePatch(input: string, options: PatchOptions): EditOu
 	}
 	const clipboard = store.startClipboardBatch();
 	const canonicalPaths = new Map<string, string>();
+	// Stage every section before writing any file.
 	const staged = sections.map((section) => stageSection(section, options, clipboard, canonicalPaths));
 
 	const noop = staged.find((file) => file.op === "noop");

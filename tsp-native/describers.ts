@@ -1,12 +1,3 @@
-/**
- * Describers: how pi's interactive-mode components become TSP nodes. A
- * registry keyed by class (instanceof first, constructor name as a fallback
- * for duplicated module instances). Every describer runs under try/catch; a
- * throw, or a `null` result, means the component falls back to `rows`.
- *
- * Role names follow oh-my-pi (`omp.user`, `omp.assistant`, `omp.tool.*`,
- * `omp.field`, …) so Tern's stylesheet applies.
- */
 import {
 	AssistantMessageComponent,
 	DynamicBorder,
@@ -70,13 +61,11 @@ import { SHEET_DESCRIBERS } from "./describe-sheets.ts";
 import { TUI_DESCRIBERS } from "./describe-tui.ts";
 import type { TspCardStatus, TspEditorDecoration, TspKind, TspSpan, TspText, TspTone, TspToolPreview } from "./wire.ts";
 
-/** Loose view of private component state. */
 type Any = Record<string, any>;
 
 export interface Describer {
 	readonly name: string;
 	matches(component: Component): boolean;
-	/** Cheap fingerprint of everything the description depends on; same fingerprint → same node. */
 	fingerprint(component: Component, cx: DescribeContext): readonly unknown[];
 	build(component: Component, cx: DescribeContext): NativeNode | null;
 	handleEvent?(component: Component, event: NativeUiEvent, cx: DescribeContext): void;
@@ -88,28 +77,21 @@ export interface DescriberStats {
 	failures: Map<string, string>;
 }
 
-/** Hooks a component (MagicEditor) may implement itself; duck-typed so the editor module needs no import. */
 export interface EditorNativeHooks {
-	/** Decorations over the current text (UTF-16 offsets into lines joined by "\n"). */
+	/**
+	 * Decoration offsets count UTF-16 code units in the newline-joined draft.
+	 */
 	describeDecorations?(text: string): readonly TspEditorDecoration[];
-	/** Set while a TSP surface draws the editor: skip ANSI-only effects and their timers. */
 	nativeMode?: boolean;
 }
 
 const memo = new WeakMap<Component, { by: Describer; fp: readonly unknown[]; node: NativeNode | null }>();
-/** Components whose describer threw: they stay on rows for the rest of the session. */
 const broken = new WeakSet<Component>();
-/** Loaders whose animation timers we stopped while native; restarted on fallback. */
 const stoppedLoaders = new Set<Loader>();
-/** Editors switched to native mode; reverted on fallback. */
 const nativeEditors = new Set<Component>();
-/** What each prompt editor's composer shows this frame besides the draft (set by its fingerprint). */
 const composerFrames = new WeakMap<Component, ComposerFrame>();
-/** Prompt editors whose working indicator their container describes over the composer (set by the container's fingerprint). */
 const hoistedIndicators = new WeakMap<Component, Component>();
-/** Footers whose facts the composer carries this frame: they describe hidden. */
 const carriedFooters = new WeakSet<Component>();
-/** Forced failures for tests: `PI_TSP_FAIL_DESCRIBER=<describer name>`. */
 const failDescriber = process.env.PI_TSP_FAIL_DESCRIBER;
 
 export const stats: DescriberStats = { native: new Map(), rows: new Map(), failures: new Map() };
@@ -125,8 +107,6 @@ function is(component: Component, ctor: Function | undefined, name: string): boo
 	}
 	return false;
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────────
 
 function plain(s: string): string {
 	return stripAnsi(s).replaceAll("\x1b_pi:c\x07", "");
@@ -162,17 +142,10 @@ function previewLines(text: string): number {
 	return Math.min(10, Math.max(1, text.split("\n").length));
 }
 
-/** A line of pi's display diff: marker, padded line number, one space, the line's text. */
 const DISPLAY_DIFF_LINE = /^([+\- ])(\s*\d+)(?: (.*))?$/s;
 
 /**
- * The `diff` hunks of pi's display-oriented edit diff (`+12 added`,
- * `-12 removed`, ` 12 context`, a numberless `...` row between regions), the
- * way omp's `nativeDiff` reads its compact diff: each run of consecutive lines
- * is one hunk, and a `...` row or a jump in line numbers starts the next.
- * Removed and context rows carry old line numbers, added rows new ones, so the
- * other side follows from the running offset. Runs without a change are
- * dropped. Undefined when nothing parses into a hunk.
+ * pi numbers added diff rows on the new side and the other rows on the old side.
  */
 function displayDiffHunks(display: string): { oldStart: number; newStart: number; lines: string[] }[] | undefined {
 	const hunks: { oldStart: number; newStart: number; lines: string[] }[] = [];
@@ -180,7 +153,6 @@ function displayDiffHunks(display: string): { oldStart: number; newStart: number
 	let changed = false;
 	let oldStart = 1;
 	let newStart = 1;
-	// The old and new lines the open run continues with.
 	let nextOld = 1;
 	let nextNew = 1;
 	const close = (): void => {
@@ -200,7 +172,7 @@ function displayDiffHunks(display: string): { oldStart: number; newStart: number
 		const added = prefix === "+";
 		if (number !== (added ? nextNew : nextOld)) {
 			close();
-			// The lines skipped are unchanged: both sides move by as many.
+			// pi omits only unchanged lines between diff regions.
 			const skipped = number - (added ? nextNew : nextOld);
 			nextOld += skipped;
 			nextNew += skipped;
@@ -217,8 +189,6 @@ function displayDiffHunks(display: string): { oldStart: number; newStart: number
 	close();
 	return hunks.length > 0 ? hunks : undefined;
 }
-
-// ── Describers ──────────────────────────────────────────────────────────
 
 const userMessage: Describer = {
 	name: "UserMessage",
@@ -325,7 +295,7 @@ const loader: Describer = {
 	},
 	build: (c) => {
 		const a = c as Any;
-		// The terminal clocks the spinner: stop pi's 80 ms repaint timer while native.
+		// The terminal animates this spinner without pi's repaint timer.
 		if (a.intervalId) {
 			a.stop?.();
 			stoppedLoaders.add(c as Loader);
@@ -338,7 +308,6 @@ const loader: Describer = {
 	},
 };
 
-/** A styled pi line as a `text` node: theme colours become span tokens; a plain line stays a plain string. */
 function styledLine(line: string, key?: string): NativeNode {
 	const spans = lineToSpans(line);
 	if (spans.length === 0) return text("", { role: "pi.text" }, key);
@@ -351,7 +320,7 @@ const plainText: Describer = {
 	matches: (c) => is(c, Text, "Text"),
 	fingerprint: (c) => {
 		const a = c as Any;
-		// ThemedText rebuilds its string lazily in render(): ask for it once so `text` is current.
+		// pi normally rebuilds stale text during render.
 		if (a.stale === true && typeof a.build === "function") {
 			a.stale = false;
 			a.setText?.(a.build());
@@ -379,7 +348,6 @@ const container: Describer = {
 	build: (c) => {
 		const children: Component[] = (c as Any).children ?? [];
 		if (children.length === 0) return EMPTY_NODE;
-		// pi's editor container: the working row goes over the composer, as omp's activity line.
 		const indicator = children.length === 1 ? hoistedIndicators.get(children[0]!) : undefined;
 		if (indicator) return col([indicator, children[0]!], { gap: "lg" });
 		return col(children.slice());
@@ -404,13 +372,13 @@ const idleStatus: Describer = {
 };
 
 function footerSegments(c: Component): { left: string[]; right: string[] } {
-	// Render wide so nothing is truncated, then split the stats line at its padding gap.
 	const lines = safeRender(c, 400).map(plain);
 	const left: string[] = [];
 	const right: string[] = [];
 	const pwd = (lines[0] ?? "").trim();
 	if (pwd) left.push(pwd);
 	const stats = lines[1] ?? "";
+	// pi separates the footer stats from the model with at least two spaces.
 	const gap = stats.search(/ {2,}/);
 	if (gap === -1) {
 		if (stats.trim()) left.push(stats.trim());
@@ -426,7 +394,6 @@ const footer: Describer = {
 	name: "Footer",
 	matches: (c) => is(c, FooterComponent, "FooterComponent"),
 	fingerprint: (c) => {
-		// The composer carries its facts this frame: no duplicate line.
 		if (footerCarried(c)) {
 			carriedFooters.add(c);
 			return [true];
@@ -446,21 +413,15 @@ const footer: Describer = {
 	},
 };
 
-// ── Tool execution ──────────────────────────────────────────────────────
-
 function toolStatus(a: Any): TspCardStatus {
 	if (a.isPartial) return a.executionStarted ? "running" : "pending";
 	if (a.result?.isError) return "error";
 	return "done";
 }
 
-// ── hashline (the `hashline` extension's read / edit; pi's built-ins never match these) ──
-
 const NO_PATHS: readonly string[] = [];
-/** A section header row of a hashline `edit` input: `[PATH#TAG]` or `[PATH]`. */
 const HASHLINE_HEADER_RE = /^\[(.+?)(?:#[0-9A-Fa-f]{4})?\]$/;
 
-/** The distinct files a hashline edit call names, in order: the `[PATH#TAG]` headers of `args.input`. Empty for every other edit tool. */
 function hashlineEditPaths(args: Any): readonly string[] {
 	const input: unknown = args?.input;
 	if (typeof input !== "string" || input.length === 0) return NO_PATHS;
@@ -468,18 +429,11 @@ function hashlineEditPaths(args: Any): readonly string[] {
 	for (const row of input.split("\n")) {
 		if (!row.startsWith("[")) continue;
 		const path = HASHLINE_HEADER_RE.exec(row.trimEnd())?.[1]?.trim();
-		// `[*** Begin Patch]` and other bracketed envelope rows are not files.
 		if (path && !path.startsWith("***") && !paths.includes(path)) paths.push(path);
 	}
 	return paths;
 }
 
-/**
- * A hashline read result (`details.hashline` + `[PATH#TAG]` / `N:TEXT` rows) as the file's own text:
- * `text` without the header row and the `N:` prefixes (undefined when no row was shown), `start` its
- * first line number, `notice` what follows the rows. Undefined for any other read result, and when the
- * text does not have that shape (then the card shows it as it is).
- */
 function hashlineReadView(result: Any | undefined, output: string): { text: string | undefined; start: number; notice: string } | undefined {
 	const mark: unknown = result?.details?.hashline;
 	if (result?.isError || mark === null || typeof mark !== "object") return undefined;
@@ -512,7 +466,6 @@ function toolTarget(name: string, args: Any): string | undefined {
 			return typeof args.path === "string" ? args.path : undefined;
 		case "edit": {
 			if (typeof args.path === "string") return args.path;
-			// hashline edit: one file heads the call with its path, several as "N files" (omp's edit head).
 			const paths = hashlineEditPaths(args);
 			return paths.length === 0 ? undefined : paths.length === 1 ? paths[0] : `${paths.length} files`;
 		}
@@ -534,9 +487,9 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 	const expanded = a.expanded === true;
 	const out: NativeChild[] = [];
 	const output = textOutput(result);
-	// A `tool` node clamps its body itself; inside a card the children carry the previews.
+	// The terminal applies the preview limit to the entire `tool` body.
 	const preview = expanded || tool ? undefined : ({ lines: previewLines(output) } as const);
-	// pi's grep/find/ls renderers repeat the call line a `tool` head already shows: their output alone reads natively.
+	// pi includes the call line in its grep, find and ls renders.
 	if (tool && (name === "grep" || name === "find" || name === "ls")) {
 		if (output) out.push(code(plain(output), { role: `omp.tool.${name}.output` }, "out"));
 		return out;
@@ -544,7 +497,6 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 	switch (name) {
 		case "bash":
 		case "powershell": {
-			// A `tool` head shows a one-line command as its target: only a multi-line script keeps its code block.
 			if (typeof args.command === "string" && (!tool || args.command.trim().includes("\n"))) out.push(code(args.command, { lang: name === "bash" ? "bash" : "powershell", role: "omp.tool.bash.command" }, "cmd"));
 			if (output) out.push(ansi(output, { follow: a.isPartial === true, preview, role: "omp.tool.bash.output" }, "out"));
 			return out;
@@ -552,13 +504,11 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 		case "edit": {
 			const sections = typeof args.path === "string" ? NO_PATHS : hashlineEditPaths(args);
 			const path = typeof args.path === "string" ? args.path : sections.length === 1 ? sections[0] : undefined;
-			// pi's standard unified patch (`--- path`, `+++ path`, `@@ -a,b +c,d @@` hunks); a patch without a hunk shows nothing.
 			const patch: unknown = result?.details?.patch;
 			if (typeof patch === "string" && /^@@ /m.test(patch)) {
 				out.push(diff(patch, { path, role: "omp.tool.edit.diff" }, "diff"));
 				return out;
 			}
-			// Only the display diff (older pi, other edit tools): its numbered lines as hunks, never as unified text.
 			const display: unknown = result?.details?.diff;
 			const hunks = typeof display === "string" && display.trim() ? displayDiffHunks(display) : undefined;
 			if (hunks) out.push(node("diff", { path, role: "omp.tool.edit.diff", hunks }, undefined, "diff"));
@@ -571,7 +521,6 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 			return out;
 		}
 		case "read": {
-			// hashline read: the file's own text, numbered from the first row shown; the header row and the `N:` prefixes stay out.
 			const anchored = hashlineReadView(result, output);
 			if (anchored) {
 				if (anchored.text !== undefined) out.push(code(anchored.text, { path: typeof args.path === "string" ? args.path : undefined, start: anchored.start, numbers: true, preview: preview && { lines: previewLines(anchored.text) }, role: "omp.tool.read" }, "out"));
@@ -582,7 +531,6 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 			return out;
 		}
 		default: {
-			// Tools with their own renderer (extensions): their rendered rows keep the body faithful.
 			const shell: Component | undefined = a.toolDefinition?.renderShell === "self" ? a.selfRenderContainer : a.contentBox;
 			if (a.toolDefinition && shell && (a.toolDefinition.renderResult || a.toolDefinition.renderCall)) {
 				const lines = safeRender(shell, cx.cols);
@@ -590,8 +538,7 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 				return out;
 			}
 			if (output) out.push(code(output, { preview, role: "omp.tool.output" }, "out"));
-			// The complete arguments (the head clips its one value), folded after the output, once the call runs:
-			// streamed argument deltas would re-send the whole JSON each frame.
+			// Wait until execution to avoid resending the full JSON on each argument delta.
 			if ((a.executionStarted === true || result !== undefined) && args && typeof args === "object" && !Array.isArray(args) && Object.keys(args).length > 0) {
 				out.push(node("section", { head: [span("Args", "muted")], collapsible: true, collapsed: true }, [code(JSON.stringify(args, null, 2), { lang: "json" }, "json")], "args"));
 			}
@@ -600,13 +547,6 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 	}
 }
 
-// ── Native tool hooks ───────────────────────────────────────────────────
-//
-// The contract with extensions: optional fields on a registered ToolDefinition
-// (pi hands the definition to `ToolExecutionComponent.toolDefinition` as is).
-// Both sides define these types locally; nothing is imported across.
-
-/** A node in a hook's view: plain JSON, the shape of {@link NativeNode}. */
 export interface NativeViewNode {
 	readonly k: string;
 	readonly p?: Readonly<Record<string, unknown>>;
@@ -620,15 +560,12 @@ export interface NativeDescribeOptions {
 	executionStarted: boolean;
 	argsComplete: boolean;
 	cols: number;
-	/** Date.now() at describe time. */
 	nowMs: number;
-	/** The terminal advertises this TSP node kind. */
 	supports(kind: string): boolean;
 }
 
 export type NativeToolTargetKind = "command" | "path" | "pattern" | "query" | "text";
 
-/** A tool call as data: the `tool` node's head, its body nodes and its fold. */
 export interface NativeToolView {
 	tool?: {
 		title?: TspText;
@@ -637,40 +574,36 @@ export interface NativeToolView {
 		meta?: readonly TspText[];
 		badges?: readonly { text: string; tone?: TspTone; title?: string }[];
 		note?: TspText;
-		/** Timer override: a number is a live timer (ms elapsed now); null: no timer; undefined: the default. */
+		/**
+		 * Use elapsed milliseconds for a live timer or `null` to disable it.
+		 */
 		age?: number | null;
-		/** Timer override: a number is a stopped timer (total ms); null: no timer; undefined: the default. */
+		/**
+		 * Use total milliseconds for a stopped timer or `null` to disable it.
+		 */
 		took?: number | null;
 	};
 	body?: readonly NativeViewNode[];
 	tone?: TspTone;
 	preview?: TspToolPreview;
-	/** Never start collapsed. */
 	open?: boolean;
-	/** `frame: "inline"`: a head line plus a disclosed body, no ring. */
 	inline?: boolean;
 }
 
 /**
- * Describe hooks a tool definition may carry. Memo contract: return the same
- * view object while nothing shown changed, a new one when anything did.
+ * Reuse the same view object until its rendered content changes.
  */
 export interface NativeToolHooks {
 	describeCall?(args: unknown, options: NativeDescribeOptions): NativeToolView | undefined;
 	describeResult?(result: { content: unknown[]; details: unknown; isError: boolean }, options: NativeDescribeOptions, args: unknown): NativeToolView | undefined;
-	/** true: once a result exists only describeResult's view counts (describeCall's when it returns none). Else the call head merges under the result head and the bodies concatenate. */
 	mergeCallAndResult?: boolean;
 }
 
-/** omp's DEFAULT_TERMINAL_PREVIEW_LINES: a collapsed tool body shows this many lines. */
 const TOOL_PREVIEW_LINES = 10;
 const NO_BODY: readonly NativeChild[] = [];
 
-/** The hook view `fingerprint` computed, reused by `build` (no second hook call). */
 const toolViews = new WeakMap<Component, NativeToolView | undefined>();
-/** The last merged call+result view, kept while both halves are reference-equal. */
 const mergedViews = new WeakMap<Component, { call: NativeToolView; result: NativeToolView; view: NativeToolView }>();
-/** When execution was first seen started, and first seen settled (Date.now()). */
 const toolClocks = new WeakMap<Component, { start?: number; end?: number }>();
 
 function asView(value: unknown): NativeToolView | undefined {
@@ -692,12 +625,8 @@ function mergeViews(c: Component, call: NativeToolView, result: NativeToolView):
 	return view;
 }
 
-/**
- * The tool definition's own view of the call (omp `#nativeView`): the call view
- * until a result exists, then the result view (merged hooks) or the call head
- * over both bodies. No hooks, no view, or a throw: undefined (built-in rendering).
- */
 function nativeView(c: Component, a: Any, cx: DescribeContext): NativeToolView | undefined {
+	// pi preserves custom properties on the registered tool definition.
 	const hooks: NativeToolHooks | undefined = a.toolDefinition;
 	if (!hooks || (typeof hooks.describeCall !== "function" && typeof hooks.describeResult !== "function")) return undefined;
 	const options: NativeDescribeOptions = {
@@ -731,7 +660,6 @@ function nativeView(c: Component, a: Any, cx: DescribeContext): NativeToolView |
 	}
 }
 
-/** Record when execution was first seen started and first seen settled. */
 function tickToolClock(c: Component, a: Any): void {
 	let clock = toolClocks.get(c);
 	if (!clock) {
@@ -747,7 +675,9 @@ function toolTone(a: Any): TspTone | undefined {
 	return a.result?.isError ? "error" : a.isPartial ? "pending" : undefined;
 }
 
-/** A view's live timer keeps a settled call running (`task` returns while its agents work on). */
+/**
+ * A tool can return before the work tracked by its timer finishes.
+ */
 function viewStatus(status: TspCardStatus, view: NativeToolView | undefined): TspCardStatus {
 	return status === "done" && typeof view?.tool?.age === "number" ? "running" : status;
 }
@@ -756,7 +686,6 @@ function wholeMs(ms: number): number {
 	return Math.max(0, Math.round(ms));
 }
 
-/** `age` (live, ms elapsed when sent) or `took` (stopped, total ms); the view's numbers win, its nulls drop the timer. */
 function toolTimer(c: Component, a: Any, status: TspCardStatus, view: NativeToolView | undefined): { age?: number; took?: number } {
 	const head = view?.tool;
 	if (typeof head?.age === "number" && Number.isFinite(head.age)) return { age: wholeMs(head.age) };
@@ -773,7 +702,6 @@ function toolTimer(c: Component, a: Any, status: TspCardStatus, view: NativeTool
 	return clock?.start === undefined ? {} : { took: wholeMs((clock.end ?? now) - clock.start) };
 }
 
-/** The head verb: the definition's label, else the tool name, first letter capitalised ("Bash", "Task", "IRC"). */
 function toolLabel(a: Any, name: string): string {
 	const label: unknown = a.toolDefinition?.label;
 	const raw = typeof label === "string" && label.trim() ? label.trim() : name;
@@ -786,7 +714,6 @@ function toolTargetKind(name: string, args?: Any): NativeToolTargetKind {
 		case "powershell":
 			return "command";
 		case "edit":
-			// "N files" (a hashline edit of several files) is not a path.
 			return args && typeof args.path !== "string" && hashlineEditPaths(args).length > 1 ? "text" : "path";
 		case "read":
 		case "write":
@@ -804,14 +731,12 @@ function isViewNode(value: unknown): boolean {
 	return value !== null && typeof value === "object" && typeof (value as Any).k === "string";
 }
 
-/** The view's body as children (the same array while every entry is a node). */
 function viewBody(view: NativeToolView): readonly NativeChild[] {
 	const body: unknown = view.body;
 	if (!Array.isArray(body) || body.length === 0) return NO_BODY;
 	return (body.every(isViewNode) ? body : body.filter(isViewNode)) as unknown as readonly NativeNode[];
 }
 
-/** Append `value` styled `style` (spans keep their own style). */
 function pushText(out: TspSpan[], value: TspText, style: string): void {
 	if (typeof value === "string") {
 		if (value) out.push(span(value, style));
@@ -822,7 +747,6 @@ function pushText(out: TspSpan[], value: TspText, style: string): void {
 
 const BADGE_STYLES: Partial<Record<TspTone, string>> = { error: "error", warning: "warning", success: "success", accent: "accent", info: "accent", user: "accent" };
 
-/** A card head from a view's data head (terminals without `tool`). */
 function viewHeadSpans(view: NativeToolView, label: string, took: number | undefined): TspSpan[] {
 	const head = view.tool;
 	const out: TspSpan[] = [];
@@ -844,20 +768,17 @@ function viewHeadSpans(view: NativeToolView, label: string, took: number | undef
 	return out;
 }
 
-/** A view's preview as a card clamp: `tail` becomes a head clamp of that size, `none`/`children` none. */
 function cardPreview(preview: TspToolPreview | undefined): { lines: number } | "auto" | undefined {
 	if (preview === undefined) return "auto";
 	if (preview === "none" || preview === "children") return undefined;
 	return "tail" in preview ? { lines: preview.tail } : preview;
 }
 
-/** A built-in tool's body plus its result's images (read of a png, screenshots). */
 function withImages(body: readonly NativeChild[], a: Any, cx: DescribeContext): readonly NativeChild[] {
 	const images = toolResultImages(a, cx);
 	return images.length === 0 ? body : [...body, ...images];
 }
 
-/** The data-first `tool` node (omp `#describeTool`): head data, status and timer as props, the body as children. */
 function describeToolNode(c: Component, a: Any, cx: DescribeContext, view: NativeToolView | undefined): NativeNode {
 	const name = String(a.toolName ?? "tool");
 	const head = view?.tool;
@@ -883,7 +804,6 @@ function describeToolNode(c: Component, a: Any, cx: DescribeContext, view: Nativ
 			lang = name;
 			if (typeof a.args?.command === "string") command = a.args.command;
 		}
-		// Shell output reads from its end; everything else from its start.
 		preview = shell ? { tail: TOOL_PREVIEW_LINES } : { lines: TOOL_PREVIEW_LINES };
 	}
 	const hasBody = body.length > 0;
@@ -892,7 +812,7 @@ function describeToolNode(c: Component, a: Any, cx: DescribeContext, view: Nativ
 		{
 			role: `omp.tool.${name}`,
 			name,
-			// `title` here is the head verb (TspToolProps), not the common tooltip.
+			// The terminal uses a tool's `title` as its heading verb.
 			title: (head?.title ?? toolLabel(a, name)) as string,
 			target: target !== undefined && target.length > 0 ? target : undefined,
 			targetKind,
@@ -914,7 +834,6 @@ function describeToolNode(c: Component, a: Any, cx: DescribeContext, view: Nativ
 	);
 }
 
-/** A view as the classic card (terminals without `tool`). */
 function describeViewCard(c: Component, a: Any, view: NativeToolView): NativeNode {
 	const name = String(a.toolName ?? "tool");
 	const status = viewStatus(toolStatus(a), view);
@@ -939,7 +858,6 @@ const toolExecution: Describer = {
 	fingerprint: (c, cx) => {
 		const a = c as Any;
 		tickToolClock(c, a);
-		// The hook view is asked once per describe; `build` reuses it. Hooks memoize it: a new object means a change.
 		const view = nativeView(c, a, cx);
 		toolViews.set(c, view);
 		return [a.toolName, a.args, JSON.stringify(a.args ?? null).length, a.result, textOutput(a.result).length, a.isPartial, a.expanded, a.executionStarted, a.hideComponent, a.argsPending, cx.supports("tool"), view];
@@ -971,14 +889,10 @@ const toolExecution: Describer = {
 		);
 	},
 	handleEvent: (c, event) => {
-		// The card's or tool's own fold is pi's expand state; nested folds (agent rows in a body) stay terminal-local.
 		if (event.type === "toggle" && event.key === "") (c as Any).setExpanded?.(!event.collapsed);
 	},
 };
 
-// ── Editor ──────────────────────────────────────────────────────────────
-
-/** The untitled composer's placeholder: plain text in the terminal's own quiet, upright ink (omp's is a string too). */
 const EDITOR_PLACEHOLDER = "Ask anything, edit files, run tools";
 
 function editorText(a: Any): { text: string; cursor: number } {
@@ -990,15 +904,12 @@ function editorText(a: Any): { text: string; cursor: number } {
 	return { text: lines.join("\n"), cursor: offset + cursorCol };
 }
 
-/** A `!` draft's sigil with its blanks (`!`, `!!`); natively the bash mode chip stands in for it (omp's SHELL_SIGIL_RE). */
 const BASH_SIGIL_RE = /^\s*!!?[ \t]?/;
 
-/** pi's prompt editor (a CustomEditor: app action handlers); other editors (dialog fields) stay plain `omp.field`s. */
 function isPromptEditor(c: Component): boolean {
 	return (c as Any).actionHandlers instanceof Map;
 }
 
-/** The terminal draws omp's composer around the editor node (else the plain `omp.field` column). */
 function composerSupported(cx: DescribeContext): boolean {
 	return cx.supports("editor") && cx.supports("row") && cx.supports("col") && cx.supports("text");
 }
@@ -1007,7 +918,6 @@ function isFooterComponent(c: Any): boolean {
 	return typeof c.render === "function" && is(c as Component, FooterComponent, "FooterComponent");
 }
 
-/** What the composer shows besides the draft, gathered by the editor's fingerprint and reused by its build. */
 interface ComposerFrame {
 	readonly footer: Any | undefined;
 	readonly facts: ComposerFacts | undefined;
@@ -1032,7 +942,6 @@ function composerFrame(c: Component, a: Any, cx: DescribeContext): ComposerFrame
 		footer = findFooter(a.tui, isFooterComponent);
 		facts = footer ? composerFacts(footer) : undefined;
 	} catch (error) {
-		// No facts this frame: the bar keeps send/stop and the footer its own line.
 		stats.failures.set("Composer.facts", String(error));
 		facts = undefined;
 	}
@@ -1043,9 +952,7 @@ function composerFrame(c: Component, a: Any, cx: DescribeContext): ComposerFrame
 }
 
 /**
- * The editor's container (pi's editorContainer, the editor alone in it): its
- * working indicator moves out of the composer, over it. Called from the
- * container's fingerprint, before the editor is described in the same frame.
+ * Mark the indicator before the editor builds its own description.
  */
 function hoistIndicator(children: readonly Component[], cx: DescribeContext): Component | undefined {
 	if (children.length !== 1) return undefined;
@@ -1060,7 +967,6 @@ function hoistIndicator(children: readonly Component[], cx: DescribeContext): Co
 	return undefined;
 }
 
-/** The working row inside the editor's own description (no container moved it out). */
 function workingRow(indicator: Any): NativeNode {
 	if (indicator.intervalId) {
 		indicator.stop?.();
@@ -1074,7 +980,6 @@ function workingRow(indicator: Any): NativeNode {
 	);
 }
 
-/** The draft's decorations: a `!` draft hides its sigil (the mode chip shows it), else the editor's own (magic keywords). */
 function editorDecor(c: Component, value: string, bash: boolean): readonly TspEditorDecoration[] | undefined {
 	if (bash) {
 		const sigil = BASH_SIGIL_RE.exec(value)?.[0].length ?? 0;
@@ -1086,7 +991,6 @@ function editorDecor(c: Component, value: string, bash: boolean): readonly TspEd
 	return d && d.length > 0 ? d : undefined;
 }
 
-/** Submit the draft as Enter does (pi-tui's `submitValue`: paste markers expanded, the draft cleared, `onSubmit`). */
 function submitDraft(a: Any): void {
 	if (a.disableSubmit) return;
 	const { text: value } = editorText(a);
@@ -1095,7 +999,6 @@ function submitDraft(a: Any): void {
 		a.submitValue();
 		return;
 	}
-	// No submitValue (a foreign editor): what it does, by hand.
 	a.cancelAutocomplete?.();
 	a.state.lines = [""];
 	a.state.cursorLine = 0;
@@ -1107,11 +1010,7 @@ function submitDraft(a: Any): void {
 }
 
 /**
- * A TSP `send` (rsttyd's `TspEditing.send`: a prompt submitted programmatically, never a key; rsttyd passes Enter to
- * the pty, so Enter with the autocomplete open stays pi-tui's own) is its own prompt, as omp's CustomEditor takes it:
- * a different draft gives way to `text` (kept in history for recall when it holds no pasted blocks), then the
- * prompt goes out the way Enter sends it ({@link submitDraft}): the draft cleared, the autocomplete closed,
- * history browsing left and the undo stack reset before `onSubmit`, so the composer describes empty again.
+ * The terminal passes Enter to pi as a key rather than emitting `send`.
  */
 function sendPrompt(a: Any, text: string): void {
 	const value = text.trim();
@@ -1129,18 +1028,13 @@ function sendPrompt(a: Any, text: string): void {
 	submitDraft(a);
 }
 
-/** The keypath of the `editor` node in each editor's last native build (its caret anchor). */
 const caretPaths = new WeakMap<Component, string>();
 /**
- * The list each editor's overlay last showed in `layer` (set by {@link editorAutocompleteOverlay} before the frame is
- * described). Pi-tui makes a new list per suggestion request, so a stale entry never matches the open one; a mounted
- * editor's open list is put into `layer` every frame.
+ * pi creates a fresh list for each new set of completions.
  */
 const layeredLists = new WeakMap<Component, Component>();
-/** The list each editor shows under its input line this frame (no session put it into `layer`). */
 const inlineLists = new WeakMap<Component, Component>();
 
-/** pi-tui's open autocomplete list (`autocompleteState` + `autocompleteList`), unless it has no item to show (omp's `#visibleAutocompleteList`). */
 function openAutocomplete(a: Any): Component | undefined {
 	const list: Any | undefined = a.autocompleteList;
 	if (!a.autocompleteState || !list || typeof list.render !== "function") return undefined;
@@ -1151,14 +1045,12 @@ function openAutocomplete(a: Any): Component | undefined {
 	}
 }
 
-/** Lines omp's caret menu shows (its default `autocompleteMaxVisible`). */
 const AUTOCOMPLETE_LINES = 10;
 
 function finiteNumber(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-/** Hand the list what its items are drawn with: the typed prefix their labels are marked with (`nativeMark`) and their icons (`nativeIcon`), read by the SelectList describer. */
 function markAutocomplete(a: Any, list: Component): void {
 	const l = list as Any;
 	let label = "";
@@ -1169,25 +1061,16 @@ function markAutocomplete(a: Any, list: Component): void {
 	}
 	const prefix = String(a.autocompletePrefix ?? "");
 	l.nativeMark = autocompleteMark(prefix, label);
-	// pi's command-name list: `/name` (a path completion's prefix holds another `/`; an argument's, none).
 	const commands = /^\/[^/\s]*$/.test(prefix) && a.autocompleteState !== "force";
 	l.nativeIcon = autocompleteIcons(prefix, a.autocompleteState, commands);
-	// omp's caret menu caps at its 10 visible lines (rsttyd counts them in 22px for its 32px rows); pi's default is 5.
 	l.nativeMaxLines = Math.max(AUTOCOMPLETE_LINES, finiteNumber(a.autocompleteMaxVisible));
 }
 
-/** How deep below a dock component, and through how wide containers, the editor is looked for (pi's editorContainer holds it). */
 const EDITOR_DEPTH = 3;
 const EDITOR_WIDTH = 16;
 
 /**
- * The open autocomplete of the editor mounted in `dock` (the components pi
- * mounted under the transcript), as omp's caret menu for the `layer` region:
- * an `overlay` (role `omp.autocomplete`, key `complete`) anchored at the
- * editor node's wire id, around pi-tui's SelectList (its own describe
- * boundary; a click applies the completion through its onSelect). Null while
- * no natively described editor shows one. Call once per frame, before the
- * frame is described: the editor then leaves the list out of its composer.
+ * Build the overlay before describing the editor to avoid drawing the list twice.
  */
 export function editorAutocompleteOverlay(dock: readonly unknown[]): NativeNode | null {
 	const queue: { component: Component; depth: number }[] = [];
@@ -1225,8 +1108,6 @@ const editor: Describer = {
 			}
 		}
 		const indicator: Any | undefined = a.workingStatusIndicator;
-		// The open list is a component of its own (pi-tui's SelectList describes itself); in `layer` when the session
-		// put it there this frame, else under the input line.
 		const list = openAutocomplete(a);
 		const layered = list !== undefined && layeredLists.get(c) === list;
 		const inline = layered ? undefined : list;
@@ -1315,7 +1196,6 @@ const editor: Describer = {
 				sendPrompt(a, event.text);
 				return;
 			case "action": {
-				// The composer's controls (omp's action names); chips and unknown actions are ignored.
 				if (event.act === "submit") {
 					submitDraft(a);
 					return;
@@ -1328,7 +1208,9 @@ const editor: Describer = {
 	},
 };
 
-/** Apply a terminal-side edit over pi's editor state (UTF-16 offsets; stale when `len` mismatches). */
+/**
+ * Terminal edit offsets are measured in UTF-16 code units.
+ */
 function applyHostEdit(a: Any, edit: { from: number; to: number; text: string; cursor: number; len: number }): void {
 	const { text: current } = editorText(a);
 	if (edit.len !== current.length) return;
@@ -1356,14 +1238,12 @@ function applyHostEdit(a: Any, edit: { from: number; to: number; text: string; c
 	a.state.cursorCol = Math.min(colOffset, lines[line]!.length);
 	a.preferredVisualCol = null;
 	if (!changed) {
-		// The caret alone moved (a click in the draft): an open list follows it as on pi-tui's arrow keys (re-queried
-		// at the new position, closed when nothing matches there), and none opens.
 		if ((a.state.cursorLine !== beforeLine || a.state.cursorCol !== beforeCol) && a.autocompleteState) {
 			try {
 				if (typeof a.updateAutocomplete === "function") a.updateAutocomplete();
 				else a.cancelAutocomplete?.();
 			} catch {
-				// A provider's failure must not break the caret move.
+				// Keep the caret move even if the completion provider fails.
 			}
 		}
 		return;
@@ -1372,12 +1252,6 @@ function applyHostEdit(a: Any, edit: { from: number; to: number; text: string; c
 	retriggerAutocomplete(a);
 }
 
-/**
- * After a terminal-side edit, keep the autocomplete as typing would (omp's
- * `#retriggerAutocompleteAtCursor`): an open list refreshes for the new text,
- * else a `/` command, or a trigger character's token (`@`, `^`; pi-tui's
- * own trigger pattern), before the caret opens one.
- */
 function retriggerAutocomplete(a: Any): void {
 	try {
 		if (a.autocompleteState) {
@@ -1389,11 +1263,10 @@ function retriggerAutocomplete(a: Any): void {
 		const pattern: unknown = a.autocompleteTriggerPattern;
 		if (slash || (pattern instanceof RegExp && pattern.test(before))) a.tryTriggerAutocomplete?.();
 	} catch {
-		// the next keystroke triggers it
+		// The next keystroke can retry autocomplete.
 	}
 }
 
-/** Most specific first: startup/transcript blocks, then the transcript's blocks (Flow's describers), sheets, pi-tui primitives, then the fallbacks. */
 const DESCRIBERS: readonly Describer[] = [
 	...BLOCK_DESCRIBERS,
 	...TRANSCRIPT_DESCRIBERS,
@@ -1432,10 +1305,6 @@ export function describerFor(component: Component): Describer | null {
 	return found;
 }
 
-/**
- * Describe `component`: its own `describe()` wins, then the registry. `null`
- * means rows. The memo returns the same node while the fingerprint is equal.
- */
 export function describeComponent(component: Component, cx: DescribeContext): NativeNode | null {
 	if (broken.has(component)) return null;
 	const own = (component as Any).describe;
@@ -1472,7 +1341,6 @@ export function describeComponent(component: Component, cx: DescribeContext): Na
 		broken.add(component);
 		stats.failures.set(by.name, String(error));
 		bump(stats.rows, by.name);
-		// The editor goes to rows: the composer no longer hosts its chips.
 		if (by === editor && isPromptEditor(component)) {
 			composerFrames.delete(component);
 			hostComposer(component as Any, false);
@@ -1481,7 +1349,6 @@ export function describeComponent(component: Component, cx: DescribeContext): Na
 	}
 }
 
-/** Route a terminal event to the component's own handler, else its describer's. */
 export function dispatchEvent(component: Component, event: NativeUiEvent, cx: DescribeContext): boolean {
 	const own = (component as Any).handleNativeEvent;
 	if (typeof own === "function") {
@@ -1494,13 +1361,11 @@ export function dispatchEvent(component: Component, event: NativeUiEvent, cx: De
 	return true;
 }
 
-/** Leaving native rendering: give pi's animations back their timers and clear per-frame stats. */
 export function releaseNativeSideEffects(): void {
 	for (const l of stoppedLoaders) {
 		try {
 			(l as Any).start?.();
 		} catch {
-			// ignore
 		}
 	}
 	stoppedLoaders.clear();

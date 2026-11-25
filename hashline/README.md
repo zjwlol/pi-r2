@@ -1,21 +1,21 @@
-# hashline: oh-my-pi's line-anchored edit mode for pi
+# hashline: line-anchored editing for pi
 
-A port of oh-my-pi's default edit mode ("hashline") on top of vanilla pi's extension API. While it is on, `read` shows a text file under a header `[PATH#TAG]` with every line as `LINE:TEXT`, and `edit` takes a small patch language that addresses those line numbers under that header instead of quoting the old text. `TAG` is a 4-hex snapshot of the file's content: an edit whose tag no longer names the file is either moved onto the current text when that is provably safe, or rejected with the current tag and the rows around its anchors. The parser, applier, stale-tag recovery and messages are a TypeScript port of oh-my-pi's Rust crate `pi-edit` (`modes/hashline`), checked against that crate's own fixtures (see [Conformance](#conformance)).
+With hashline on, `read` shows text under a `[PATH#TAG]` header with `LINE:TEXT` rows. `edit` takes patches that address those lines under the header. `TAG` is a four-digit hex snapshot of the file contents. For a stale tag, `edit` either moves the patch onto the current text when safe or rejects it with the current tag and rows around the anchors.
 
 It is **off by default**. It works in every mode (TUI, print, JSON, RPC).
 
 ## Turning it on
 
-- `/hashline on` replaces pi's `read` and `edit` with the hashline tools; `/hashline off` gives the built-ins back. Either one writes `{"enabled":true|false}` to `<agentDir>/hashline/config.json` (`~/.pi/agent/hashline/`, or under `PI_CODING_AGENT_DIR`) and then reloads pi's extensions, like `/reload`: pi fixes the tool set when extensions load and has no way to unregister a tool. The switch applies to other pi processes at their next start or reload.
+- `/hashline on` installs the hashline `read` and `edit` tools. `/hashline off` restores the built-ins. Each writes `{"enabled":true|false}` to `<agentDir>/hashline/config.json` under `~/.pi/agent/` or `PI_CODING_AGENT_DIR`, then reloads all extensions. The tool set is fixed at extension load. Other pi processes take the saved setting at their next start or reload.
 - `/hashline` or `/hashline status` shows, as a notification:
   ```
   hashline: on in this session (read and edit are the hashline tools)
   saved setting: on
   ```
-  (`off in this session (read and edit are pi's built-ins)` when off), plus a line `PI_HASHLINE forces it on|off for this process` when that variable is set.
-- `PI_HASHLINE=1` (or `true`, `on`) forces it on for one process, `PI_HASHLINE=0` (`false`, `off`) forces it off, whatever the saved setting says. `/hashline on|off` still saves the setting then, but tells you the variable wins.
-- No config file, or an unreadable one, means off.
-- A session that was switched keeps its history: the transcript then holds calls in both edit syntaxes, and the model sees only the current tools' descriptions.
+  When off, the first line reads `hashline: off in this session (read and edit are pi's built-ins)`. If set, the override adds `PI_HASHLINE forces it on|off for this process`.
+- `PI_HASHLINE=1`, `true` or `on` forces it on for one process. `PI_HASHLINE=0`, `false` or `off` forces it off. `/hashline on|off` still saves the setting and reports the override.
+- A missing or unreadable config means off.
+- Switching tools keeps the session history. The transcript can hold both edit syntaxes. The model sees only the current tools' descriptions.
 
 ## What `read` returns
 
@@ -30,9 +30,9 @@ For a text file:
 5:greet("world")
 ```
 
-- The header path is relative to the working directory for files inside it, absolute otherwise. The header and the `N:` prefixes are not part of the file; the tool's description and guidelines tell the model so.
-- `TAG` is the low 16 bits of the xxHash32 of the content with trailing spaces, tabs and CRs removed from every line, as four uppercase hex digits. CRLF files are shown and tagged as LF text and written back with CRLF; a BOM is kept.
-- `offset` and `limit` work as in pi and select original line numbers; the same limits apply (2000 lines, 50KB). A cut ends with a notice such as `[Showing lines 1-2000 of 2500. Use offset=2001 to continue]` or `[3 more lines in file. Use offset=8 to continue]`. A final newline does not count as an extra line (`a\nb\n` has two), unlike pi's own read.
+- Header paths are relative for files inside the working directory and absolute otherwise. The tool description and guidelines tell the model that headers and `N:` prefixes are not file content.
+- The tag uses the low 16 bits of xxHash32, shown as four uppercase hex digits. Hashing removes trailing spaces, tabs and CRs from each line. CRLF files appear and hash as LF text. Writes preserve CRLF and any BOM.
+- `offset` and `limit` select original line numbers. The limits are 2000 lines and 50KB. A cut ends with a notice such as `[Showing lines 1-2000 of 2500. Use offset=2001 to continue]` or `[3 more lines in file. Use offset=8 to continue]`. A final newline does not add a line. For example, `a\nb\n` has two lines.
 - Images, missing files and unreadable files are handled by pi's built-in read, which runs first: the result or error is pi's.
 - A file that is larger than 4MB, not valid UTF-8, or contains a NUL character comes back as pi's own output followed by ``[No edit anchors: <reason>; `edit` cannot target this file.]``.
 - `details` are pi's read details plus `hashline: { path, tag, firstLine, lastLine, totalLines }`.
@@ -41,7 +41,7 @@ For a text file:
 
 ## What `edit` takes and returns
 
-One parameter, `input`: one or more sections, each a header copied from the latest `read` (or `edit` reply) of that file, followed by operations. Line numbers always mean the lines of the version the tag names, however many operations the section has.
+`edit` takes one parameter, `input`, with one or more sections. Each section starts with a header from the latest `read` or `edit` reply for that file, followed by operations. Every operation uses line numbers from the version named by the tag.
 
 ```
 [greet.py#430B]
@@ -63,7 +63,7 @@ The reply is the new header and the changed region with its new numbers, so the 
 6:greet("team")
 ```
 
-Rows the reply leaves out between two changes are marked `…`; a long run of added rows shows its first and last 20. Repairs and recoveries are listed under a trailing `Warnings:` block. With several sections the replies are separated by a blank line.
+The reply marks gaps between changes with `…`. It shows the first and last 20 rows of a long addition. `Warnings:` lists repairs and recoveries. A blank line separates replies for multiple sections.
 
 ### Operations
 
@@ -78,14 +78,14 @@ Rows the reply leaves out between two changes are marked `…`; a long run of ad
 | `REM` | Delete the file. |
 | `MV DEST` | After the section's edits, write the file to `DEST` and remove the source (quote a destination with spaces). |
 
-- A body row is `+` followed by the line's exact text, indentation included; a lone `+` is an empty line. The body is the final content, not a before/after pair, and need not have as many rows as the range.
-- The anonymous register lives for one call. Named registers stay for the session, so a `CUT … @fn` in one section (or call) can feed a `PUT … @fn` in another file's section.
-- Sections for the same file are merged. All sections are checked before anything is written: one rejected section leaves every file as it was. `edit` calls run one at a time.
+- A body row starts with `+` followed by the exact text, including indentation. A lone `+` is an empty line. Supply only the final content. Its length can differ from the range length.
+- The anonymous register lasts for one call. Named registers last for the session. A `CUT … @fn` can feed a `PUT … @fn` in another file's section or a later call.
+- The tool merges sections for the same file. It checks all sections before writing. A rejected section leaves every file as it was. `edit` calls run one at a time.
 - New files are created with `write`; `edit` rejects a path that does not exist (`File not found: <path>. Use the write tool to create new files.`).
 
 ### Leniency and repairs
 
-As upstream, the parser accepts some near misses and says so in a warning: an optional `*** Begin Patch` / `*** End Patch` envelope, `PUT 3:` / `PUT 3-5:` for a range, a bare `3.=5:` header, body rows without the `+`, `N:TEXT` rows pasted from read output, read notices and `…` rows copied ahead of the operations (ignored), unified-diff `-old` rows next to `+new` rows (dropped), an empty `PUT` body (a deletion), a `:` on `CUT`. Two hunks on exactly the same range keep the later one; any other overlap is an error. Other formats (`@@` hunks, `*** Update File:`) are rejected with a message that names the hashline form.
+The parser accepts near misses, with warnings for repairs. It accepts an optional `*** Begin Patch` / `*** End Patch` envelope, `PUT 3:` or `PUT 3-5:` for a range, a bare `3.=5:` header, body rows without `+`, `N:TEXT` rows pasted from `read`, and a `:` on `CUT`. It ignores read notices and `…` rows ahead of the operations. It drops unified-diff `-old` rows alongside `+new` rows. An empty `PUT` body deletes the range. If two hunks cover the same range, the later one wins. Other overlaps are errors. `@@` hunks and `*** Update File:` are rejected with a message that names the hashline form.
 
 When applying, three text-only repairs run, each with a warning:
 
@@ -95,7 +95,7 @@ When applying, three text-only repairs run, each with a warning:
 
 ### Stale tags
 
-The extension remembers, per session, the last four versions of each file it showed or wrote (their tags and text).
+The extension remembers the tags and text of the last four versions it shows or writes for each file in a session.
 
 - **The tag names the current content**: the edit applies. This needs no memory, so it also works after a restart.
 - **The tag names an older remembered version**, e.g. the tag of the `read` before an earlier edit:
@@ -142,25 +142,25 @@ A rejection is an error result (`isError`) whose `details.errorKind` is one of `
 ## Outside the TUI, subagents, other tools
 
 - **Print, JSON and RPC mode**: the tools behave the same; they have no UI part. `/hashline` shows its notifications only where there is a UI.
-- **Subagents**: the `subagent` extension starts children without extensions, so children keep pi's built-in `read` and `edit` even while the parent uses hashline. A file a child changed has a new tag; the parent's next edit of it is recovered or rejected like any outside change.
-- **Changes made by `write`, `bash` or anything else** are outside changes too: the next `edit` under an old tag goes through the stale-tag rules above.
+- **Subagents**: children started by `subagent` load no extensions. They use pi's built-in `read` and `edit`. A file a child changes has a new tag. The parent's next edit goes through stale-tag recovery or rejection.
+- **Changes made by `write`, `bash` or anything else** also trigger the stale-tag rules when an edit uses an old tag.
 - **A new, resumed or forked session** starts with an empty memory (tags from the old transcript still apply when they name the current content).
 
 ## Rendering
 
-- **pi's TUI**: both tools use pi's built-in renderers. `edit` results carry pi's own `details.diff` and `details.patch`, so the diff is drawn as for the built-in edit, and the call line shows the first section's path.
-- **Native terminals (tsp-native)**: `tsp-native/describers.ts` shows a hashline `read` as the file's own text, without the header row and the `N:` prefixes, numbered from the first line shown, with a cut notice as a muted line under it; a hashline `edit` is headed by its file (`N files` for several) over the diff from `details.patch`. The cards of pi's built-in tools are unchanged.
+- **pi's TUI**: both tools use pi's built-in renderers. `edit` returns `details.diff` and `details.patch` for diff rendering. The call line shows the first section's path.
+- **Native terminals (tsp-native)**: `tsp-native/describers.ts` shows `read` output without the hashline header or `N:` prefixes. Numbering starts at the first line shown. A cut notice appears in muted text below. The `edit` card shows the file name or `N files` above the diff from `details.patch`. Built-in tool cards are unchanged.
 
 ## Conformance
 
-The engine files are ports of the Rust modules of the same names under `crates/pi-edit/src/modes/hashline/` (plus the parts of `store.rs`, `session.rs`, `diff_string.rs` and `crates/pi-diff` they use), at oh-my-pi commit `67ef5342de`. They were checked with plain-node test scripts against upstream's own JSON fixtures (`crates/pi-edit/tests/fixtures/hashline/`) and against cases ported by hand from upstream's Rust tests. The scripts and fixtures were built in a scratch directory and are not part of this repository.
+The results come from Node scripts that check JSON fixtures and selected hand-written cases. The scripts and fixtures were built in a scratch directory outside this repository.
 
-| What | Result |
+| Check | Result |
 |---|---|
-| Parser: every `parse` call of the `parity_*.json` fixtures | 330 of 330 give upstream's edit count, file op and warnings, or its error text |
-| Applier: every `apply` call of those fixtures | 172 of 211 give upstream's text, first changed line and warnings, or its error text. The other 39 are cases upstream decides with a tree-sitter parse (see below); for 10 of them the text is the same and only upstream's syntax-error warning is missing |
-| End to end (`patcher.json`: temp files, snapshots, expected files and replies) | 25 of 26; the other one tests the seen-line guard |
-| Stale-tag recovery (15 cases from `tests/hashline_apply.rs`), mismatch / header-only / no-op / out-of-range replies (from `tests/hashline_patcher.rs`), the tag (`F27C` for `before\n`, and upstream's colliding pair) | all as upstream |
+| Parser (`parity_*.json`): edit counts, file operations, warnings and errors | 330 of 330 match the fixtures. |
+| Applier: text, first changed line, warnings and errors | 172 of 211 match. The other 39 require syntax checks the extension does not perform. In 10 of those cases only the syntax-error warning differs. |
+| End to end (`patcher.json`): files, snapshots and replies | 25 of 26 match. The other case requires a seen-line guard. |
+| Stale-tag recovery (15 cases), mismatch, header-only, no-op and out-of-range replies, and tags | All match. The tag cases cover `F27C` for `before\n` and a collision. |
 
 ## Files
 
@@ -169,7 +169,7 @@ The engine files are ports of the Rust modules of the same names under `crates/p
 | `index.ts` | Extension entry: registers the two tools when on, clears the session memory at session start, `/hashline`. |
 | `config.ts` | The saved switch (`config.json`) and the `PI_HASHLINE` override. |
 | `tools.ts` | The `read` and `edit` tool definitions: pi's built-in read first, then the anchored text; `details` for pi's renderers; pi's file mutation queue around writes. |
-| `prompt.ts` | Everything the model is told: the edit tool's description (upstream's `hashline.md` without the block forms), parameter description, prompt snippets and guidelines. |
+| `prompt.ts` | Model-facing tool and parameter descriptions, prompt snippets and guidelines. |
 | `read-format.ts` | Pure: header, numbered rows, limits and notices of a read. |
 | `patcher.ts` | One edit call: split into sections, stage every file in memory, write, record the new versions, build the reply. |
 | `store.ts` | The session memory: versions per file, named registers, the repeated-no-op counter. |
@@ -180,24 +180,21 @@ The engine files are ports of the Rust modules of the same names under `crates/p
 | `input.ts` | Pure: splitting `input` into sections, header leniency, merging sections of one file. |
 | `parser.ts` | Pure: the rows under a header as edits, with the leniency rules. |
 | `tokenizer.ts` | Pure: classifying each row (header, operation, body row, envelope). |
-| `diff.ts` | Pure: line diff (Myers, as jsdiff), the line map for recovery, similarity, the numbered diff and the reply preview. |
-| `messages.ts` | Every error and warning text, as upstream words them. |
+| `diff.ts` | Pure: Myers line diff, recovery line map, similarity, numbered diff and reply preview. |
+| `messages.ts` | Error and warning text. |
 | `format.ts` | Pure: header and row format, the tag (xxHash32), line-ending and BOM handling, recognising rows copied from read output. |
 | `types.ts` | Shared types and the error class. |
 
 Outside this directory: `tsp-native/describers.ts` (the two cards above).
 
-## Not replicated / differences from oh-my-pi
+## Unsupported features
 
-- **Block forms** (`PUT N*:`, `PUT >N*:`, `CUT N*`, `PUT N* @name`: "the syntactic block that starts on line N"). Upstream resolves them with a tree-sitter parse of the file; vanilla pi ships no parser. They are not in the tool description. If a model writes one anyway it gets what upstream gives for a language it cannot parse: replace and cut forms are rejected with a message naming the `N.=M` form, `PUT >N*` is applied as `PUT >N` with a warning.
-- **Parse-checked repairs and warnings.** Upstream also uses the parse to keep a closing line a range swallowed, to move an insert past the block its anchor opens, to treat a neighbouring attribute or decorator as an echo on a one-line range, to warn that an edit introduced a syntax error, and to refuse a recovery that lands in another construct or breaks the parse. Here such an edit is applied as written. One rule stands in for upstream's parse veto of the `PUT >N:` shift: a body that starts with a closing delimiter or with `case`, `default`, `else`, `elif`, `catch`, `except` or `finally` is never moved.
-- **The seen-line guard** (upstream's `edit.enforceSeenLines`, on by default there): rejecting edits anchored on lines no read displayed. Not ported; pi's read does not fold or cut lines, and the guard's replies point at oh-my-pi's `path:A-B` read selectors.
-- **Anchored search output.** Upstream's `grep` output carries headers and anchors too. Here only `read` and `edit` replies do.
-- **oh-my-pi's `read`**: selectors in the path (`:50-100`, `:raw`), structural summaries, bracket-context rows. pi's `offset` / `limit` are kept instead.
-- **Reply previews** mark the gap between two changed regions with `…`; upstream does so only next to its bracket-context rows.
-- **Streaming previews** of an edit while its arguments arrive, the grammar for constrained decoding, the compact prompt variant and per-model edit modes.
-- **Host features**: notebooks, internal URL targets, plan mode, the auto-generated-file guard, format-on-write handling, approval tiers, finding a mistyped path by its unique suffix in the workspace.
-- `REM` on a file that is not valid UTF-8 is refused (upstream deletes it); the non-UTF-8 message has no byte offset.
+- The tool description omits syntactic block forms such as `PUT N*:`, `PUT >N*:`, `CUT N*` and `PUT N* @name`. Block replacement and cut are rejected with a message naming `N.=M`. `PUT >N*` is treated as `PUT >N` with a warning.
+- The extension does not parse code for repairs or stale-tag recovery. It does not warn when an edit introduces a syntax error. It does not preserve swallowed closing lines, move inserts past opened blocks or treat neighboring attributes or decorators as echoes based on syntax. It does not reject a recovery on the basis of a syntax error or a change of construct. The textual `PUT >N:` shift leaves a body in place if it starts with a closing delimiter or with `case`, `default`, `else`, `elif`, `catch`, `except` or `finally`.
+- Edits can target lines no `read` displayed. `grep` output has no anchors. `read` uses `offset` and `limit`, not path selectors such as `:50-100` or `:raw`. It has no structural summaries or bracket-context rows.
+- There are no previews while edit arguments stream, constrained-decoding grammar, compact prompt variant or per-model edit modes.
+- There is no special handling for notebooks, internal URL targets, plan mode, auto-generated files, format-on-write or approval tiers. Mistyped paths are not resolved by a unique workspace suffix.
+- `REM` refuses files that are not valid UTF-8. The error has no byte offset.
 
 ## Known limits
 
@@ -215,5 +212,4 @@ Not verified:
 
 - Nothing was watched in a terminal: the TUI rendering of both tools, the native cards in rsttyd, and `/hashline on` / `off` / `status` in a running session (the reload, the notifications, the tool descriptions afterwards) have not been seen.
 - How well models other than the one tried handle the syntax, and any task larger than that one edit.
-- The Rust engine was not run for this port; agreement rests on upstream's fixtures and tests as described under Conformance. Upstream tests written inline in Rust were ported only in part.
 - Windows paths.

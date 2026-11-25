@@ -1,19 +1,7 @@
-/**
- * TSP framing: `ESC _ tsp ; <verb> [; k=v]* ; <body> ESC \`, ported from
- * oh-my-pi `packages/tui/src/native/encode.ts`.
- *
- * Bodies are UTF-8 JSON (or base64 for blobs). A body larger than the
- * negotiated `apc` limit is split across messages with the same verb, tagged
- * `c=<chunk-id>`, with `m=1` on every chunk but the last; the receiver joins
- * the bodies byte-wise. Chunks split on code-point boundaries and never where
- * the next chunk would lead with a `key=value;` segment the receiver would read
- * as a parameter.
- */
 import { TSP_APC_ID, TSP_DEFAULT_APC_LIMIT, TSP_VERSION, type TspEvent, type TspHello, type TspReply, type TspVerb } from "./wire.ts";
 
 const APC = "\x1b_";
 const ST = "\x1b\\";
-/** Every TSP message starts with this. */
 export const TSP_PREFIX = `${APC}${TSP_APC_ID};`;
 
 export type TspIncoming = { verb: "r"; reply: TspReply } | { verb: "e"; event: TspEvent };
@@ -37,6 +25,7 @@ function leadsWithParameter(bytes: Uint8Array, at: number): boolean {
 function chunkEnd(bytes: Uint8Array, start: number, limit: number): number {
 	const target = start + limit;
 	if (target >= bytes.length) return bytes.length;
+	// Continuation chunks must be valid UTF-8 without a parameter-shaped prefix.
 	const safe = (at: number): boolean => (bytes[at]! & 0xc0) !== 0x80 && !leadsWithParameter(bytes, at);
 	for (let at = target; at > start; at--) if (safe(at)) return at;
 	for (let at = target + 1; at < bytes.length; at++) if (safe(at)) return at;
@@ -70,7 +59,9 @@ function encodeParams(params: TspParams | undefined): string {
 	return out;
 }
 
-/** Encode one logical message, chunked when `body` exceeds `limit` UTF-8 bytes. */
+/**
+ * The limit applies to UTF-8 body bytes.
+ */
 export function encodeTspMessage(verb: TspVerb, body: string, params?: TspParams, limit: number = TSP_DEFAULT_APC_LIMIT): string {
 	const base = encodeParams(params);
 	if (body.length * 3 <= limit) return frame(verb, base, body);
@@ -90,7 +81,6 @@ export function encodeTspJson(verb: TspVerb, value: unknown, params?: TspParams,
 	return encodeTspMessage(verb, JSON.stringify(value), params, limit);
 }
 
-/** The `hello` query; callers follow it with a DA1 sentinel. */
 export function encodeTspHelloQuery(app: string, features: readonly string[], ver?: string): string {
 	return encodeTspJson("q", { q: "hello", v: [TSP_VERSION], app, features, ver });
 }
@@ -103,7 +93,6 @@ export interface TspRawMessage {
 
 const PARAM_PATTERN = /^[A-Za-z0-9_-]+=[\x21-\x3a\x3c-\x7e]*$/;
 
-/** Split a complete `ESC _ tsp;… ESC \` string into verb, parameters and body; null when it isn't one. */
 export function splitTspMessage(sequence: string): TspRawMessage | null {
 	if (!sequence.startsWith(TSP_PREFIX) || !sequence.endsWith(ST)) return null;
 	const inner = sequence.slice(TSP_PREFIX.length, -ST.length);
@@ -164,7 +153,6 @@ const EVENT_REQUIRED: Readonly<Record<string, Readonly<Record<string, "string" |
 function decodeEvent(value: Record<string, unknown>): TspEvent | null {
 	if (typeof value.ev !== "string") return null;
 	const required = EVENT_REQUIRED[value.ev];
-	// Unknown events (e.g. rmux-view) pass through for the backend to ignore or use.
 	if (!required) return value as TspEvent;
 	for (const key in required) {
 		const want = required[key];
@@ -174,7 +162,6 @@ function decodeEvent(value: Record<string, unknown>): TspEvent | null {
 	return value as TspEvent;
 }
 
-/** Decode an unchunked reply/event body. Null for malformed JSON, missing fields or program → terminal verbs. */
 export function decodeTspBody(verb: string, body: string): TspIncoming | null {
 	if (verb !== "r" && verb !== "e") return null;
 	let value: unknown;
@@ -192,7 +179,6 @@ export function decodeTspBody(verb: string, body: string): TspIncoming | null {
 	return event ? { verb, event } : null;
 }
 
-/** Reassembles chunked terminal → program messages and decodes replies and events. */
 export class TspReader {
 	#chunks = new Map<string, string>();
 

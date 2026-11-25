@@ -1,20 +1,3 @@
-/**
- * pi's session navigation selectors as omp's native picker sheets (oh-my-pi overlays/session-selector.ts,
- * overlays/tree-selector.ts, native/picker.ts).
- *
- * - /resume (`SessionSelectorComponent`): an `lg` sheet over the session list — scopes Current folder / All
- *   projects (the scope column, Tab), sort tabs Threaded / Recent / Fuzzy (Ctrl+S cycles), Named-only and Paths
- *   toggles (Ctrl+N / Ctrl+P), Delete (Ctrl+D, answered in the confirm strip) and Rename (Ctrl+R: pi's rename
- *   `Input` takes the preview pane). Threaded sessions nest as a `tree`; flat orders are day-grouped cards.
- * - /tree (`TreeSelectorComponent`): a `tree` sheet of the visible entries at pi's branch depths, the active
- *   path lit, filter-mode tabs, labels as badges; the label editor (pi's `Input`) takes the preview pane.
- * - /fork (`UserMessageSelectorComponent`): a sheet of the past user messages, the selected one previewed.
- *
- * Keys stay pi's: each sheet's search text and caret come from the component's own state (the terminal holds no
- * field while a sheet is up, so typing reaches pi's `handleInput`). Pointer events — `select`, `activate`,
- * `action` (bar buttons, `tab`, `scope`, the confirm strip's answer, `close`, `clear`) — feed the bound key to
- * the component's `handleInput` where one exists, so every side effect pi runs on a key runs on a click too.
- */
 import { SessionSelectorComponent, TreeSelectorComponent, UserMessageSelectorComponent } from "@earendil-works/pi-coding-agent";
 import { type Component, getKeybindings } from "@earendil-works/pi-tui";
 import type { Describer } from "./describers.ts";
@@ -22,7 +5,6 @@ import { code, md, type NativeChild, type NativeNode, type NativeUiEvent, node, 
 import { lineToSpans, spansThemeId } from "./spans.ts";
 import type { TspProps, TspSpan, TspText, TspTone } from "./wire.ts";
 
-/** Loose view of private component state. */
 type Any = Record<string, any>;
 
 function is(component: Component, ctor: Function | undefined, name: string): boolean {
@@ -33,7 +15,6 @@ function is(component: Component, ctor: Function | undefined, name: string): boo
 	return false;
 }
 
-/** One line of display text: control characters and runs of whitespace folded to single spaces. */
 function oneLine(s: string): string {
 	return s
 		.replace(/[\x00-\x1f\x7f]/g, " ")
@@ -45,7 +26,6 @@ function clip(s: string, max: number): string {
 	return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
-/** The last `max` characters of `s`, led by an ellipsis when cut. */
 function tail(s: string, max: number): string {
 	return s.length > max ? `…${s.slice(-max)}` : s;
 }
@@ -55,7 +35,6 @@ function shortenPath(p: string): string {
 	return home && p.startsWith(home) ? `~${p.slice(home.length)}` : p;
 }
 
-/** A path as dim-prefix / strong-tail spans (omp's `cwdSpans`). */
 function pathSpans(p: string): TspSpan[] {
 	const short = shortenPath(p);
 	const cut = short.lastIndexOf("/") + 1;
@@ -71,7 +50,6 @@ function validDate(d: unknown): Date | undefined {
 	return undefined;
 }
 
-/** omp's `pickerAge`: the compact age of `at` (`now`, `5m`, `2h`, `3d`, `2w`, `6mo`, `1y`), pi's session ages. */
 function pickerAge(at: Date, now = Date.now()): string {
 	const seconds = Math.max(0, Math.floor((now - at.getTime()) / 1000));
 	if (seconds < 60) return "now";
@@ -88,19 +66,15 @@ function pickerAge(at: Date, now = Date.now()): string {
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-/** omp's `pickerDate`: the absolute local time behind an age (`28 Sep 2026, 18:02`). */
 function pickerDate(d: Date): string {
 	const hh = String(d.getHours()).padStart(2, "0");
 	const mm = String(d.getMinutes()).padStart(2, "0");
 	return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}, ${hh}:${mm}`;
 }
 
-/** Ages only change by the minute: memos key on this. */
 function minute(): number {
 	return Math.floor(Date.now() / 60_000);
 }
-
-// ── Picker wire shapes (omp `TspPickerProps`) ───────────────────────────
 
 interface PickerMark {
 	text: string;
@@ -120,7 +94,6 @@ interface PickerItem {
 	badges?: readonly { text: string; tone?: TspTone; title?: string }[];
 	tone?: TspTone;
 	disabled?: string | true;
-	/** `timeline`: node style; `tree`: nesting depth and disclosure state. */
 	node?: "user" | "assistant" | "tool" | "marker";
 	depth?: number;
 	open?: boolean;
@@ -196,7 +169,6 @@ function picker(p: PickerProps, preview?: readonly NativeChild[]): NativeNode {
 	return node("picker", p as unknown as TspProps, preview);
 }
 
-/** Keycap names for a key id (`"alt+enter"` → `["alt", "enter"]`, `"escape"` → `["esc"]`). */
 function keyCaps(key: string): string[] {
 	if (key === "+") return ["+"];
 	const parts = key.endsWith("++") ? [...key.slice(0, -2).split("+"), "+"] : key.split("+");
@@ -204,15 +176,13 @@ function keyCaps(key: string): string[] {
 }
 
 /**
- * The primary key bound to `binding`, else `fallback` (pi's default). A bundled pi keeps its own keybindings
- * manager; ours then knows only pi-tui's ids, so app ids fall back to their defaults.
+ * Bundled pi keeps a separate keybindings manager.
  */
 function boundKey(binding: string, fallback: string): string {
 	try {
 		const keys = (getKeybindings() as unknown as { getKeys(id: string): string[] }).getKeys(binding);
 		if (Array.isArray(keys) && typeof keys[0] === "string" && keys[0] !== "") return keys[0];
 	} catch {
-		// no keybindings manager
 	}
 	return fallback;
 }
@@ -222,12 +192,13 @@ function pickerAction(id: string, label: string, key?: string, opts?: Omit<Picke
 	return { id, label, ...(caps.length > 0 ? { keys: caps } : {}), ...opts };
 }
 
-/** The right-aligned `Close esc` every picker ends with; rsttyd's backdrop and head `esc` send it too. */
+/**
+ * The terminal uses this action for backdrop and header close clicks.
+ */
 const CLOSE_ACTION: PickerAction = { id: "close", label: "Close", keys: ["esc"], end: true };
 
 type PickerEvent = { readonly kind: "select" | "activate"; readonly item: string } | { readonly kind: "action"; readonly act: string; readonly value: string | undefined };
 
-/** omp's `pickerEvent`: the pointer event for the picker at keypath `key` ("" = the component's root). */
 function pickerEvent(event: NativeUiEvent, key = ""): PickerEvent | undefined {
 	if (event.key.replaceAll("^", "") !== key) return undefined;
 	switch (event.type) {
@@ -241,7 +212,6 @@ function pickerEvent(event: NativeUiEvent, key = ""): PickerEvent | undefined {
 	}
 }
 
-/** Every case-insensitive occurrence of the (lowercase) `tokens` in `label`, merged (omp's `pickerHits`). */
 function substringHits(label: string, tokens: readonly string[]): [number, number][] {
 	const lower = label.toLowerCase();
 	const ranges: [number, number][] = [];
@@ -259,12 +229,10 @@ function substringHits(label: string, tokens: readonly string[]): [number, numbe
 	return merged;
 }
 
-/** The plain text of a picker label. */
 function labelText(label: TspText): string {
 	return typeof label === "string" ? label : label.map((s) => s.t).join("");
 }
 
-/** A search Input's text and caret. */
 function inputState(input: Any | undefined): { value: string; cursor: number } {
 	const value = typeof input?.getValue === "function" ? String(input.getValue()) : String(input?.value ?? "");
 	const raw = Number(input?.cursor);
@@ -283,8 +251,6 @@ function kvNode(pairs: readonly (readonly [string, TspText | undefined])[], key:
 function previewTitle(t: TspText, key = "title"): NativeNode {
 	return text(t, { role: "omp.picker.title", wrap: "word" }, key);
 }
-
-// ── Keys fed to the component (its own key paths) ───────────────────────
 
 const NAMED_KEYS: Readonly<Record<string, string>> = {
 	enter: "\r",
@@ -305,7 +271,9 @@ const NAMED_KEYS: Readonly<Record<string, string>> = {
 };
 const ARROW_FINAL: Readonly<Record<string, string>> = { up: "A", down: "B", right: "C", left: "D" };
 
-/** The legacy bytes of a key id (pi-tui's `matchesKey` accepts them with or without the kitty protocol). */
+/**
+ * Pi accepts legacy key bytes even in extended keyboard mode.
+ */
 function keyBytes(key: string): string | undefined {
 	const parts = key.toLowerCase().split("+");
 	const base = parts.pop() ?? "";
@@ -324,16 +292,11 @@ function keyBytes(key: string): string | undefined {
 	}
 	if (mods.has("shift")) {
 		if (base === "tab") return "\x1b[Z";
-		// Legacy shift+letter is the capital.
 		if (/^[a-z]$/.test(base)) return base.toUpperCase();
 	}
 	return undefined;
 }
 
-/**
- * Run what pressing `binding` runs: its key goes through `target.handleInput`. False (nothing fed) when the
- * target takes no keys or the bound key has no legacy bytes; callers then run the same path directly.
- */
 function press(target: Any | undefined, binding: string, fallback: string): boolean {
 	if (!target || typeof target.handleInput !== "function") return false;
 	const bytes = keyBytes(boundKey(binding, fallback));
@@ -341,8 +304,6 @@ function press(target: Any | undefined, binding: string, fallback: string): bool
 	target.handleInput(bytes);
 	return true;
 }
-
-// ── /fork: UserMessageSelectorComponent ─────────────────────────────────
 
 interface ForkMessage {
 	id: string;
@@ -375,7 +336,6 @@ function forkItems(messages: ForkMessage[]): PickerItem[] {
 
 const forkPreviews = new WeakMap<object, { index: number; n: number; nodes: NativeChild[] }>();
 
-/** The selected message in full, and what forking from it does. */
 function forkPreview(message: ForkMessage | undefined, index: number, n: number): NativeChild[] {
 	if (!message) return [];
 	const cached = forkPreviews.get(message);
@@ -455,8 +415,6 @@ const userMessageSelector: Describer = {
 	},
 };
 
-// ── /resume: SessionSelectorComponent ───────────────────────────────────
-
 interface SessionInfoLike {
 	path: string;
 	id?: string;
@@ -470,7 +428,6 @@ interface SessionInfoLike {
 	allMessagesText?: string;
 }
 
-/** A `SessionList.filteredSessions` row: the session and its place in the threaded tree. */
 interface SessionRow {
 	session: SessionInfoLike;
 	depth?: number;
@@ -494,7 +451,6 @@ const SESSION_COLUMNS: readonly PickerColumn[] = [
 	{ id: "when", format: "time", priority: 2 },
 ];
 
-/** Longest prompt or answer excerpt the session preview shows (omp's `PREVIEW_EXCERPT_CHARS`). */
 const EXCERPT_CHARS = 1200;
 const DAY_MS = 86_400_000;
 
@@ -509,7 +465,6 @@ function allSessionsOf(list: Any | undefined): SessionInfoLike[] {
 	return Array.isArray(all) ? all.filter((s) => typeof s?.path === "string") : [];
 }
 
-/** pi's row text: the session's name, else its first message; else its id or file name. */
 function sessionLabel(s: SessionInfoLike): string {
 	const shown = oneLine(String(s.name ?? s.firstMessage ?? ""));
 	if (shown) return shown;
@@ -543,10 +498,6 @@ function sameKey(a: readonly unknown[], b: readonly unknown[]): boolean {
 	return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
-/**
- * The sheet's rows. Flat orders send the whole scope once (typing, the named filter and re-sorting change only
- * `order`); the threaded tree sends its rows at their depths, rebuilt when pi re-threads them.
- */
 function sessionCatalogue(c: Component, list: Any, tree: boolean): SessionCatalogue {
 	const all: unknown = list.allSessions;
 	const key = [all, Array.isArray(all) ? all.length : 0, tree ? list.filteredSessions : null, !!list.showCwd, !!list.showPath, list.currentSessionCanonicalPath, minute()];
@@ -561,7 +512,6 @@ function sessionCatalogue(c: Component, list: Any, tree: boolean): SessionCatalo
 	const showPath = !!list.showPath;
 	const now = Date.now();
 	const current: string[] = [];
-	// pi canonicalizes (realpath) every path it compares; only a path ending in the current file's name can be it.
 	const canonical = typeof list.currentSessionCanonicalPath === "string" ? (list.currentSessionCanonicalPath as string) : undefined;
 	const currentName = canonical ? canonical.slice(canonical.lastIndexOf("/") + 1) : undefined;
 	const seen = new Set<string>();
@@ -571,6 +521,7 @@ function sessionCatalogue(c: Component, list: Any, tree: boolean): SessionCatalo
 		if (seen.has(s.path)) continue;
 		seen.add(s.path);
 		const depth = Math.max(0, Number(r.depth) || 0);
+		// Pi resolves candidate paths on every comparison.
 		const isCurrent = !!currentName && (s.path === canonical || (s.path.endsWith(currentName) && isCurrentSession(list, s.path)));
 		if (isCurrent) current.push(s.path);
 		const detail: TspSpan[] = [];
@@ -591,7 +542,6 @@ function sessionCatalogue(c: Component, list: Any, tree: boolean): SessionCatalo
 		}
 		const badges: { text: string; tone?: TspTone; title?: string }[] = [];
 		if (isCurrent) badges.push({ text: "current", tone: "accent", title: "The session you are in" });
-		// Threaded forks sit under their parent; elsewhere the badge says where they came from.
 		if (s.parentSessionPath && depth === 0) {
 			const parent = labels.get(s.parentSessionPath) ?? shortenPath(s.parentSessionPath);
 			badges.push({ text: "fork", title: `Forked from “${clip(parent, 80)}”` });
@@ -602,7 +552,6 @@ function sessionCatalogue(c: Component, list: Any, tree: boolean): SessionCatalo
 			id: s.path,
 			label: clip(labels.get(s.path) ?? s.path, 240),
 			...(detail.length > 0 ? { detail } : {}),
-			// pi colours named sessions; the sheet marks them with a tag.
 			...(isNamed(s) ? { icon: "tag" } : {}),
 			facts: { msgs: Math.max(0, Number(s.messageCount) || 0), when: modified ? pickerAge(modified, now) : "" },
 			...(badges.length > 0 ? { badges } : {}),
@@ -615,7 +564,6 @@ function sessionCatalogue(c: Component, list: Any, tree: boolean): SessionCatalo
 	return catalogue;
 }
 
-/** Day group of a session's last activity, relative to local midnight today (omp's `sessionDayGroup`). */
 function dayGroup(modified: Date | undefined, startOfToday: number): { id: string; label: string } {
 	const at = modified?.getTime() ?? 0;
 	if (at >= startOfToday) return { id: "today", label: "Today" };
@@ -624,7 +572,6 @@ function dayGroup(modified: Date | undefined, startOfToday: number): { id: strin
 	return { id: "earlier", label: "Earlier" };
 }
 
-/** pi's filtered rows in its order; recency orders under day headers (Today, Yesterday, This week, Earlier). */
 function sessionOrder(rows: readonly SessionRow[], byRecency: boolean): (string | PickerGroup)[] {
 	const ids = rows.map((r) => r.session.path);
 	if (!byRecency || rows.length === 0) return ids;
@@ -644,7 +591,6 @@ function sessionOrder(rows: readonly SessionRow[], byRecency: boolean): (string 
 	return order;
 }
 
-/** pi's `re:<pattern>` as a global, case-insensitive regex; undefined when empty or invalid. */
 function regexOf(pattern: string): RegExp | undefined {
 	if (!pattern) return undefined;
 	try {
@@ -654,7 +600,6 @@ function regexOf(pattern: string): RegExp | undefined {
 	}
 }
 
-/** Hit ranges for pi's query syntax: `re:<pattern>` regex matches, else its words and "quoted phrases". */
 function sessionHits(ids: readonly string[], labels: ReadonlyMap<string, string>, query: string): Record<string, [number, number][]> | undefined {
 	const trimmed = query.trim();
 	if (!trimmed) return undefined;
@@ -697,7 +642,6 @@ function sessionHits(ids: readonly string[], labels: ReadonlyMap<string, string>
 
 const sessionPreviews = new WeakMap<object, { current: boolean; parent: string | undefined; nodes: NativeChild[] }>();
 
-/** omp's `sessionPreview`: the session's name, its facts, then its first prompt and the tail of the rest. */
 function sessionPreview(s: SessionInfoLike | undefined, labels: ReadonlyMap<string, string>, current: boolean): NativeChild[] {
 	if (!s) return [];
 	const parent = s.parentSessionPath ? (labels.get(s.parentSessionPath) ?? shortenPath(s.parentSessionPath)) : undefined;
@@ -731,7 +675,6 @@ function sessionPreview(s: SessionInfoLike | undefined, labels: ReadonlyMap<stri
 	return nodes;
 }
 
-/** The rename panel in the preview pane: pi's own rename `Input` (described by its own describer; the terminal focuses it). */
 function renamePreview(a: Any, target: SessionInfoLike | undefined): NativeChild[] {
 	const nodes: NativeChild[] = [previewTitle("Rename session")];
 	if (target) nodes.push(text([span(clip(sessionLabel(target), 200), "muted")], { wrap: "word" }, "target"));
@@ -753,14 +696,12 @@ function sessionSubtitle(a: Any, list: Any): TspText | undefined {
 	return cwd ? pathSpans(cwd) : undefined;
 }
 
-/** pi's empty-list copy (the sheet's Tab action offers the other scope next to it). */
 function sessionEmpty(a: Any, list: Any): string {
 	const all = a.scope === "all" || !!list.showCwd;
 	if (a.nameFilter === "named") return all ? "No named sessions found" : "No named sessions in this folder";
 	return all ? "No sessions found" : "No sessions in this folder yet";
 }
 
-/** Press `binding` on `target`; when that fed nothing or changed nothing `probe` sees, run pi's own `direct` path. */
 function pressOrRun(target: Any, binding: string, fallback: string, probe: () => unknown, direct: () => void): void {
 	const before = probe();
 	if (press(target, binding, fallback) && probe() !== before) return;
@@ -781,7 +722,6 @@ function sessionActions(a: Any, list: Any, selected: SessionInfoLike | undefined
 	}
 	actions.push(pickerAction("named", "Named only", boundKey("app.session.toggleNamedFilter", "ctrl+n"), { on: a.nameFilter === "named" }));
 	actions.push(pickerAction("path", "Paths", boundKey("app.session.togglePath", "ctrl+p"), { on: !!list.showPath }));
-	// Bound to Tab: rsttyd's empty state offers it ("No sessions in this folder yet" → All projects).
 	actions.push(pickerAction("scope", a.scope === "all" ? "Current folder" : "All projects", boundKey("tui.input.tab", "tab")));
 	actions.push(CLOSE_ACTION);
 	return actions;
@@ -834,7 +774,6 @@ const sessionSelector: Describer = {
 		const input = inputState(list.searchInput);
 		const query = input.value;
 		const sortMode = SORT_IDS.includes(a.sortMode) ? String(a.sortMode) : "threaded";
-		// pi threads sessions only without a query; searching ranks them flat.
 		const tree = sortMode === "threaded" && !query.trim();
 		const rows = sessionRows(list);
 		const catalogue = sessionCatalogue(c, list, tree);
@@ -882,7 +821,6 @@ const sessionSelector: Describer = {
 				...(hits ? { hits } : {}),
 				selected: confirming ?? selected?.path ?? null,
 				current: catalogue.current,
-				// Every session of the scope, whatever the named filter hides ("3 of 40").
 				total: Math.max(catalogue.items.length, allSessionsOf(list).length),
 				actions: sessionActions(a, list, selected, selectedIsCurrent),
 				state: loading ? "loading" : "ready",
@@ -909,7 +847,6 @@ const sessionSelector: Describer = {
 			const path = selectedPath();
 			if (path) list.onSelect?.(path);
 		};
-		// Rename: Enter saves (pi's rename Input submits), Esc goes back to the list.
 		if (a.mode === "rename") {
 			if (ev.kind !== "action") return;
 			if (ev.act === "rename-save" || ev.act === "confirm") {
@@ -919,7 +856,6 @@ const sessionSelector: Describer = {
 			}
 			return;
 		}
-		// Delete confirmation: pi takes only Enter (delete) and Esc (keep) until it is answered.
 		if (typeof list.confirmingDeletePath === "string") {
 			if (ev.kind !== "action") return;
 			if (ev.act === "delete-confirm") {
@@ -983,7 +919,6 @@ const sessionSelector: Describer = {
 				);
 				return;
 			case "scope":
-				// The scope column names its scope; the bar's button (Tab) toggles.
 				if (ev.value !== undefined && ev.value === a.scope) return;
 				pressOrRun(
 					a,
@@ -994,7 +929,6 @@ const sessionSelector: Describer = {
 				);
 				return;
 			case "tab": {
-				// pi cycles Threaded → Recent → Fuzzy on its sort key: press it until the clicked tab is on.
 				const target = ev.value;
 				if (target === undefined || !SORT_IDS.includes(target)) return;
 				for (let i = 0; i < SORT_IDS.length && a.sortMode !== target; i++) {
@@ -1020,8 +954,6 @@ const sessionSelector: Describer = {
 	},
 };
 
-// ── /tree: TreeSelectorComponent ────────────────────────────────────────
-
 const TREE_FILTER_TABS: readonly { id: string; label: string }[] = [
 	{ id: "default", label: "Default" },
 	{ id: "no-tools", label: "No tools" },
@@ -1030,7 +962,9 @@ const TREE_FILTER_TABS: readonly { id: string; label: string }[] = [
 	{ id: "all", label: "All" },
 ];
 
-/** The key pi binds to each filter mode (`default` sets it; the others toggle between it and `default`). */
+/**
+ * Pressing the active filter key returns to the default.
+ */
 const TREE_FILTER_KEYS: Readonly<Record<string, readonly [binding: string, fallback: string]>> = {
 	default: ["app.tree.filter.default", "ctrl+d"],
 	"no-tools": ["app.tree.filter.noTools", "ctrl+t"],
@@ -1039,7 +973,6 @@ const TREE_FILTER_KEYS: Readonly<Record<string, readonly [binding: string, fallb
 	all: ["app.tree.filter.all", "ctrl+a"],
 };
 
-/** A `TreeList.filteredNodes` row: the session tree node and its display indent. */
 interface TreeFlatNode {
 	node: { entry: Any; label?: string; labelTimestamp?: string };
 	indent?: number;
@@ -1052,7 +985,6 @@ function treeNodes(list: Any | undefined): TreeFlatNode[] {
 	return rows.every(ok) ? rows : rows.filter(ok);
 }
 
-/** The text of a message's content (pi's `extractFullContent`). */
 function contentText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
@@ -1063,7 +995,6 @@ function contentText(content: unknown): string {
 
 const TOOL_ICONS: Readonly<Record<string, string>> = { read: "read", write: "write", edit: "edit", bash: "bash", grep: "search", find: "search", ls: "folder" };
 
-/** The lead icon of an entry, by what it records. */
 function entryIcon(entry: Any): string | undefined {
 	switch (entry.type) {
 		case "message": {
@@ -1097,24 +1028,18 @@ function entryIcon(entry: Any): string | undefined {
 	}
 }
 
-/**
- * pi's row text for an entry (`user: …`, `[read: …]`, `[compaction: 12k tokens]`) as styled spans, on one line:
- * pi folds `\n` and `\t` out of message text only, so a tool argument's line breaks (and any `\r`, U+2028, U+2029)
- * are folded here, one space each (span boundaries and search hit offsets stay put).
- */
 function entryLabel(list: Any, flat: TreeFlatNode): TspSpan[] {
 	try {
 		if (typeof list.getEntryDisplayText === "function") {
+			// Pi leaves line breaks in tool arguments.
 			const spans = lineToSpans(String(list.getEntryDisplayText(flat.node, false))).map((s) => ({ ...s, t: s.t.replace(/[\r\n\t\u2028\u2029]/g, " ") }));
 			if (spans.some((s) => s.t.trim().length > 0)) return clipSpans(spans, 300);
 		}
 	} catch {
-		// fall back to the entry type
 	}
 	return [span(`[${String(flat.node.entry.type ?? "entry")}]`, "dim")];
 }
 
-/** At most `max` characters of styled text, an ellipsis marking the cut. */
 function clipSpans(spans: readonly TspSpan[], max: number): TspSpan[] {
 	const out: TspSpan[] = [];
 	let left = max;
@@ -1135,13 +1060,11 @@ function labelTimestamp(list: Any, ts: unknown): string | undefined {
 	try {
 		if (typeof list.formatLabelTimestamp === "function") return String(list.formatLabelTimestamp(ts));
 	} catch {
-		// fall through
 	}
 	const d = validDate(ts);
 	return d ? pickerDate(d) : undefined;
 }
 
-/** Whether pi would fold the entry on its fold key (it has visible children and starts a branch or the tree). */
 function isFoldable(list: Any, id: string): boolean {
 	try {
 		return typeof list.isFoldable === "function" && list.isFoldable(id) === true;
@@ -1157,7 +1080,6 @@ function isFolded(list: Any, id: string): boolean {
 
 const treeItemCache = new WeakMap<object, { sig: string; item: PickerItem }>();
 
-/** A visible entry as a `tree` row: pi's depth, a disclosure where it folds, the active path lit, its label a badge. */
 function treeItem(list: Any, flat: TreeFlatNode, themeId: number): PickerItem {
 	const entry = flat.node.entry;
 	const id = String(entry.id);
@@ -1166,7 +1088,7 @@ function treeItem(list: Any, flat: TreeFlatNode, themeId: number): PickerItem {
 	const folded = isFolded(list, id);
 	const open = folded ? false : isFoldable(list, id) ? true : undefined;
 	const active = list.activePathIds instanceof Set && list.activePathIds.has(id);
-	// Folded to one line: a label's line breaks would break the badge (and the row).
+	// Picker badges cannot contain line breaks.
 	const label = (typeof flat.node.label === "string" && oneLine(flat.node.label)) || undefined;
 	const stamp = label && list.showLabelTimestamps ? labelTimestamp(list, flat.node.labelTimestamp) : undefined;
 	const sig = `${depth}|${open}|${active}|${label ?? ""}|${stamp ?? ""}|${themeId}`;
@@ -1190,7 +1112,6 @@ function treeItem(list: Any, flat: TreeFlatNode, themeId: number): PickerItem {
 
 const treeCatalogues = new WeakMap<object, PickerItem[]>();
 
-/** The visible entries in pi's order; the previous array while every row is unchanged (moving the selection). */
 function treeItems(c: Component, list: Any, nodes: readonly TreeFlatNode[]): PickerItem[] {
 	const themeId = spansThemeId();
 	const items = nodes.map((flat) => treeItem(list, flat, themeId));
@@ -1202,7 +1123,6 @@ function treeItems(c: Component, list: Any, nodes: readonly TreeFlatNode[]): Pic
 
 const treeTotals = new WeakMap<object, number>();
 
-/** Entries pi can show at all (it never lists `usage` entries). */
 function treeTotal(list: Any): number {
 	const flat: unknown = list.flatNodes;
 	if (!Array.isArray(flat)) return 0;
@@ -1214,7 +1134,6 @@ function treeTotal(list: Any): number {
 	return total;
 }
 
-/** Longest entry body the tree preview shows. */
 const TREE_PREVIEW_CHARS = 4000;
 
 function entryTitle(entry: Any): string {
@@ -1250,19 +1169,16 @@ function entryTitle(entry: Any): string {
 	}
 }
 
-/** The tool call a tool result answers, as pi's tree shows it (`[read: ~/x.ts:1-20]`). */
 function toolCallText(list: Any, m: Any): string | undefined {
 	const call: Any | undefined = m.toolCallId && list.toolCallMap instanceof Map ? list.toolCallMap.get(m.toolCallId) : undefined;
 	if (!call) return undefined;
 	try {
 		if (typeof list.formatToolCall === "function") return String(list.formatToolCall(call.name, call.arguments ?? {}));
 	} catch {
-		// fall through
 	}
 	return String(call.name ?? "");
 }
 
-/** The selected entry's body: prose as markdown, commands and outputs as code. */
 function entryBody(list: Any, entry: Any): NativeChild[] {
 	const out: NativeChild[] = [];
 	switch (entry.type) {
@@ -1299,7 +1215,6 @@ function entryBody(list: Any, entry: Any): NativeChild[] {
 
 const treePreviews = new WeakMap<object, { sig: string; nodes: NativeChild[] }>();
 
-/** omp's tree preview: the entry's kind, its label, facts, then its content as the transcript shows it. */
 function treePreview(list: Any, flat: TreeFlatNode | undefined): NativeChild[] {
 	if (!flat) return [];
 	const entry = flat.node.entry;
@@ -1340,7 +1255,6 @@ function treePreview(list: Any, flat: TreeFlatNode | undefined): NativeChild[] {
 
 const labelPreviews = new WeakMap<object, NativeChild[]>();
 
-/** The label editor in the preview pane: pi's own label `Input` (described by its own describer; the terminal focuses it). */
 function labelPreview(labelInput: Any, target: TreeFlatNode | undefined, list: Any): NativeChild[] {
 	const cached = labelPreviews.get(labelInput);
 	if (cached) return cached;
@@ -1460,7 +1374,6 @@ const treeSelector: Describer = {
 		const ev = pickerEvent(event);
 		if (!ev || !list) return;
 		const labelInput: Any | null = a.labelInput ?? null;
-		// The label editor owns the sheet while open: Enter saves, Esc cancels (pi's LabelInput keys).
 		if (labelInput) {
 			if (ev.kind !== "action") return;
 			if (ev.act === "label-save" || ev.act === "confirm") {
@@ -1510,7 +1423,7 @@ const treeSelector: Describer = {
 				return;
 			}
 			case "label": {
-				// What the label key runs (its fallback, a capital letter, would otherwise land in the search).
+				// Sending the default L would type into the search.
 				const flat = selected();
 				if (flat) list.onLabelEdit?.(flat.node.entry.id, flat.node.label);
 				return;
@@ -1543,7 +1456,7 @@ const treeSelector: Describer = {
 				return;
 			}
 			case "clear":
-				// pi's Esc with a query clears it (and the folds), leaving the selector open.
+				// Escape clears a tree query without closing the picker.
 				if (!list.searchQuery) return;
 				pressOrRun(
 					a,
@@ -1565,5 +1478,4 @@ const treeSelector: Describer = {
 	},
 };
 
-/** Registered with the picker describers (describers.ts DESCRIBERS). */
 export const SHEET_DESCRIBERS: readonly Describer[] = [sessionSelector, treeSelector, userMessageSelector];

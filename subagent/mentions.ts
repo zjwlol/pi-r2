@@ -1,26 +1,3 @@
-/**
- * `^model` mentions (ported from oh-my-pi): type `^` in the prompt to pick a
- * model. A tagged model stands for a subagent of the default agent type running
- * on that model; the main agent still writes its task.
- *
- *   - Editor: `^` at the start of a word opens a model popup (models you
- *     recently picked with `^` or used via /model first); picking one inserts
- *     `^<model-id> ` (or `^provider/id` when the id alone is ambiguous).
- *   - Submit: tags standing as prose (not in code) are resolved and a hidden
- *     notice tells the main agent to spawn that work as a default-agent `task`
- *     item with `model` set. The message text stays as typed.
- *   - Level suffix: `^model:high` also pins the subagent's thinking level (the
- *     notice lists `thinking` for that tag). Levels are minimal|low|medium|high|
- *     xhigh|max; an unambiguous abbreviation of two or more characters works
- *     (`:hi`, `:me`). An exact model id wins, since some ids contain a colon
- *     (`qwen3:8b`). A suffix that is not a level the model supports (including
- *     `:off`), or whose full spelling is another model's id, leaves the whole
- *     tag as plain text: no notice is sent for it.
- *   - Chip: a tag that would be honoured on submit is reported to the prompt
- *     editor as a chip (shared/editor-chips.ts), so it shows as a selected
- *     model once you move on from it; a tag still at the very end of the draft
- *     is being typed and is not a chip yet.
- */
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
@@ -38,38 +15,29 @@ export const MENTION_NOTICE_TYPE = "model-mention-notice";
 export const MENTION_TRIGGER = "^";
 const MAX_SUGGESTIONS = 20;
 
-/** Completed `^token` in submitted text; groups: leading delimiter, token. */
 const MENTION_RE = /(^|\s)\^([^\s^]+)(?=\s|$)/g;
-/** `^query` being typed right before the cursor. */
 const LIVE_TOKEN_RE = /(?:^|\s)\^([^\s^]*)$/;
 
 type AnyModel = Model<any>;
 
-/** Where mentionable models come from (re-read on every use so it never goes stale). */
 export interface MentionSource {
-	/** Models a mention may name: the session's scoped models if any, else all available. */
 	models(): AnyModel[];
-	/** The main session's current model (used to break id ties). */
 	current(): AnyModel | undefined;
 }
 
 export interface ResolvedMention {
-	/** Token as typed after `^`. */
 	token: string;
 	model: AnyModel;
-	/** Thinking level from a `:level` suffix (full name, never "off"). */
 	thinking?: string;
 }
 
 const selectorOf = (m: AnyModel) => `${m.provider}/${m.id}`;
 
-/** Shortest unambiguous token for a model: its id, or `provider/id` when another provider has the same id. */
 export function mentionToken(model: AnyModel, models: readonly AnyModel[]): string {
 	const sameId = models.filter((m) => m.id === model.id);
 	return sameId.length > 1 ? selectorOf(model) : model.id;
 }
 
-/** Resolve a typed token (`id` or `provider/id`) against the mentionable models. */
 export function resolveToken(token: string, models: readonly AnyModel[], current?: AnyModel): AnyModel | undefined {
 	const exact = models.find((m) => selectorOf(m) === token);
 	if (exact) return exact;
@@ -77,10 +45,8 @@ export function resolveToken(token: string, models: readonly AnyModel[], current
 	return byId.find((m) => m.provider === current?.provider) ?? byId[0];
 }
 
-/** Levels a `:level` suffix may name. */
 const TAG_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
-/** Exact level, or an unambiguous abbreviation of 2+ chars (`hi` → high). */
 function parseLevel(value: string): string | undefined {
 	if ((TAG_LEVELS as readonly string[]).includes(value)) return value;
 	if (value.length < 2) return undefined;
@@ -88,7 +54,6 @@ function parseLevel(value: string): string | undefined {
 	return hits.length === 1 ? hits[0] : undefined;
 }
 
-/** Levels a tag may name for this model (never "off"). */
 function tagLevels(model: AnyModel): string[] {
 	try {
 		return getSupportedThinkingLevels(model).filter((l) => l !== "off");
@@ -97,17 +62,12 @@ function tagLevels(model: AnyModel): string[] {
 	}
 }
 
-/**
- * Resolve a typed token with an optional `:level` suffix. Exact ids win: some
- * contain colons (`qwen3:8b`) or end in a level name (`glm-4.7:max`). A level
- * the model does not support, or a spelling whose full form is another model's
- * token (`:ma` beside a literal `…:max`), stays unresolved.
- */
 function resolveMention(
 	token: string,
 	models: readonly AnyModel[],
 	current?: AnyModel,
 ): { model: AnyModel; thinking?: string } | undefined {
+	// Some model ids contain colons.
 	const exact = resolveToken(token, models, current);
 	if (exact) return { model: exact };
 	const colon = token.lastIndexOf(":");
@@ -121,18 +81,14 @@ function resolveMention(
 	return { model, thinking: level };
 }
 
-/** One resolvable tag in a text: where it stands and what it names. */
+/**
+ * Offsets use UTF-16 code units.
+ */
 export interface MentionRange extends ResolvedMention {
-	/** Offset of the `^` in the text (UTF-16). */
 	from: number;
-	/** Offset just past the token's last character. */
 	to: number;
 }
 
-/**
- * Every resolvable tag standing as prose in `text` (never inside code or
- * markup, never in a bash-mode draft), in text order, repeats included.
- */
 export function findMentionRanges(text: string, source: MentionSource): MentionRange[] {
 	if (!text.includes(MENTION_TRIGGER) || isBashInput(text)) return [];
 	const models = source.models();
@@ -150,7 +106,6 @@ export function findMentionRanges(text: string, source: MentionSource): MentionR
 	return out;
 }
 
-/** Tags standing as prose in `text` (never inside code or markup), one per model and level, in order. */
 export function findMentions(text: string, source: MentionSource): ResolvedMention[] {
 	const seen = new Set<string>();
 	const out: ResolvedMention[] = [];
@@ -163,33 +118,17 @@ export function findMentions(text: string, source: MentionSource): ResolvedMenti
 	return out;
 }
 
-// ---------- editor chips ----------
-
 const NO_CHIPS: readonly EditorChip[] = Object.freeze([]);
 
-/**
- * The tags of `text` the editor shows as selected: every resolvable prose tag
- * except one that ends at the very end of the text (it is still being typed;
- * oh-my-pi collapses a tag into its chip only once something follows it).
- */
 export function mentionChips(text: string, source: MentionSource): EditorChip[] {
 	const out: EditorChip[] = [];
 	for (const { from, to } of findMentionRanges(text, source)) {
+		// A tag at the end of the draft may still be changing.
 		if (to < text.length) out.push({ from, to });
 	}
 	return out;
 }
 
-/**
- * Chip provider for the prompt editor (shared/editor-chips.ts), cached because
- * the editor asks on every render:
- *   - a text without `^` costs one `includes` and never touches the source;
- *   - otherwise the source's model list is read once and the last answer is
- *     returned (the same array) while the text, every model object of the list
- *     (compared by identity, in order) and the current model's provider are
- *     the same as last time; anything else recomputes.
- * Never throws: a failing source means no chips.
- */
 export function createMentionChipProvider(getSource: () => MentionSource | undefined): EditorChipProvider {
 	let lastText: string | undefined;
 	let lastModels: readonly AnyModel[] = [];
@@ -217,6 +156,7 @@ export function createMentionChipProvider(getSource: () => MentionSource | undef
 				lastChips = chips.length > 0 ? chips : NO_CHIPS;
 				return lastChips;
 			} catch {
+				// A model lookup failure must not break editor rendering.
 				lastText = undefined;
 				return NO_CHIPS;
 			}
@@ -224,7 +164,6 @@ export function createMentionChipProvider(getSource: () => MentionSource | undef
 	};
 }
 
-/** Hidden notice telling the main agent what each tag means for this message. */
 export function mentionNotice(mentions: readonly ResolvedMention[], defaultAgent: string): string {
 	const lines = mentions.map(({ token, model, thinking }) => {
 		const name = thinking ? `${displayName(model)} · ${thinking}` : displayName(model);
@@ -247,15 +186,9 @@ function displayName(model: AnyModel): string {
 	return (model.name?.trim() || model.id).replaceAll('"', "");
 }
 
-/** pi's bash mode (`!cmd` / `!!cmd`): mentions don't apply. */
 function isBashInput(text: string): boolean {
 	return text.trimStart().startsWith("!");
 }
-
-// ---------- recent models ----------
-// Two sources, merged newest first:
-//  - model-history.json: models used in the main session (written by remember-model)
-//  - model-mention-history.json: models picked with `^` (written here on submit)
 
 interface RecentEntry {
 	provider: string;
@@ -269,7 +202,6 @@ const recentCache = new Map<string, { mtimeMs: number; entries: RecentEntry[] }>
 const historyFile = () => join(getAgentDir(), "model-history.json");
 const mentionHistoryFile = () => join(getAgentDir(), "model-mention-history.json");
 
-/** Entries of one history file, newest first; empty when missing or unreadable. Never throws. */
 function readHistoryFile(file: string): RecentEntry[] {
 	try {
 		const { mtimeMs } = statSync(file);
@@ -289,7 +221,6 @@ function readHistoryFile(file: string): RecentEntry[] {
 	}
 }
 
-/** Recently used + recently `^`-picked models, newest first, one entry per model. */
 function readRecent(): RecentEntry[] {
 	const newest = new Map<string, RecentEntry>();
 	for (const e of [...readHistoryFile(mentionHistoryFile()), ...readHistoryFile(historyFile())]) {
@@ -300,10 +231,8 @@ function readRecent(): RecentEntry[] {
 	return [...newest.values()].sort((a, b) => b.lastUsed - a.lastUsed);
 }
 
-/** Remember models the user tagged with `^` (called when a prompt with mentions is sent). Never throws. */
 export function recordMentions(mentions: readonly ResolvedMention[], at = Date.now()): void {
 	if (mentions.length === 0) return;
-	// Later mentions in the same message rank just below earlier ones.
 	mergeMentionHistory(mentions.map((m, i) => ({ provider: m.model.provider, id: m.model.id, lastUsed: at - i })));
 }
 
@@ -323,14 +252,10 @@ function mergeMentionHistory(fresh: readonly RecentEntry[]): void {
 		renameSync(tmp, file);
 		recentCache.delete(file);
 	} catch {
-		// History is best-effort.
+		// History failures must not block prompt submission.
 	}
 }
 
-/**
- * First run: seed the `^` history from mention notices already in recent session files
- * (so picks made before the history existed still show up). No-op once the file exists.
- */
 export async function seedMentionHistory(maxFiles = 100): Promise<void> {
 	const file = mentionHistoryFile();
 	try {
@@ -393,9 +318,6 @@ function timeAgo(ms: number): string {
 	return `${Math.round(h / 24)}d ago`;
 }
 
-// ---------- autocomplete ----------
-
-/** Candidate models for the popup: recently used first, then the rest by provider/id. */
 export function mentionSuggestions(query: string, source: MentionSource, now = Date.now()): AutocompleteItem[] {
 	const models = source.models();
 	if (models.length === 0) return [];
@@ -421,10 +343,6 @@ export function mentionSuggestions(query: string, source: MentionSource, now = D
 	});
 }
 
-/**
- * Wrap pi's autocomplete provider: handle `^query` tokens, delegate everything
- * else (slash commands, @files, other extensions) to `current`.
- */
 export function createMentionAutocomplete(
 	current: AutocompleteProvider,
 	getSource: () => MentionSource | undefined,

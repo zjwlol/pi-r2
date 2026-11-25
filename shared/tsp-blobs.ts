@@ -1,19 +1,3 @@
-/**
- * Content-addressed image bytes for TSP `image` nodes, shared by the
- * pi-extended extensions (this directory has no index.ts, so pi doesn't load
- * it as an extension).
- *
- * A component registers the bytes and puts the returned id in its node's
- * `p.blob`; tsp-native's backend looks the id up here and uploads the bytes
- * (verb `b`) once per terminal connection, before the frame that first
- * references it. Ids are the lowercase sha256 hex of the bytes, which is what
- * the terminal verifies a `b` body against (rsttyd
- * `frontend/js/tsp-blobs.js` `readBlob`; oh-my-pi `native/blobs.ts`).
- *
- * The registry lives on `globalThis` under a registered symbol, so every
- * module copy jiti loads (one per extension, a fresh one per reload) shares
- * it.
- */
 import { createHash } from "node:crypto";
 
 export interface TspBlob {
@@ -24,7 +8,6 @@ export interface TspBlob {
 
 interface TspBlobRegistry {
 	readonly blobs: Map<string, TspBlob>;
-	/** Ids already computed for a bytes object, so re-registering it on every describe skips the hash. */
 	readonly ids: WeakMap<Uint8Array, string>;
 }
 
@@ -40,16 +23,15 @@ function registry(): TspBlobRegistry {
 	return current;
 }
 
-/** Lowercase sha256 hex of `bytes`. */
+/**
+ * The terminal expects a lowercase SHA-256 hex digest.
+ */
 function blobId(bytes: Uint8Array): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 
 /**
- * Register image bytes for TSP `image` nodes; returns the content-addressed
- * blob id to put in the node's `p.blob`. Idempotent for identical bytes (the
- * first registration's mime wins; the terminal sniffs the real type anyway).
- * The registry keeps `bytes` as given: don't mutate them afterwards.
+ * Keep the bytes unchanged after registration to preserve their digest.
  */
 export function registerTspBlob(bytes: Uint8Array, mime: string): string {
 	const reg = registry();
@@ -62,15 +44,12 @@ export function registerTspBlob(bytes: Uint8Array, mime: string): string {
 	return id;
 }
 
-/** A registered blob by id. */
 export function getTspBlob(id: string): TspBlob | undefined {
 	return registry().blobs.get(id);
 }
 
 /**
- * Drop a blob the caller no longer shows (best effort: a backend may already
- * have sent it, and a later connection can no longer deliver it to a node
- * that still references it).
+ * A reconnect can only upload blobs that are still registered.
  */
 export function releaseTspBlob(id: string): void {
 	registry().blobs.delete(id);

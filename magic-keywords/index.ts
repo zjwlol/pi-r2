@@ -1,17 +1,3 @@
-/**
- * magic-keywords (ported from oh-my-pi)
- *
- * Type a magic keyword as a standalone word in your prompt and it glows with
- * an animated gradient in the editor (static in the sent message). When the
- * prompt is sent, the keyword's hidden notice is attached to that turn.
- *
- *   orchestrate  → act as an orchestrator: decompose, fan out parallel
- *                  subagents (task/subagent tool), verify, iterate, don't yield early.
- *
- * Keywords only count as prose: inside `code`, fenced blocks, XML/HTML, paths,
- * identifiers (foo-orchestrate, orchestrate()) they are ignored.
- * Keywords live in keywords.ts; notices in notices.ts.
- */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { patchUserMessages, setBubbleHook } from "./bubble.ts";
 import { chipStyleFor } from "./chips.ts";
@@ -22,7 +8,6 @@ import type { PaintOptions } from "./paint.ts";
 const NOTICE_TYPE = "magic-keyword-notice";
 
 export default function (pi: ExtensionAPI) {
-	/** Combined hidden notice for every keyword in `text`, given the active tools. */
 	const buildNotice = (text: string) => {
 		const keywords = findKeywords(text);
 		if (keywords.length === 0) return undefined;
@@ -39,14 +24,13 @@ export default function (pi: ExtensionAPI) {
 		};
 	};
 
-	// Idle prompt: attach the notice to the run it starts.
 	pi.on("before_agent_start", async (event) => {
 		if (event.messageType !== "user") return;
 		const message = buildNotice(event.prompt);
 		return message ? { message } : undefined;
 	});
 
-	// Prompt typed while the agent is busy (steer / follow-up): queue the notice with it.
+	// Pi skips `before_agent_start` for steers and follow-ups.
 	pi.on("input", async (event) => {
 		if (!event.streamingBehavior) return;
 		const message = buildNotice(event.text);

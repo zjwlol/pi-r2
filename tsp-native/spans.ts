@@ -1,14 +1,5 @@
-/**
- * ANSI-styled pi text → TSP spans. pi paints with theme tokens (`theme.fg("accent", …)`),
- * so the exact SGR prefix each token produces maps back to the token name, which
- * the terminal resolves through the palette we sent (verb `t`, a local extension sent
- * only to a `program-palette` terminal such as rsttyd) or, without one (omp retired
- * the verb in 1513e856d5), through its own theme. Bold/italic/dim/underline become the
- * semantic `strong`/`em`/`dim`/`link` styles. Unknown colors keep their text unstyled.
- */
 import type { TspSpan } from "./wire.ts";
 
-/** Reverse map from a token's fg SGR sequence (`\x1b[38;2;r;g;bm`) to the token name. */
 let fgTokens = new Map<string, string>();
 let mapId = 0;
 
@@ -17,19 +8,18 @@ export interface ThemeLike {
 	getFgAnsi?(token: string): string;
 }
 
-/** Rebuild the reverse map from the current theme; returns an identity that changes with it. */
 export function setThemeForSpans(theme: ThemeLike | undefined): number {
 	const next = new Map<string, string>();
 	if (theme?.colors && typeof theme.getFgAnsi === "function") {
 		for (const token of Object.keys(theme.colors)) {
 			try {
 				const ansi = theme.getFgAnsi(token);
-				// A dim token's prefix ends with `\x1b[2m`; map the colour part alone too.
 				if (ansi && !next.has(ansi)) next.set(ansi, token);
+				// The pi theme appends dim as a separate SGR sequence.
 				const bare = ansi.replace(/\x1b\[2m$/, "");
 				if (bare !== ansi && !next.has(bare)) next.set(bare, token);
 			} catch {
-				// not a colour token
+				// Some theme keys are not color tokens.
 			}
 		}
 	}
@@ -38,7 +28,6 @@ export function setThemeForSpans(theme: ThemeLike | undefined): number {
 	return mapId;
 }
 
-/** Size of the reverse map (diagnostics). */
 export function spansTokenCount(): number {
 	return fgTokens.size;
 }
@@ -59,7 +48,6 @@ interface Style {
 
 const SGR = /\x1b\[([0-9;:]*)m/g;
 // eslint-disable-next-line no-control-regex
-// Every non-SGR escape sequence (SGR, `CSI … m`, is kept for the parser).
 const OTHER = /\x1b(?:\[(?![0-9;:]*m)[0-9;?<>=!]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[_P^][^\x1b]*\x1b\\|[()][A-Za-z0-9]|[=>78])/g;
 
 function styleOf(style: Style): string | undefined {
@@ -74,7 +62,6 @@ function styleOf(style: Style): string | undefined {
 	return parts.length > 0 ? parts.join(" ") : undefined;
 }
 
-/** Spans for one ANSI-styled line (no newlines). Returns `undefined` when the line is plain. */
 export function lineToSpans(line: string): TspSpan[] {
 	const clean = line.replace(OTHER, "");
 	const spans: TspSpan[] = [];
@@ -99,7 +86,7 @@ export function lineToSpans(line: string): TspSpan[] {
 		else applySgr(m[1] ?? "", style);
 		const next = styleOf(style);
 		if (next !== current) {
-			flush(); // the buffered run carries the style that was current when it was written
+			flush();
 			current = next;
 		}
 	}
@@ -161,7 +148,7 @@ function applySgr(params: string, style: Style): void {
 			case 38:
 			case 48:
 			case 58: {
-				// Extended colour: skip its arguments (unknown colours stay unstyled).
+				// Extended color parameters can look like standalone SGR codes.
 				const mode = Number(codes[i + 1]);
 				i += mode === 5 ? 2 : mode === 2 ? 4 : 0;
 				if (code === 38) style.token = undefined;
@@ -174,12 +161,10 @@ function applySgr(params: string, style: Style): void {
 	}
 }
 
-/** Whether a span list carries any styling. */
 export function hasStyle(spans: readonly TspSpan[]): boolean {
 	return spans.some((s) => s.s !== undefined);
 }
 
-/** Plain text of spans. */
 export function spansText(spans: readonly TspSpan[]): string {
 	return spans.map((s) => s.t).join("");
 }

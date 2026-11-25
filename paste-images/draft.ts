@@ -1,7 +1,3 @@
-/**
- * The prompt draft's pasted images: `[Image #N]` → file, the tokenising
- * rewrite of the editor text, and what a submitted prompt attaches.
- */
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { getImageDimensions } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
@@ -18,26 +14,22 @@ import {
 
 export interface DraftImage {
 	readonly n: number;
-	/** Absolute path of the file. */
 	readonly path: string;
-	/** The text the token replaced (quotes included); put back when the image isn't attached. */
 	readonly source: string;
 	readonly name: string;
 	mime: string;
 	size: number;
-	/** File contents (kept while the entry exists, so a later-deleted upload still sends). */
 	bytes?: Buffer;
-	/** Base64 of `bytes`, computed on first use. */
 	data?: string;
-	/** Pixel size from the header; null when unreadable. */
+	/**
+	 * Dimensions are in pixels.
+	 */
 	dims?: { readonly width: number; readonly height: number } | null;
-	/** The file couldn't be read the last time we tried. */
 	missing?: boolean;
 }
 
 export interface Rewrite {
 	readonly text: string;
-	/** Cursor offset mapped into `text` (undefined when none was given). */
 	readonly cursor: number | undefined;
 	readonly added: readonly DraftImage[];
 }
@@ -45,15 +37,11 @@ export interface Rewrite {
 export interface SubmitPlan {
 	readonly text: string;
 	readonly images: ImageContent[];
-	/** Entries attached as image content, in the order of `images`. */
 	readonly attached: readonly DraftImage[];
-	/** Entries whose file couldn't be read: their path text was put back. */
 	readonly missing: readonly DraftImage[];
-	/** Entries not attached because the model has no image input: their path text was put back. */
 	readonly withheld: readonly DraftImage[];
 }
 
-/** Pre-rewrite texts remembered so an undo of our rewrite isn't redone. */
 const MAX_UNDONE = 32;
 
 export function base64Of(entry: DraftImage): string | undefined {
@@ -74,19 +62,11 @@ function adopt(entry: DraftImage, file: ImageFile): void {
 }
 
 export class Draft {
-	/** The editor text as last observed (after any rewrite of ours). */
 	snapshot = "";
-	/** Entries whose token is in the editor text, in text order. A new array whenever the set changes. */
 	shown: readonly DraftImage[] = [];
 	readonly #entries = new Map<number, DraftImage>();
 	readonly #undone = new Set<string>();
 
-	/**
-	 * Replace image paths that arrived whole between `prev` and `next` (a
-	 * paste, drop or insertion; not typing) with `[Image #N]` tokens. Null
-	 * when there is nothing to do, including when `next` is a text we
-	 * rewrote before (the user undid our rewrite: leave it).
-	 */
 	tokenise(prev: string, next: string, cursor?: number): Rewrite | null {
 		if (this.#undone.has(next)) return null;
 		const region = changedRegion(prev, next);
@@ -121,7 +101,6 @@ export class Draft {
 		return { text: out, cursor: mapped, added };
 	}
 
-	/** Recompute {@link shown} for `text`; true when it changed. */
 	updateShown(text: string): boolean {
 		const next: DraftImage[] = [];
 		if (this.#entries.size > 0) {
@@ -140,8 +119,8 @@ export class Draft {
 		return true;
 	}
 
-	/** (Re)read an entry's file; false (and `missing`) when it can't be read. */
 	load(entry: DraftImage): boolean {
+		// The uploaded file can disappear before submission.
 		if (entry.bytes) return true;
 		const file = readImage(entry.path);
 		if (!file) {
@@ -152,16 +131,9 @@ export class Draft {
 		return true;
 	}
 
-	/**
-	 * What a submitted prompt sends: every `[Image #N]` of this draft becomes
-	 * image content (its marker stays in the text); paths that arrived since
-	 * `prev` (the last observed editor text) and were never tokenised are
-	 * tokenised first. Without image input (`vision` false), or when a file
-	 * can't be read, the original path text goes back in place of the token.
-	 * Null when the text references no draft image.
-	 */
 	prepareSubmit(text: string, options: { vision: boolean; prev?: string }): SubmitPlan | null {
 		let current = text;
+		// Submission can arrive before the editor poll sees a paste.
 		if (options.prev !== undefined) {
 			const rewrite = this.tokenise(options.prev, current);
 			if (rewrite) current = rewrite.text;
@@ -208,13 +180,8 @@ export class Draft {
 		return { text: out, images, attached: [...attached.values()], missing, withheld };
 	}
 
-	/**
-	 * After a submit: forget the entries whose token isn't in `text` (the
-	 * editor's text now, normally empty), so numbering starts over at 1. An
-	 * entry a new draft already uses survives (a prompt queued during
-	 * compaction is resolved later, after the next draft began).
-	 */
 	prune(text: string): void {
+		// A prompt queued during compaction can resolve after the next draft starts.
 		const keep = new Set(findTokens(text).map((t) => t.n));
 		for (const n of [...this.#entries.keys()]) if (!keep.has(n)) this.#entries.delete(n);
 		this.#undone.clear();
@@ -222,7 +189,6 @@ export class Draft {
 		this.updateShown(text);
 	}
 
-	/** Forget everything (session start/shutdown). */
 	reset(): void {
 		this.#entries.clear();
 		this.#undone.clear();
@@ -230,14 +196,10 @@ export class Draft {
 		this.snapshot = "";
 	}
 
-	/**
-	 * One past the highest number in use: by a token in the text, or by an
-	 * entry of this draft (a deleted token can come back through undo, and a
-	 * queued prompt may still reference it until it is submitted).
-	 */
 	#nextNumber(text: string): number {
 		let max = 0;
 		for (const t of findTokens(text)) if (t.n > max) max = t.n;
+		// Queued prompts and undo can still reference deleted tokens.
 		for (const n of this.#entries.keys()) if (n > max) max = n;
 		return max + 1;
 	}

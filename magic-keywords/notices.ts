@@ -1,12 +1,5 @@
-/**
- * Hidden notices appended to the turn when a magic keyword is used.
- * Adapted from oh-my-pi's prompts/system/orchestrate-notice.md, rendered
- * against the tools this session actually exposes.
- */
-
 const code = (name: string) => `\`${name}\``;
 
-/** The subagent dispatch tool: oh-my-pi calls it `task`, our port `subagent`. */
 function dispatchTool(tools: readonly string[]): string | undefined {
 	return ["task", "subagent"].find((t) => tools.includes(t));
 }
@@ -20,7 +13,6 @@ export function orchestrateNotice(tools: readonly string[]): string | undefined 
 	const editTools = ["edit", "write"].filter(has).map(code).join("/");
 	const verifyParts = [has("bash") && "project checks, tests", has("lsp") && "`lsp diagnostics`"].filter(Boolean);
 	const verify = verifyParts.join(", ");
-	// Per-phase gate is targeted; the full gates are rerun in workflow step 7.
 	const phaseVerify = [has("bash") && "project checks, targeted tests", has("lsp") && "`lsp diagnostics` on changed files"]
 		.filter(Boolean)
 		.join(", ");

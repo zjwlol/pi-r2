@@ -1,20 +1,3 @@
-/**
- * pi's selectors and dialogs as omp's native sheets (oh-my-pi overlays/model-picker.ts, oauth-selector.ts,
- * thinking-selector.ts, theme-selector.ts, hook-selector.ts, hook-input.ts, hook-editor.ts, login-dialog.ts,
- * native/picker.ts).
- *
- * Pickers: /model, /scoped-models, /thinking, the theme and show-images submenus, /login and /logout's provider
- * list, /trust, and an extension's `select`/`confirm` describe as a ROOT `picker` node; session.ts hoists a dock
- * component whose description root is a `picker`, `prefs` or `overlay` into `layer` as a modal sheet. The picker's
- * search field is the component's own `Input`, sent as `query`/`cursor`: keys stay pi's (the terminal holds no
- * focus while a sheet is up). Pointer events arrive as `select` (move the selection), `activate` (the confirm path)
- * and `action` (`close`, `clear`, the action bar's ids); confirm and cancel feed the bound key to the component's
- * own `handleInput`, so every side effect pi runs on Enter/Esc runs on a click too.
- *
- * Dialogs: an extension's `input`/`editor` are omp's docked panels in the composer's place (`omp.overlay.hook-input`,
- * `omp.overlay.hook-editor`) holding pi's own Input/Editor (described by their own describers); the login flow is
- * omp's `omp.overlay.login` modal sheet, hoisted like a picker.
- */
 import {
 	BorderedLoader,
 	ExtensionEditorComponent,
@@ -34,7 +17,6 @@ import { col, type NativeChild, type NativeNode, type NativeUiEvent, node, row, 
 import { lineToSpans, spansThemeId } from "./spans.ts";
 import type { TspProps, TspSpan, TspText, TspTone } from "./wire.ts";
 
-/** Loose view of private component state. */
 type Any = Record<string, any>;
 
 function is(component: Component, ctor: Function | undefined, name: string): boolean {
@@ -57,8 +39,6 @@ function textOf(c: unknown): string {
 function isText(c: Component): boolean {
 	return is(c, undefined, "Text") || is(c, undefined, "TruncatedText");
 }
-
-// ── Picker wire shapes (omp `TspPickerProps`) ───────────────────────────
 
 interface PickerMark {
 	text: string;
@@ -136,7 +116,6 @@ function picker(p: PickerProps, preview?: readonly NativeChild[]): NativeNode {
 	return node("picker", p as unknown as TspProps, preview);
 }
 
-/** Keycap names for a key id (`"alt+enter"` → `["alt", "enter"]`, `"escape"` → `["esc"]`). */
 function keyCaps(key: string): string[] {
 	if (key === "+") return ["+"];
 	const parts = key.endsWith("++") ? [...key.slice(0, -2).split("+"), "+"] : key.split("+");
@@ -144,20 +123,17 @@ function keyCaps(key: string): string[] {
 }
 
 /**
- * The primary key bound to `binding`, else `fallback` (pi's default). A bundled pi keeps its own keybindings
- * manager; ours then knows only pi-tui's ids, so app ids fall back to their defaults.
+ * Bundled pi keeps a separate keybindings manager.
  */
 function boundKey(binding: string, fallback?: string): string | undefined {
 	try {
 		const keys = (getKeybindings() as unknown as { getKeys(id: string): string[] }).getKeys(binding);
 		if (Array.isArray(keys) && typeof keys[0] === "string" && keys[0] !== "") return keys[0];
 	} catch {
-		// no keybindings manager
 	}
 	return fallback;
 }
 
-/** How pi spells a key in its hints (`ctrl+s` → `Ctrl+S`). */
 function keyLabel(key: string): string {
 	return key
 		.split("+")
@@ -170,12 +146,13 @@ function pickerAction(id: string, label: string, key?: string, opts?: Omit<Picke
 	return { id, label, ...(caps.length > 0 ? { keys: caps } : {}), ...opts };
 }
 
-/** The right-aligned `Close esc` every picker ends with; rsttyd's backdrop and head `esc` send it too. */
+/**
+ * The terminal uses this action for backdrop and header close clicks.
+ */
 const CLOSE_ACTION: PickerAction = { id: "close", label: "Close", keys: ["esc"], end: true };
 
 type PickerEvent = { readonly kind: "select" | "activate"; readonly item: string } | { readonly kind: "action"; readonly act: string; readonly value: string | undefined };
 
-/** omp's `pickerEvent`: the pointer event for the picker at keypath `key` ("" = the component's root). */
 function pickerEvent(event: NativeUiEvent, key = ""): PickerEvent | undefined {
 	if (event.key.replaceAll("^", "") !== key) return undefined;
 	switch (event.type) {
@@ -189,7 +166,6 @@ function pickerEvent(event: NativeUiEvent, key = ""): PickerEvent | undefined {
 	}
 }
 
-/** omp's `pickerFuzzyHits`: each query token's first substring, else its characters in order. */
 function fuzzyHits(label: string, query: string): [number, number][] | undefined {
 	const tokens = query
 		.toLowerCase()
@@ -232,14 +208,12 @@ function hitsFor(ids: readonly string[], labels: (id: string) => string, query: 
 	return out;
 }
 
-/** A search Input's text and caret. */
 function inputState(input: Any | undefined): { value: string; cursor: number } {
 	const value = typeof input?.getValue === "function" ? String(input.getValue()) : String(input?.value ?? "");
 	const raw = Number(input?.cursor);
 	return { value, cursor: Number.isFinite(raw) ? Math.max(0, Math.min(value.length, raw)) : value.length };
 }
 
-/** omp's `providerMark`: the terminal's logo for a provider, else its initials on its own gradient. */
 function providerMark(providerId: string): PickerMark {
 	const words = providerId.split(/[-_\s.]+/).filter((word) => word.length > 0);
 	const word = words[0] ?? providerId;
@@ -256,8 +230,6 @@ function initialsMark(name: string, seed: string): PickerMark {
 		.join("");
 	return { text: initials || name.slice(0, 2) || "?", seed };
 }
-
-// ── Keys fed to the component (its own Enter/Esc paths) ─────────────────
 
 const NAMED_KEYS: Readonly<Record<string, string>> = {
 	enter: "\r",
@@ -278,7 +250,9 @@ const NAMED_KEYS: Readonly<Record<string, string>> = {
 };
 const ARROW_FINAL: Readonly<Record<string, string>> = { up: "A", down: "B", right: "C", left: "D" };
 
-/** The legacy bytes of a key id (pi-tui's `matchesKey` accepts them with or without the kitty protocol). */
+/**
+ * Pi accepts legacy key bytes even in extended keyboard mode.
+ */
 function keyBytes(key: string): string | undefined {
 	const parts = key.toLowerCase().split("+");
 	const base = parts.pop() ?? "";
@@ -296,7 +270,6 @@ function keyBytes(key: string): string | undefined {
 	return undefined;
 }
 
-/** Run what pressing `binding` runs: its key goes through `target.handleInput`. */
 function press(target: Any | undefined, binding: string, fallback: string): boolean {
 	if (!target || typeof target.handleInput !== "function") return false;
 	const key = boundKey(binding, fallback) ?? fallback;
@@ -306,9 +279,6 @@ function press(target: Any | undefined, binding: string, fallback: string): bool
 	return true;
 }
 
-// ── Dialog chrome (omp native/overlay.ts) ───────────────────────────────
-
-/** omp's `actionButton`: a label plus its keycap; a click sends `act` as an `action` event. */
 function button(label: string, act: string, opts: { key?: string | undefined; tone?: "accent" | "error"; title?: string; href?: string } = {}): NativeNode {
 	const caps = opts.key ? keyCaps(opts.key) : [];
 	const children: NativeChild[] = [text(label, undefined, "label")];
@@ -325,7 +295,6 @@ function button(label: string, act: string, opts: { key?: string | undefined; to
 	return node("row", p, children, act);
 }
 
-/** omp's `actionBar`: `null` entries become the spacer that end-aligns what follows. */
 function actionBar(buttons: readonly (NativeNode | null)[], key = "actions"): NativeNode {
 	return node(
 		"row",
@@ -335,7 +304,6 @@ function actionBar(buttons: readonly (NativeNode | null)[], key = "actions"): Na
 	);
 }
 
-/** A pi-styled line as a text node (theme colours → span tokens). */
 function styledText(raw: string, p: TspProps, key: string): NativeNode {
 	const lines = raw.replaceAll("\x1b_pi:c\x07", "").split("\n");
 	if (lines.length === 1) return text(lineToSpans(lines[0]!), p, key);
@@ -346,7 +314,6 @@ function styledText(raw: string, p: TspProps, key: string): NativeNode {
 	);
 }
 
-/** The plain texts of the `Text` children between `from` (exclusive) and `to` (exclusive; undefined: the end). */
 function textsBetween(children: readonly Component[], from: unknown, to: unknown): string[] {
 	const start = from === undefined ? 0 : children.indexOf(from as Component) + 1;
 	let end = to === undefined ? children.length : children.indexOf(to as Component);
@@ -361,10 +328,14 @@ function textsBetween(children: readonly Component[], from: unknown, to: unknown
 	return out;
 }
 
-/** Deadlines of pi's countdowns (it keeps only the seconds left), first seen. */
+/**
+ * Pi exposes remaining seconds rather than a deadline.
+ */
 const deadlines = new WeakMap<object, { seconds: number; at: number }>();
 
-/** A live countdown as omp's `elapsed` (negative age = time left); undefined without a running timer. */
+/**
+ * A negative age counts down in milliseconds.
+ */
 function countdownNode(countdown: Any | undefined): NativeNode | undefined {
 	if (!countdown || countdown.intervalId === undefined) return undefined;
 	const seconds = Number(countdown.remainingSeconds);
@@ -377,7 +348,6 @@ function countdownNode(countdown: Any | undefined): NativeNode | undefined {
 	return node("elapsed", { age: Math.min(0, Date.now() - seen.at), format: "short" }, undefined, "countdown");
 }
 
-/** The deadline a countdown node counts to (its identity for memos). */
 function countdownKey(countdown: Any | undefined): number | undefined {
 	if (!countdown || countdown.intervalId === undefined) return undefined;
 	const seconds = Number(countdown.remainingSeconds);
@@ -386,20 +356,15 @@ function countdownKey(countdown: Any | undefined): number | undefined {
 	return seen.at;
 }
 
-// ── Ages (remember-model's recency tags) ────────────────────────────────
-
-/** remember-model's cache of each selector's recents (`modelKey` → lastUsed ms). */
 const RECENT = Symbol.for("pi-extended.remember-model.recent");
 
 const modelKey = (provider: string, id: string) => `${provider}\0${id}`;
 
-/** The recents remember-model cached on this selector (refreshed whenever it sorts the models). */
 function recentOf(a: object): Map<string, number> | undefined {
 	const value = (a as Record<PropertyKey, unknown>)[RECENT];
 	return value instanceof Map ? (value as Map<string, number>) : undefined;
 }
 
-/** remember-model's `timeAgo`. */
 function timeAgo(ms: number): string {
 	const s = Math.max(0, Math.round(ms / 1000));
 	if (s < 60) return "just now";
@@ -412,12 +377,9 @@ function timeAgo(ms: number): string {
 	return `${Math.round(d / 30)}mo ago`;
 }
 
-/** Ages only change by the minute: the memo keys on this. */
 function minute(): number {
 	return Math.floor(Date.now() / 60_000);
 }
-
-// ── /model ──────────────────────────────────────────────────────────────
 
 interface ModelRow {
 	provider: string;
@@ -470,7 +432,6 @@ function modelItem(a: Any, row: ModelRow, recent: Map<string, number> | undefine
 	const last = current ? undefined : recent?.get(modelKey(row.provider, row.id));
 	const detail: TspSpan[] = [];
 	if (name) detail.push(span(last !== undefined ? `${name} ` : name));
-	// remember-model's tag, as its ANSI rows show it.
 	if (last !== undefined) detail.push(span(`· ${timeAgo(now - last)}`, "accent"));
 	const isDefault = a.defaultModel?.provider === row.provider && a.defaultModel?.id === row.id;
 	const id = rowId(row);
@@ -488,7 +449,6 @@ function modelItem(a: Any, row: ModelRow, recent: Map<string, number> | undefine
 
 const modelCatalogues = new WeakMap<Component, { models: unknown; recent: unknown; minute: number; current: unknown; def: unknown; items: PickerItem[] }>();
 
-/** The whole scope as picker rows (built once per catalogue; filtering only changes `order`). */
 function modelCatalogue(c: Component, a: Any): PickerItem[] {
 	const models: ModelRow[] = Array.isArray(a.activeModels) ? a.activeModels : [];
 	const recent = recentOf(a);
@@ -501,7 +461,6 @@ function modelCatalogue(c: Component, a: Any): PickerItem[] {
 	return items;
 }
 
-/** The filtered rows in pi's order; the leading current+recent block (remember-model's MRU order) under "Recent". */
 function modelOrder(a: Any, filtered: readonly ModelRow[], query: string): (string | PickerGroup)[] {
 	const ids = filtered.map(rowId);
 	const recent = recentOf(a);
@@ -516,7 +475,6 @@ function modelOrder(a: Any, filtered: readonly ModelRow[], query: string): (stri
 	return [{ group: "recent", label: "Recent", count: split }, ...ids.slice(0, split), { group: "all", label: "All models", count: filtered.length - split }, ...ids.slice(split)];
 }
 
-/** The selected model's facts under the list, then the selector's status lines. */
 function modelPreview(a: Any, row: ModelRow | undefined): NativeChild[] {
 	const out: NativeChild[] = [];
 	if (row) {
@@ -665,8 +623,6 @@ const modelSelector: Describer = {
 	},
 };
 
-// ── /scoped-models ──────────────────────────────────────────────────────
-
 interface ScopedRow {
 	fullId: string;
 	model: Any | undefined;
@@ -785,15 +741,13 @@ const scopedModels: Describer = {
 				return;
 			case "close":
 			case "cancel":
-				// Esc cancels even with a search (Ctrl+C would clear it first).
+				// Ctrl+C clears the search instead of closing the picker.
 				if (typeof a.handleInput === "function") a.handleInput("\x1b");
 				else a.callbacks?.onCancel?.();
 				return;
 		}
 	},
 };
-
-// ── SelectList sheets (thinking level, theme, show images) ──────────────
 
 interface SelectItem {
 	value: string;
@@ -810,7 +764,6 @@ function listSelected(list: Any | undefined): SelectItem | undefined {
 	return items[Number(list?.selectedIndex) || 0];
 }
 
-/** omp's `routeSelectListPicker`: a row click selects (and previews), a second click or Select confirms, Close cancels. */
 function routeSelectList(list: Any | undefined, event: NativeUiEvent, onClear?: () => void): void {
 	const ev = pickerEvent(event);
 	if (!ev || !list) return;
@@ -888,7 +841,7 @@ const thinkingSelector: Describer = {
 			size: "md",
 			layout: "rows",
 			preview: "none",
-			// The field shows once typing filters (omp's hook selector); the keys always reach pi's search.
+			// Pi receives search keys even with no field shown.
 			...(input.value ? { query: input.value, cursor: input.cursor } : { query: null }),
 			columns: [{ id: "depth", format: "bar", priority: 1 }],
 			items,
@@ -917,7 +870,9 @@ const thinkingSelector: Describer = {
 	},
 };
 
-/** The selection a list was opened with (pi keeps the current value only as the preselection). */
+/**
+ * Pi exposes the current image mode only as the initial selection.
+ */
 const openedWith = new WeakMap<object, string | undefined>();
 
 function selectListSheet(name: string, ctor: Function | undefined, ctorName: string, options: { title: string; icon: string; noun: string; details?: boolean; current: (a: Any, list: Any) => string | undefined; decorate?: (item: SelectItem) => Partial<PickerItem> }): Describer {
@@ -972,7 +927,6 @@ const themeSelector = selectListSheet("ThemeSelector", ThemeSelectorComponent, "
 	icon: "ink",
 	noun: "themes",
 	current: (_a, list) => (Array.isArray(list.items) ? (list.items as SelectItem[]).find((item) => item.description === "(current)")?.value : undefined),
-	// The check marks the current theme; its "(current)" text stays in the terminal list.
 	details: false,
 	decorate: (item) => ({ mark: { text: item.value.slice(0, 2), seed: item.value } }),
 });
@@ -984,14 +938,11 @@ const showImagesSelector = selectListSheet("ShowImagesSelector", ShowImagesSelec
 	current: (_a, list) => openedWith.get(list),
 });
 
-// ── /login, /logout provider list ───────────────────────────────────────
-
 function authTypeLabel(authType: unknown, subscription: unknown): string {
 	if (authType === "api_key") return "API key";
 	return subscription === false ? "account" : "subscription";
 }
 
-/** pi's `formatAuthSelectorProviderStatus`, as a detail and a dot. */
 function authStatus(p: Any): { text: string; style: string; dot: TspTone } {
 	const status: Any | undefined = p.status;
 	if (!status) return { text: "Not configured", style: "muted", dot: "muted" };
@@ -1093,8 +1044,6 @@ const oauthSelector: Describer = {
 	},
 };
 
-// ── /trust ──────────────────────────────────────────────────────────────
-
 const trustSelector: Describer = {
 	name: "TrustSelector",
 	matches: (c) => is(c, undefined, "TrustSelectorComponent"),
@@ -1107,7 +1056,6 @@ const trustSelector: Describer = {
 		const a = c as Any;
 		const options: Any[] = Array.isArray(a.trustOptions) ? a.trustOptions : [];
 		const texts = textsBetween((a.children ?? []) as Component[], undefined, a.listContainer);
-		// The first text is the title; the cwd and the decisions follow.
 		const [title = "Project trust", ...facts] = texts;
 		const current = options.findIndex((o) => {
 			try {
@@ -1147,8 +1095,6 @@ const trustSelector: Describer = {
 		else if (ev.act === "close" || ev.act === "cancel") press(a, "tui.select.cancel", "escape");
 	},
 };
-
-// ── ctx.ui.select / ctx.ui.confirm (and the /login menus) ───────────────
 
 const extensionSelector: Describer = {
 	name: "ExtensionSelector",
@@ -1202,8 +1148,6 @@ const extensionSelector: Describer = {
 	},
 };
 
-// ── ctx.ui.input: omp's hook-input panel in the composer's place ────────
-
 const extensionInput: Describer = {
 	name: "ExtensionInput",
 	matches: (c) => is(c, ExtensionInputComponent, "ExtensionInputComponent"),
@@ -1242,8 +1186,6 @@ const extensionInput: Describer = {
 	},
 };
 
-// ── ctx.ui.editor: omp's hook-editor panel ──────────────────────────────
-
 const extensionEditor: Describer = {
 	name: "ExtensionEditor",
 	matches: (c) => is(c, ExtensionEditorComponent, "ExtensionEditorComponent"),
@@ -1255,7 +1197,6 @@ const extensionEditor: Describer = {
 	build: (c) => {
 		const a = c as Any;
 		if (!a.editor) return null;
-		// The title, then the description, sit above the editor.
 		const [title = "", ...details] = textsBetween((a.children ?? []) as Component[], undefined, a.editor);
 		const [titleLine = "", ...rest] = title.split(/\r?\n/);
 		const detail = [...rest, ...details].join("\n").trim();
@@ -1281,7 +1222,7 @@ const extensionEditor: Describer = {
 		const a = c as Any;
 		switch (event.act) {
 			case "submit":
-				// pi-tui's submit path (paste markers expanded, the draft cleared, onSubmit).
+				// Pi expands paste markers on editor submit.
 				if (typeof a.editor?.submitValue === "function") a.editor.submitValue();
 				else a.onSubmitCallback?.(a.editor?.getText?.() ?? "");
 				return;
@@ -1296,15 +1237,15 @@ const extensionEditor: Describer = {
 	},
 };
 
-// ── /login dialog: omp's login sheet ────────────────────────────────────
-
 const HINT_RE = /^\(.*\bto (cancel|close|submit)\b.*\)$/i;
 const CLICK_RE = /^(cmd|ctrl)\+click to open$/i;
 const URL_RE = /^https?:\/\/\S+$/;
 const CODE_RE = /^Enter code:\s*(\S+)$/;
 const ELLIPSIS_RE = /(\.\.\.|…)$/;
 
-/** The device code, large in a well; a click copies it (terminal-local, `href`). */
+/**
+ * The terminal copies the code from `href`.
+ */
 function codeWell(code: string, key: string): NativeNode {
 	return node(
 		"row",
@@ -1314,7 +1255,6 @@ function codeWell(code: string, key: string): NativeNode {
 	);
 }
 
-/** A link as omp's read-only field: the URL (middle-truncated; a click opens it) and Copy. */
 function linkField(url: string, key: string): NativeNode {
 	return node(
 		"row",
@@ -1347,7 +1287,7 @@ function loginParts(a: Any): { body: NativeChild[]; close: boolean; field: boole
 			if (t && !HINT_RE.test(t) && !CLICK_RE.test(t)) lastText = i;
 		} else if (!is(child, undefined, "Spacer")) lastText = -1;
 	}
-	// A prompt's question (and its `e.g.` line) are the texts since the spacer before its field: they label it.
+	// Pi puts prompt text directly before its input.
 	const labels = new Map<number, number[]>();
 	const labelled = new Set<number>();
 	for (let i = 0; i < kids.length; i++) {
@@ -1374,7 +1314,6 @@ function loginParts(a: Any): { body: NativeChild[]; close: boolean; field: boole
 		}
 		if (is(child, undefined, "Spacer")) continue;
 		if (!isText(child)) {
-			// AuthUrlComponent and anything else describe themselves.
 			body.push(child);
 			continue;
 		}
@@ -1401,7 +1340,6 @@ function loginParts(a: Any): { body: NativeChild[]; close: boolean; field: boole
 			continue;
 		}
 		if (ELLIPSIS_RE.test(t)) {
-			// A stage message: the latest one runs, earlier ones are done.
 			body.push(
 				i === lastText
 					? row([node("spinner", { style: "orbit", label: t, tone: "muted" })], { role: "omp.login.waiting", gap: "sm", align: "center" }, `p${i}`)
@@ -1457,7 +1395,6 @@ const loginDialog: Describer = {
 	},
 };
 
-/** A sign-in URL (pi's AuthUrlComponent): omp's link field; Copy copies in the terminal. */
 const authUrl: Describer = {
 	name: "AuthUrl",
 	matches: (c) => is(c, undefined, "AuthUrlComponent"),
@@ -1471,8 +1408,6 @@ const authUrl: Describer = {
 		if (event.type === "action" && event.act === "copy") void (c as Any).copy?.();
 	},
 };
-
-// ── Bordered loader (extension and share flows) ─────────────────────────
 
 const borderedLoader: Describer = {
 	name: "BorderedLoader",
@@ -1491,7 +1426,6 @@ const borderedLoader: Describer = {
 	},
 };
 
-/** Registered after the transcript's and block describers (describers.ts DESCRIBERS). */
 export const PICKER_DESCRIBERS: readonly Describer[] = [
 	modelSelector,
 	scopedModels,

@@ -1,26 +1,8 @@
-/**
- * Tern Surface Protocol (TSP) wire shapes, ported from oh-my-pi
- * `packages/wire/src/tsp.ts` (trimmed to what this extension sends and reads;
- * unknown fields and verbs are ignored in both directions).
- *
- * Messages travel in-band as APC strings on the pty:
- *
- *     ESC _ tsp ; <verb> [; <key>=<value>]* ; <body> ESC \
- *
- * Program → terminal verbs: `q` query, `o` open, `f` frame, `b` blob, `x`
- * close. Terminal → program: `r` reply, `e` event.
- *
- * `t` (theme palette) is a local extension, not upstream protocol: omp removed
- * the verb in 1513e856d5. rsttyd still applies it and says so with the hello
- * feature `program-palette`; the backend sends it to such a terminal only.
- */
-
 export const TSP_VERSION = 1;
 export const TSP_APC_ID = "tsp";
 export const TSP_DEFAULT_APC_LIMIT = 65_536;
 export const TSP_DEFAULT_CREDITS = 2;
 
-/** `t` is the local palette extension (see the file header); the rest is omp's protocol. */
 export type TspVerb = "q" | "o" | "f" | "b" | "t" | "x" | "r" | "e";
 
 export const TSP_KINDS = [
@@ -87,16 +69,16 @@ export interface TspSpan {
 export type TspText = string | readonly TspSpan[];
 export type TspCardStatus = "pending" | "running" | "done" | "error" | "cancelled";
 export type TspPreview = { lines: number } | "auto";
-/** A `tool` node's body clamp while collapsed: head lines, tail lines (shell output), none, or the children's own previews. */
+/**
+ * The terminal interprets `tail` as a line count.
+ */
 export type TspToolPreview = { lines: number } | { tail: number } | "none" | "children";
 
 /**
- * One entry of `actions.menu` or `actions.hold`: an action name (labeled from it), `"-"` a separator, a dim
- * `{ header }`, or a row running action `id`, with its `label`, `icon` and `detail`.
+ * The terminal renders `"-"` as a menu separator.
  */
 export type TspMenuEntry = string | { header: string } | { id: string; label?: string; icon?: string; detail?: string; disabled?: boolean | string; danger?: boolean };
 
-/** Props every node accepts, plus the kind-specific ones this extension uses (loosely typed). */
 export interface TspProps {
 	role?: string;
 	key?: string;
@@ -106,14 +88,14 @@ export interface TspProps {
 	title?: string;
 	aria?: string;
 	href?: string;
-	/** What a pointer does: `menu` is the right-click menu, `hold` the long-press menu on a touch screen (a desktop ignores it). */
+	/**
+	 * The terminal opens `hold` on a touch long press and `menu` on a right click.
+	 */
 	actions?: { click?: string; dblclick?: string; menu?: readonly TspMenuEntry[]; hold?: readonly TspMenuEntry[] };
-	// col/row
 	gap?: TspSpace;
 	align?: string;
 	justify?: string;
 	wrap?: boolean | "word" | "char" | "none";
-	// card/section/overlay
 	head?: TspText;
 	status?: TspCardStatus;
 	collapsible?: boolean;
@@ -122,7 +104,6 @@ export interface TspProps {
 	anchor?: "center" | "top" | "bottom" | { node: string; side: "above" | "below" } | { caret: string };
 	size?: string;
 	modal?: boolean;
-	// text-like
 	text?: string;
 	spans?: readonly TspSpan[];
 	stream?: boolean;
@@ -134,13 +115,11 @@ export interface TspProps {
 	follow?: boolean;
 	cols?: number;
 	lines?: readonly string[] | number;
-	// spinner/shimmer/elapsed
 	style?: string;
 	label?: TspText;
 	age?: number;
 	stopped?: number;
 	format?: string;
-	// editor
 	cursor?: number;
 	anchorOffset?: never;
 	decor?: readonly TspEditorDecoration[];
@@ -151,14 +130,11 @@ export interface TspProps {
 	readonly?: boolean;
 	sendable?: boolean;
 	maxLines?: number;
-	// status/seg
 	transparent?: boolean;
 	icon?: string;
 	priority?: number;
 	side?: "left" | "right";
-	// badge/kbd
 	keys?: readonly string[];
-	// misc passthrough
 	[extra: string]: unknown;
 }
 
@@ -169,10 +145,8 @@ export interface TspEditorDecoration {
 	fx?: TspEffect;
 }
 
-/** Kinds whose primary text the `text` and `splice` ops address. */
 export const TSP_TEXT_KINDS = ["text", "md", "code", "ansi", "math", "editor", "input", "shimmer"] as const;
 
-/** A node on the wire. */
 export interface TspNode {
 	id: string;
 	k: TspKind;
@@ -215,7 +189,6 @@ export interface TspClose {
 	keep: boolean;
 }
 
-/** Body of the local `t` verb (sent only to a terminal with the `program-palette` feature; not in omp's protocol any more). */
 export interface TspPalette {
 	sf: string;
 	dark?: Readonly<Record<string, string>>;

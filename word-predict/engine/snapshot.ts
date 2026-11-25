@@ -1,27 +1,3 @@
-/**
- * Versioned binary snapshot of the learned model, byte-format-compatible with
- * upstream's `ngram.snapshot` v1.
- * Port of oh-my-pi `crates/pi-predict/src/ngram/snapshot.rs` (MIT).
- *
- * Layout: `"PINGRAM\0"`, `u32` version (little endian), then one zstd frame
- * (with content checksum) holding the payload below. Words are stored as
- * strings, so a snapshot survives changes to the web prior; the prefix trees
- * and hygiene flags are rebuilt on load, and every restored word lands in the
- * sorted base.
- *
- *   f64 total
- *   u32 words     { u16 len, utf8, f32 count, u32 raw }
- *   u32 contexts  { u32 word, u32 n, n × { u32 word, f32 count } }
- *   u32 pairs     { u32 u, u32 v, f32 total, u32 types }        (pair index = position)
- *   u32 trigrams  { u32 pair, u32 word, f32 count }
- *   u32 tailed    { u32 word, u32 n, n × { u16 len, utf8, f32 count } }
- *   u32 prompts   { u32 n, n × u32 word }                        (session cache, oldest first)
- *
- * Node's zstd neither reports a truncated frame nor verifies that the checksum
- * is present: a payload that decodes short fails in the reader below.
- *
- * Loaded by Node's type stripping (worker / CLI): erasable syntax only.
- */
 import { constants, zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { Model } from "./model.ts";
 import type { CaseTail, Params } from "./model.ts";
@@ -29,19 +5,15 @@ import { Followers, IdTable, NONE } from "./structures.ts";
 import type { WebPrior } from "./web.ts";
 
 const MAGIC = Buffer.from("PINGRAM\0", "latin1");
-/** Current snapshot format. */
 export const SNAPSHOT_VERSION = 1;
-/** Longest word a `u16` length can describe, in UTF-8 bytes. */
 const MAX_TEXT_BYTES = 0xffff;
 
-/** Little-endian payload writer over a growing buffer. */
 class Writer {
 	private buf: Buffer = Buffer.allocUnsafe(1 << 16);
 	private at = 0;
 
 	/**
-	 * Make room for `length` more bytes and return where they go. Call it
-	 * before reading `this.buf`: growing replaces the buffer.
+	 * Claim space before reading the buffer because it may be replaced.
 	 */
 	private claim(length: number): number {
 		const start = this.at;
@@ -83,10 +55,9 @@ class Writer {
 			this.buf.write(text, at, length, "utf8");
 			return;
 		}
-		// Words are capped far below this by the prose gates' line limit; cut
-		// at a character boundary like upstream.
 		const bytes = Buffer.from(text, "utf8");
 		length = MAX_TEXT_BYTES;
+		// Truncate only between UTF-8 code points.
 		while (length > 0 && (bytes[length] & 0xc0) === 0x80) length -= 1;
 		this.u16(length);
 		const at = this.claim(length);
@@ -98,7 +69,6 @@ class Writer {
 	}
 }
 
-/** Little-endian payload reader; every read is bounds-checked. */
 class Reader {
 	private readonly bytes: Buffer;
 	private at = 0;
@@ -108,7 +78,6 @@ class Reader {
 		this.bytes = bytes;
 	}
 
-	/** Advance over `length` bytes and return where they start. */
 	private take(length: number): number {
 		const start = this.at;
 		if (length > this.bytes.length - start) throw new Error("snapshot truncated");
@@ -128,7 +97,9 @@ class Reader {
 		return this.bytes.readUInt32LE(this.take(4));
 	}
 
-	/** A count of following records, bounded by the bytes left. */
+	/**
+	 * The minimum record size is in bytes.
+	 */
 	len(minRecord: number): number {
 		const n = this.u32();
 		if (n * minRecord > this.bytes.length - this.at) throw new Error("snapshot count out of range");
@@ -163,7 +134,6 @@ class Reader {
 		}
 	}
 
-	/** A word reference: an index into the snapshot's word list, mapped to its id. */
 	word(map: Uint32Array): number {
 		const at = this.u32();
 		if (at >= map.length) throw new Error("snapshot word index out of range");
@@ -171,7 +141,6 @@ class Reader {
 	}
 }
 
-/** Serialize `model`'s learned state (upstream `ngram.snapshot` v1 bytes). */
 export function encodeSnapshot(model: Model): Uint8Array {
 	const vocab = model.vocab;
 	const n = vocab.length;
@@ -271,10 +240,6 @@ export function encodeSnapshot(model: Model): Uint8Array {
 	return out;
 }
 
-/**
- * Restore a model from a snapshot. Throws on unknown magic/version or a
- * corrupt payload.
- */
 export function decodeSnapshot(bytes: Uint8Array, params: Params, web: WebPrior): Model {
 	const file = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	if (file.length < 12 || !file.subarray(0, 8).equals(MAGIC)) throw new Error("not an n-gram snapshot");
@@ -328,7 +293,6 @@ export function decodeSnapshot(bytes: Uint8Array, params: Params, web: WebPrior)
 			list.counts = weights;
 			for (let i = 0; i < length; i++) list.total += weights[i];
 		} else {
-			// Follower lists are sorted by id; ids changed with the vocabulary.
 			order.length = 0;
 			for (let i = 0; i < length; i++) order.push(i);
 			order.sort((a, b) => ids[a] - ids[b]);

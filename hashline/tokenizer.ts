@@ -1,12 +1,7 @@
-/**
- * hashline/tokenizer.ts: classify each row of a hashline patch.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/tokenizer.rs` (MIT).
- */
 import { describeAnchorExamples } from "./format.ts";
 import { ABORT_MARKER, BEGIN_PATCH_MARKER, END_PATCH_MARKER, jsonQuote } from "./messages.ts";
 import { HashlineError, type ParsedRange } from "./types.ts";
 
-/** Locator (and optional register) of one op header. */
 export type BlockTarget =
 	| { kind: "replace"; range: ParsedRange; register: string | undefined }
 	| { kind: "block"; line: number; register: string | undefined }
@@ -32,7 +27,6 @@ export type Token =
 
 const U32_MAX = 4294967295;
 
-/** A leading `[1-9][0-9]*` that fits u32: `[value, length]`. */
 function parseNumberPrefix(raw: string): [number, number] | undefined {
 	const m = /^[1-9][0-9]*/.exec(raw);
 	if (!m) return undefined;
@@ -41,7 +35,6 @@ function parseNumberPrefix(raw: string): [number, number] | undefined {
 	return [value, m[0].length];
 }
 
-/** `N`, `N.=M`, `N-M`, `N..M`, `N…M`, `N M`: `[range, consumed, hadSeparator]`. */
 function parseRange(raw: string): [ParsedRange, number, boolean] | undefined {
 	const leading = raw.length - raw.trimStart().length;
 	const first = parseNumberPrefix(raw.slice(leading));
@@ -72,7 +65,6 @@ function withRegister(target: BlockTarget, register: string): BlockTarget {
 	return { ...target, register };
 }
 
-/** Optional ` @name`, optional `:`, then nothing: `[target, hadColon]`. */
 function parseRegisterAndColon(raw: string, target: BlockTarget): [BlockTarget, boolean] | undefined {
 	let rest = raw.trimStart();
 	if (rest.startsWith("@")) {
@@ -131,7 +123,6 @@ function parseCutTarget(raw: string): [BlockTarget, boolean] | undefined {
 	return parseRegisterAndColon(tail, { kind: "cut", range, register: undefined });
 }
 
-/** The text after `keyword` when the keyword ends there (end of row, `:` or whitespace follows). */
 function keywordTail(line: string, keyword: string): string | undefined {
 	if (!line.startsWith(keyword)) return undefined;
 	const rest = line.slice(keyword.length);
@@ -145,7 +136,6 @@ function unquotePath(raw: string): string | undefined {
 	return raw.startsWith('"') || raw.startsWith("'") ? undefined : raw;
 }
 
-/** Parse an op header row (`PUT …`, `CUT …`, `REM`, `MV DEST`): `[target, hadColon]`. */
 export function parseHunkHeader(row: string): [BlockTarget, boolean] | undefined {
 	const line = row.trim();
 	let rest = keywordTail(line, "REM");
@@ -162,12 +152,10 @@ export function parseHunkHeader(row: string): [BlockTarget, boolean] | undefined
 	return undefined;
 }
 
-/** Whether `text` is a complete op header. */
 export function isHunkHeaderText(text: string): boolean {
 	return parseHunkHeader(text) !== undefined;
 }
 
-/** A header path that closes a bracket it never opened (`Foo] [bar.ts`). */
 export function headerPathHasOrphanBracket(path: string): boolean {
 	let depth = 0;
 	for (const ch of path) {
@@ -180,7 +168,6 @@ export function headerPathHasOrphanBracket(path: string): boolean {
 	return false;
 }
 
-/** Split a `[PATH]` / `[PATH#TAG]` row: `[path, TAG | undefined]`. */
 export function parseHeader(row: string): [string, string | undefined] | undefined {
 	const line = row.trimEnd();
 	if (line.length < 2 || !line.startsWith("[") || !line.endsWith("]")) return undefined;
@@ -196,7 +183,6 @@ export function parseHeader(row: string): [string, string | undefined] | undefin
 	return headerPathHasOrphanBracket(body) ? undefined : [body, undefined];
 }
 
-/** Classify one row (no line terminator). */
 export function classifyLine(line: string, lineNum: number): Token {
 	if (line === "") return { kind: "blank", lineNum };
 	const marker = line.trimEnd();
@@ -211,10 +197,6 @@ export function classifyLine(line: string, lineNum: number): Token {
 	return { kind: "raw", lineNum, text: line };
 }
 
-/**
- * Tokenize a whole text: rows are split on `\n`, a trailing `\r` is dropped from each, rows are numbered from 1,
- * and the text after the last `\n` is a row only when it is not empty.
- */
 export function tokenizeAll(text: string): Token[] {
 	const tokens: Token[] = [];
 	const parts = text.split("\n");
@@ -225,7 +207,6 @@ export function tokenizeAll(text: string): Token[] {
 	return tokens;
 }
 
-/** Parse a bare positive line number (diagnostics helper). */
 export function parseLid(raw: string, lineNum: number): number {
 	const value = raw.trim();
 	if (!/^[1-9][0-9]*$/.test(value) || Number(value) > U32_MAX) {

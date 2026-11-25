@@ -1,20 +1,3 @@
-/**
- * word-predict: replay CLI. Runs an oracle script (JSONL operations) through
- * the TypeScript engine and prints the oracle's output, one JSON line per
- * operation, so the port can be checked line by line against upstream's Rust
- * engine (a test oracle built from upstream's crate; see README.md,
- * "Conformance", for the formats).
- *
- * Port of the oracle driver `oracle/src/main.rs`, which drives oh-my-pi
- * `crates/pi-predict/src/ngram/mod.rs` (`NgramPredictor`: open / persist) (MIT).
- *
- *   node word-predict/engine/replay.ts <script.jsonl> [--state-dir DIR] [--show-threshold X|-inf]
- *                                      [--prior FILE] [--expect FILE] [--explain] [--bench]
- *   node word-predict/engine/replay.ts --info
- *
- * The engine state is the upstream-format file `DIR/ngram.snapshot` (not the
- * worker's `state.bin` container), so snapshots can be exchanged with the oracle.
- */
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,12 +7,9 @@ import { writeAtomic } from "./store.ts";
 import { decodeWebPrior, type WebPrior } from "./web.ts";
 
 const SNAPSHOT_FILE = "ngram.snapshot";
-/** §6.2: confidences may differ from the oracle's `f32` by at most this (absolute). */
 const CONFIDENCE_TOLERANCE = 1e-6;
-/** §6.2: more than this share of a set's completions not bit-equal as `f32` is a defect. */
 const INEXACT_LIMIT = 0.001;
 const MISMATCHES_SHOWN = 20;
-/** Operations executed before `--bench` starts sampling. */
 const BENCH_WARMUP_OPS = 2_000;
 const EXPLAIN_ROWS = 12;
 
@@ -57,7 +37,6 @@ interface Options {
 	info: boolean;
 }
 
-/** A row of the candidate table (`NgramEngine.explain`, optional debug hook). */
 interface CandidateRow {
 	word: string;
 	value: number;
@@ -69,14 +48,11 @@ interface CandidateRow {
 }
 type Explain = (before: string, prefix: string) => CandidateRow[];
 
-/** Thrown for anything the oracle reports as `ngram-oracle: …` with exit status 1. */
 class ReplayError extends Error {}
 
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
-
-// --- arguments ---
 
 function parseThreshold(text: string): number {
 	if (/^-inf(inity)?$/i.test(text)) return Number.NEGATIVE_INFINITY;
@@ -141,12 +117,6 @@ function parseArgs(argv: readonly string[]): Options {
 	return options;
 }
 
-// --- output format ---
-
-/**
- * Shortest decimal that parses back to exactly `value` as an `f32`, never in
- * exponent form: what Rust's `Display` prints for the oracle's confidences.
- */
 function formatF32(value: number): string {
 	const single = Math.fround(value);
 	if (!Number.isFinite(single)) throw new ReplayError(`engine returned a non-finite confidence ${value}`);
@@ -181,7 +151,6 @@ function completeLine(suggestion: { suffix: string; confidence: number } | null)
 
 function printInfo(): void {
 	const p = DEFAULT_PARAMS;
-	// The two `f32` params print as the oracle prints them.
 	const info = {
 		show_threshold: Number(formatF32(p.showThreshold)),
 		paste_weight: Number(formatF32(p.pasteWeight)),
@@ -209,8 +178,6 @@ function printInfo(): void {
 	process.stdout.write(`${JSON.stringify(info)}\n`);
 }
 
-// --- comparison (§6.2 pass criterion) ---
-
 type MismatchKind = "suffix" | "gate" | "confidence" | "shape" | "missing";
 
 interface Mismatch {
@@ -227,7 +194,6 @@ class Comparison {
 	completesMatched = 0;
 	others = 0;
 	othersMatched = 0;
-	/** Passing completions whose confidence is not bit-equal to the oracle's as `f32`. */
 	inexact = 0;
 	readonly kinds: Record<MismatchKind, number> = { suffix: 0, gate: 0, confidence: 0, shape: 0, missing: 0 };
 	readonly mismatches: Mismatch[] = [];
@@ -236,7 +202,6 @@ class Comparison {
 		this.expected = readLines(file);
 	}
 
-	/** Compare one output line; returns the mismatch, if any. */
 	check(
 		line: number,
 		op: Record<string, unknown>,
@@ -285,7 +250,6 @@ class Comparison {
 		return undefined;
 	}
 
-	/** Print the summary and the first mismatches; returns whether the run passes. */
 	report(scriptFile: string, expectFile: string, lines: number, out: string[]): boolean {
 		const mismatched = this.completes - this.completesMatched + (this.others - this.othersMatched);
 		const countsMatch = lines === this.expected.length;
@@ -320,7 +284,6 @@ class Comparison {
 	}
 }
 
-/** Lines of a JSONL file without their terminators (`\n` or `\r\n`), as Rust's `BufRead::lines`. */
 function readLines(file: string): string[] {
 	let text: string;
 	try {
@@ -340,7 +303,6 @@ function describeOp(op: Record<string, unknown>): string {
 	return `complete before=${JSON.stringify(tail)} (${before.length} units) prefix=${JSON.stringify(op.prefix)}`;
 }
 
-/** The port's candidate table for one query, best first, on stderr. */
 function explainMismatch(engine: NgramEngine, mismatch: Mismatch, before: string, prefix: string): void {
 	const explain = (engine as unknown as { explain?: Explain }).explain;
 	const head = `replay: line ${mismatch.line} [${mismatch.kind}] expected ${mismatch.expected} got ${mismatch.actual}\n`;
@@ -355,7 +317,7 @@ function explainMismatch(engine: NgramEngine, mismatch: Mismatch, before: string
 		process.stderr.write(`${head}  (candidate table failed: ${errorText(error)})\n`);
 		return;
 	}
-	// Stable: equal values keep the engine's enumeration order, which decides ties.
+	// Preserve candidate enumeration order when scores tie.
 	rows.sort((a, b) => b.value - a.value);
 	const number = (value: unknown): string => (typeof value === "number" ? String(value) : "-").padEnd(24);
 	const columns = ["value", "c2", "pw", "c3", "cache", "session"].map((name) => name.padEnd(24)).join("");
@@ -370,8 +332,6 @@ function explainMismatch(engine: NgramEngine, mismatch: Mismatch, before: string
 	}
 	process.stderr.write(text);
 }
-
-// --- bench (§6.5) ---
 
 class Samples {
 	private values: number[] = [];
@@ -393,8 +353,6 @@ class Samples {
 function megabytes(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
-
-// --- replay ---
 
 function stringField(op: Record<string, unknown>, name: string): string {
 	const value = op[name];
@@ -424,7 +382,6 @@ function replay(options: Options, script: string, out: string[]): boolean {
 	let tempDir: string | undefined;
 	const stateDir = options.stateDir ?? (tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "word-predict-replay-")));
 	const snapshotFile = path.join(stateDir, SNAPSHOT_FILE);
-	/** Upstream `NgramPredictor::open`: restore the snapshot when there is one, else start empty. */
 	const open = (): NgramEngine => {
 		let snapshot: Buffer | undefined;
 		try {
@@ -501,7 +458,6 @@ function replay(options: Options, script: string, out: string[]): boolean {
 						persist(engine);
 						break;
 					case "reopen":
-						// Persist, drop the old engine, then restore from the snapshot it wrote.
 						persist(engine);
 						engine = open();
 						break;
@@ -515,8 +471,6 @@ function replay(options: Options, script: string, out: string[]): boolean {
 					explainMismatch(engine, mismatch, String(fields.before), String(fields.prefix));
 				}
 			} catch (error) {
-				// As the oracle: output produced before the failing line is still printed.
-				// An engine exception keeps its stack: that is a port defect to locate.
 				const text = error instanceof ReplayError || !(error instanceof Error) ? errorText(error) : (error.stack ?? error.message);
 				failure = `line ${number}: ${text}`;
 				break;
@@ -569,9 +523,9 @@ function main(): void {
 		if (error instanceof ReplayError) failure = error.message;
 		else failure = error instanceof Error ? (error.stack ?? error.message) : String(error);
 	}
-	// No process.exit(): piped output must drain first.
 	if (out.length > 0) process.stdout.write(out.join(""));
 	if (failure !== undefined) process.stderr.write(`replay: ${failure}\n`);
+	// Let piped output drain before exiting.
 	process.exitCode = pass ? 0 : 1;
 }
 

@@ -1,42 +1,12 @@
-/**
- * Model-facing text, ported from oh-my-pi's prompts:
- *  - tools/task.md + tools/task-async-contract.md   -> buildTaskDescription (one `# Inputs` bullet list)
- *  - system/subagent-system-prompt.md               -> childSystemPrompt (anti-chatter peer rules;
- *    system/system-prompt.md "Hand-off"                 no builds/tests unless assigned; `⁂` section marker)
- *  - system/subagent-user-prompt.md                 -> childUserPrompt
- *  - tools/task-summary.md (+ result-summary.ts)    -> formatTaskResult (whole up to INLINE_OUTPUT_CHARS,
- *                                                      else a PREVIEW_CHARS head)
- *  - tools/task-follow-up.md                        -> followUpHint
- *  - tools/task-spawn-feedback.md                   -> formatSpawnFeedback (+ the `irc` lifecycle reference,
- *                                                      once per spawner, on the first spawn result)
- * Adapted to this extension: steering/messaging is the `irc` tool (no agent://, proc://, local://).
- * Structured output (`outputSchema` → `yield`, structured.ts) and worktree isolation (`isolated`,
- * isolation.ts) are wired up by features.ts. Nested spawning is depth-limited (hub MAX_DEPTH)
- * and gated by the agent's `spawns` frontmatter.
- *
- * Also home of the `task` tool's schema + argument repair (call shape, blank placeholders, top-level
- * per-item options, double-encoded prose: packages/tui tools/task-repair-args.ts), shared by the main
- * agent's tool (index.ts) and spawning children's tool (hub.ts) so the two never diverge.
- */
-
 import { Type } from "typebox";
 import { type AgentConfig, isReadOnlyAgent } from "./agents.ts";
 import { formatStructuredData, type JsonSchema, structuredCompletionPrompt } from "./structured.ts";
 
-/**
- * Largest output inlined whole: a cut output costs the parent an `irc` op "read" turn on top of the
- * preview it already holds (OMP: INLINE_OUTPUT_CHARS).
- */
 export const INLINE_OUTPUT_CHARS = 11_500;
-/** Head shown for an output over INLINE_OUTPUT_CHARS; the envelope then points at `irc` op "read" (OMP: PREVIEW_CHARS). */
 export const PREVIEW_CHARS = 5000;
 
 export const MAX_TASKS_PER_CALL = 16;
 
-// ---------------------------------------------------------------------------------------------
-// `task` tool schema (shared by the main agent and spawning children)
-
-/** Per-item fields; `prepareTaskArguments` copies these from a flat single-agent call. */
 export const TASK_ITEM_KEYS = ["name", "agent", "task", "model", "thinking", "cwd", "isolated", "outputSchema"] as const;
 
 export const ISOLATED_DESCRIPTION =
@@ -44,7 +14,6 @@ export const ISOLATED_DESCRIPTION =
 export const OUTPUT_SCHEMA_DESCRIPTION =
 	"JSON Schema; the agent must submit its result via `yield`; you receive validated JSON. Overrides the agent's default schema; false disables it";
 
-/** Parameters schema; `defaultAgent` only changes the `agent` field's description. */
 export function buildTaskParams(defaultAgent: string) {
 	const TaskItem = Type.Object({
 		name: Type.Optional(
@@ -63,7 +32,7 @@ export function buildTaskParams(defaultAgent: string) {
 		thinking: Type.Optional(Type.String({ description: "Thinking level override: off|minimal|low|medium|high|xhigh" })),
 		cwd: Type.Optional(Type.String({ description: "Working directory (default: current; relative paths resolve against it)" })),
 		isolated: Type.Optional(Type.Boolean({ description: ISOLATED_DESCRIPTION })),
-		// Explicit union (not `unknown`): some grammars reject boolean subschemas (OMP types.ts).
+		// Some model grammars reject boolean subschemas.
 		outputSchema: Type.Optional(
 			Type.Union([Type.Object({}, { additionalProperties: true }), Type.String(), Type.Boolean(), Type.Null()], {
 				description: OUTPUT_SCHEMA_DESCRIPTION,
@@ -78,34 +47,15 @@ export function buildTaskParams(defaultAgent: string) {
 	});
 }
 
-/**
- * Whether `value` carries the signature of whole-string double-encoding rather than prose that
- * merely mentions escapes. Deliberately narrower than upstream's heuristic (any structural escape, or
- * two-plus escapes), which also decoded legitimate one-line assignments whose backslashes happen to
- * be valid JSON escapes (`\bfoo\b`, `C:\temp\new\bin`, `\nabla \times`, "on \t and \n", `C:\\Users`):
- *  - `\\` pairs are ignored: an escaped backslash alone is a path or a regex, not a signature;
- *  - `\b` / `\f` never occur in re-escaped prose, so their presence vetoes the repair;
- *  - otherwise an escaped quote, a `\uXXXX`, or two-plus `\n` (a multi-line document on one line).
- */
 function hasDoubleEncodeSignature(value: string): boolean {
 	const escapes = value.replace(/\\\\/g, "");
-	// `\b` / `\f` never occur in re-escaped prose: a regex or a path (`\bfoo\b`, `C:\temp\bin`).
+	// Treat `\b` and `\f` as literal text to preserve paths and regexes.
 	if (/\\[bf]/.test(escapes)) return false;
 	if (/\\(?:"|u[0-9a-fA-F]{4})/.test(escapes)) return true;
 	return (escapes.match(/\\n/g)?.length ?? 0) >= 2;
 }
 
-/**
- * Models occasionally JSON-escape a prose argument twice, so it arrives with every newline, quote and
- * `\uXXXX` still backslash-escaped. Return the once-unescaped string when `value` is uniformly
- * double-encoded JSON, otherwise `value` unchanged (idempotent). Two guards: the signature check above
- * (text whose backslashes are valid JSON escapes by coincidence is left alone), then the `JSON.parse`
- * round-trip, which throws on an invalid escape (`\d+`, `C:\Users`), a bare quote or a real newline.
- * Only for natural-language fields (`task`, `context`), NEVER identifiers (OMP packages/tui
- * tools/task-repair-args.ts, with a stricter signature).
- */
 export function repairDoubleEncodedJsonString(value: string): string {
-	// Fast path: no backslash → nothing was escaped → the parse can never differ.
 	if (!value.includes("\\")) return value;
 	if (!hasDoubleEncodeSignature(value)) return value;
 	let decoded: unknown;
@@ -117,16 +67,13 @@ export function repairDoubleEncodedJsonString(value: string): string {
 	return typeof decoded === "string" && decoded !== value ? decoded : value;
 }
 
-/** Optional string fields whose blank value means "absent" (callers that emit JSON pad them with `""`, `null` or `[]`). */
 const PLACEHOLDER_KEYS = ["name", "agent", "model", "thinking", "cwd"] as const;
-/** Top-level string options copied into items that lack them. */
 const INHERITED_STRING_KEYS = ["agent", "model", "thinking", "cwd"] as const;
 
 function isPlaceholder(value: unknown): boolean {
 	return value === null || (typeof value === "string" && value.trim() === "") || (Array.isArray(value) && value.length === 0);
 }
 
-/** One `tasks[]` item without placeholders, with inherited top-level options and repaired prose; copy-on-write. */
 function repairTaskItem(item: unknown, inherited: Record<string, unknown>): unknown {
 	if (!item || typeof item !== "object" || Array.isArray(item)) return item;
 	const src = item as Record<string, unknown>;
@@ -141,15 +88,6 @@ function repairTaskItem(item: unknown, inherited: Record<string, unknown>): unkn
 	return out ?? src;
 }
 
-/**
- * Repair common malformed calls before validation, never mutating the submitted args:
- *  - a flat single-agent call (`{task, agent, ...}` at the top level), a lone object or JSON string in `tasks`;
- *  - top-level `agent` / `model` / `thinking` / `cwd` / `isolated` / `outputSchema` next to `tasks[]`:
- *    copied into every item that lacks its own value;
- *  - blank placeholders (`null`, `""`, whitespace, `[]`) in an item's `name` / `agent` / `model` /
- *    `thinking` / `cwd`: removed, so the agent's defaults apply (`outputSchema` / `isolated` are left alone);
- *  - double-encoded prose in `context` and each item's `task` (see repairDoubleEncodedJsonString).
- */
 export function prepareTaskArguments(raw: unknown): any {
 	if (!raw || typeof raw !== "object") return raw;
 	const a = raw as Record<string, unknown>;
@@ -172,7 +110,7 @@ export function prepareTaskArguments(raw: unknown): any {
 			if (typeof v === "string" && v.trim()) inherited[k] = k === "agent" ? v.trim() : v;
 		}
 		if (a.isolated !== undefined && a.isolated !== null) inherited.isolated = a.isolated;
-		// `null` / `false` are values here ("no schema"), so only absence is skipped.
+		// An explicit `null` or `false` disables the default schema.
 		if (a.outputSchema !== undefined) inherited.outputSchema = a.outputSchema;
 	}
 	const out: Record<string, unknown> = { tasks: (tasks as unknown[]).map((t) => repairTaskItem(t, inherited)) };
@@ -190,12 +128,6 @@ export const TASK_PROMPT_GUIDELINES = [
 	"Use isolated: true for parallel edits that may collide or risky experiments: each agent works in its own git worktree and its changes merge back into your checkout as a patch (see each result's <merge-summary>). Use outputSchema when you need machine-readable results (validated JSON in <data>).",
 ];
 
-/**
- * `forChild`: the description for a spawning subagent's own `task` tool (its run cannot settle while
- * its subagents are active, so it is told how results come back; `structured`: it reports via `yield`).
- * `canNest`: agents spawned through this tool are still below the depth limit, so agents with
- * `spawns` are marked as able to delegate further.
- */
 export function buildTaskDescription(
 	agents: AgentConfig[],
 	defaultAgent: string,
@@ -264,7 +196,6 @@ export interface PeerInfo {
 	agent: string;
 	status: string;
 	activity?: string;
-	/** Subagent spawned by the viewer. */
 	own?: boolean;
 }
 
@@ -277,17 +208,12 @@ export interface ChildPromptOptions {
 	role: string;
 	context?: string;
 	peers: PeerInfo[];
-	/** Id of the agent that spawned this one when it is not the main agent (nested subagent). */
 	owner?: string;
-	/** Agents this child may spawn with its own `task` tool (absent = no task tool). */
 	spawns?: string[];
-	/** Isolated checkout the child works in (`isolated` tasks). */
 	worktree?: { path: string; cwd: string; repoRoot: string };
-	/** Output schema: the child must finish with `yield` (replaces the plain-text ⁂ Completion). */
 	schema?: JsonSchema;
 }
 
-/** ⁂ Coop "# Working Tree" for isolated children (OMP subagent-system-prompt.md, adapted to patch merge-back). */
 function workingTreeSection(wt: NonNullable<ChildPromptOptions["worktree"]>, boss: string): string {
 	const where = wt.cwd !== wt.path ? ` (your cwd: \`${wt.cwd}\`)` : "";
 	return `# Working Tree
@@ -301,7 +227,6 @@ You are working in an isolated git worktree at \`${wt.path}\`${where}: a snapsho
 export function childSystemPrompt(opts: ChildPromptOptions): string {
 	const peers = opts.peers.length ? opts.peers.map(formatPeer).join("\n") : "- (no other agents)";
 	const nested = !!opts.owner;
-	// Nested children: `parent` = the agent that spawned them (their owner), `main` = the main agent.
 	const boss = nested ? `\`${opts.owner}\` (\`parent\`)` : "the main agent";
 	const addressing = nested
 		? `your parent \`${opts.owner}\`, which spawned you, is \`parent\`; the main agent is \`main\``
@@ -357,40 +282,26 @@ export function childUserPrompt(assignment: string): string {
 
 export type DoneStatus = "completed" | "failed" | "aborted";
 
-/**
- * What happened to an isolated child's worktree changes when a run settled (or it was killed).
- *  applied:   merged into the parent checkout's working tree (not staged/committed)
- *  empty:     no file changes
- *  conflict:  could not be applied; parent untouched; patch saved, worktree kept while the agent lives
- *  error:     merge machinery failed (patch saved when possible)
- *  unapplied: the run failed / was aborted: changes NOT applied, patch saved
- */
 export interface MergeInfo {
 	status: "applied" | "empty" | "conflict" | "error" | "unapplied";
-	/** Model-facing summary (the `<merge-summary>` body). */
 	message: string;
-	/** Changed paths relative to the merge target's root. */
+	/**
+	 * Paths are relative to the merge target.
+	 */
 	files: string[];
 	patchFile?: string;
-	/** Worktree still holding the changes (conflict / unapplied while the agent lives). */
 	worktree?: string;
 }
 
-/** Snapshot of a settled run; also the persisted `details` of delivered `task-result` messages. */
 export interface DoneInfo {
 	id: string;
 	agent: string;
 	status: DoneStatus;
-	/** Final text; for structured runs that yielded, the pretty-printed `data`. */
 	output: string;
 	error?: string;
-	/** Validated `yield` payload (structured runs only; may legitimately be null). */
 	data?: unknown;
-	/** The task had an output schema. */
 	structured?: boolean;
-	/** The task ran in its own worktree. */
 	isolated?: boolean;
-	/** Worktree merge-back outcome for this run (isolated tasks). */
 	merge?: MergeInfo;
 	durationMs: number;
 	model: string;
@@ -401,11 +312,9 @@ export interface DoneInfo {
 	cost: number;
 	contextTokens: number;
 	contextWindow?: number;
-	/** Snapshot of the agent's own subagents (nested tree) when it settled; display only. */
 	subagents?: SubagentSummary[];
 }
 
-/** Display-only row of a nested subagent, persisted inside DoneInfo for result cards. */
 export interface SubagentSummary {
 	id: string;
 	agent: string;
@@ -441,12 +350,10 @@ function fmtBytes(n: number): string {
 	return `${(n / 1024 / 1024).toFixed(1)}MB`;
 }
 
-/** Keep child text from closing the envelope early (also applied to `<irc>` message bodies by the hub). */
 export function escapeEnvelope(text: string): string {
 	return text.replace(/<(\/?)(task-result|output|preview|error|irc|data|merge-summary)\b/g, "&lt;$1$2");
 }
 
-/** Head of `output` within the preview budget, preferring a line boundary (OMP previewHead). */
 function previewHead(output: string): string {
 	const slice = output.slice(0, PREVIEW_CHARS);
 	const nl = slice.lastIndexOf("\n");
@@ -466,7 +373,6 @@ export function followUpHint(id: string, status: DoneStatus): string {
 		: `${id} is now idle — message it with irc op "send" (to: "${id}") to follow up or ask for revisions; full output via irc op "read" (id: "${id}").`;
 }
 
-/** The `<task-result>` envelope the parent model reads (task-summary.md). */
 export function formatTaskResult(d: DoneInfo): string {
 	const hasData = d.data !== undefined;
 	const output = resultOutputFallback(d);
@@ -480,7 +386,6 @@ export function formatTaskResult(d: DoneInfo): string {
 	}
 	if (error) lines.push(`<error>${escapeEnvelope(error)}</error>`);
 	if (hasData) {
-		// Validated structured result (structured.ts caps it; `irc read` has the full value).
 		lines.push("<data>", escapeEnvelope(formatStructuredData(d.data)), "</data>");
 	} else if (truncated) {
 		lines.push(`<preview full-output="irc read ${d.id}">`, escapeEnvelope(previewHead(output)), "</preview>");
@@ -501,7 +406,6 @@ export interface SpawnedInfo {
 	agent: string;
 	queued: boolean;
 	warning?: string;
-	/** e.g. "isolated", "structured" */
 	tags?: string[];
 }
 
@@ -509,11 +413,6 @@ function spawnLabel(s: SpawnedInfo): string {
 	return [s.agent, ...(s.tags ?? [])].join(", ");
 }
 
-/**
- * Tool result text for a spawn (task-spawn-feedback.md). `lifecycle`: append the `irc` reference lines
- * (list/read/kill, idle agents) that the tool description no longer carries; the hub sets it on a
- * spawner's first successful spawn only.
- */
 export function formatSpawnFeedback(spawned: SpawnedInfo[], failures: string[], opts: { lifecycle?: boolean } = {}): string {
 	const lines: string[] = [];
 	const failureSummary = failures.length ? ` Failed to schedule ${failures.length}:` : "";

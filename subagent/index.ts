@@ -1,36 +1,3 @@
-/**
- * oh-my-pi style `task` subagents with IRC steering, for vanilla pi.
- *
- * Parent tools:
- *   task  - spawn `tasks[]` as background subagents (results auto-deliver as `task-result` messages)
- *   irc   - send (steer a running agent / follow up an idle one; `all` broadcasts, without automatic
- *           replies), wait, list, read, kill
- * Child tools:
- *   irc   - send to parent/peers (no broadcast), wait, list (+ read/kill of own subagents for spawners)
- *   task  - only for agents with `spawns` below MAX_DEPTH (nested subagents; results go to the owner)
- *   yield - only for tasks with an output schema (`outputSchema` / agent `output:`), see features.ts
- * Per-task features (features.ts): `isolated` (own git worktree, merged back as a patch) and
- * `outputSchema` (validated JSON result via `yield`).
- * Commands:
- *   /agents [id] - agent inspector (also ctrl+s / alt+a, or a deliberate ←← on an empty editor):
- *                  live roster and transcripts; message / kill agents (inspector.ts)
- *   /irc <id> <message> - message a subagent as the user
- * Delivery (hub.ts): a message from the main agent or the user steers a running agent at its next
- *   step; messages between subagents, broadcast legs and notices never extend a finishing run (they
- *   get a turn of their own after its result). Parent `irc wait` returns at once when a result or
- *   message is already queued for the main session or the agent named in `from` cannot reply, and
- *   ends when that agent stops or (without `from`) no agent is active any more; it first lets a
- *   `task` call of the same tool batch register its agents.
- * Prompt:
- *   `^model`  - popup of models; a tag means "a default-agent subagent on this model" (mentions.ts)
- * UI:
- *   live task card (updates while its agents run and the card is on screen; nested subagents as a
- *   tree under their owner), delivered-result cards, and a bottom widget for running agents whose
- *   row is not visible in ANSI. The native dock lists running agents regardless of scrolling.
- *   Native (TSP) terminals (tsp-native): the same cards, messages and widget as data-first `tool` /
- *   `agent` nodes via describe hooks (native.ts).
- */
-
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
@@ -134,13 +101,8 @@ function textResult(text: string, details?: unknown, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, isError };
 }
 
-// ---------- on-screen probing ----------
-// pi's main-screen TUI can only repaint lines inside the viewport; changing anything above it forces a
-// full clear-and-redraw (scrollback included). So a live card only repaints while all of its lines are
-// on screen. Fullscreen mode owns its viewport, so repainting off-screen cards is free there.
 interface ScreenView {
 	lines: string[];
-	/** Off-screen repaints are free (fullscreen viewport). */
 	free: boolean;
 }
 
@@ -163,7 +125,6 @@ function readScreen(tui: ScreenTui | undefined): ScreenView | undefined {
 	return undefined;
 }
 
-/** Whether `sig` (a card's last rendered lines, stripped) appears consecutively on screen. */
 function onScreen(screen: string[], sig: string[] | undefined): boolean {
 	if (!sig || sig.length === 0 || !sig[0]) return false;
 	const first = sig[0];
@@ -191,7 +152,6 @@ export default function (pi: ExtensionAPI) {
 	let inNativeView = false;
 	let uiActive = false;
 	let mentionSource: MentionSource | undefined;
-	/** Resolved `^model` tags show as chips in the prompt editor (drawn by magic-keywords' editor, if loaded). */
 	const mentionChipProvider = createMentionChipProvider(() => mentionSource);
 	let offMentionChips: (() => void) | undefined;
 	let frame = 0;
@@ -200,13 +160,11 @@ export default function (pi: ExtensionAPI) {
 	let soon: NodeJS.Timeout | undefined;
 	let offHubKeys: (() => void) | undefined;
 	let inspectorOpen = false;
-	/** Bumped on every hub change: native (TSP) views of live agents rebuild when it moves (native.ts). */
 	let hubVersion = 0;
 	const native = createNativeUI({ hub, version: () => hubVersion, widgetRows: WIDGET_MAX_ROWS });
 	const agentDir = getAgentDir();
 	let widgetCollapsed = false;
 
-	/** Show the agent inspector (one at a time). */
 	const showInspector = async (ui: ExtensionContext["ui"], opts: InspectorOpenOptions = {}) => {
 		if (inspectorOpen) return;
 		inspectorOpen = true;
@@ -221,19 +179,14 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	// ---------- user input while the main agent blocks on its subagents ----------
-	// The parent `irc wait` returns as soon as the user submits a prompt (steer or follow-up), so the
-	// model reads it now instead of after the wait; the subagents keep running and still deliver.
 	type QueuedInput = "steer" | "followUp";
 	const waitBreakers = new Set<(kind: QueuedInput) => void>();
-	/** Kind of the latest queued user prompt, and whether a wait already returned because of it. */
 	let lastInput: { kind: QueuedInput; reported: boolean } | undefined;
 	const userInputQueued = (kind: QueuedInput, ctx: ExtensionContext | undefined) => {
 		const wasPending = !!ctx?.hasPendingMessages?.();
 		lastInput = { kind, reported: false };
 		if (waitBreakers.size === 0) return;
-		// pi queues the prompt only after every input handler ran. End the wait once it is queued, so pi
-		// injects it right after the wait's result (give up if another extension swallowed the input).
+		// pi queues input only after all input handlers finish.
 		const started = Date.now();
 		const poll = () => {
 			const queued = wasPending ? Date.now() - started >= 30 : !!ctx?.hasPendingMessages?.();
@@ -246,14 +199,13 @@ export default function (pi: ExtensionAPI) {
 		};
 		setTimeout(poll, 0).unref?.();
 	};
-	/** A user prompt already queued when a wait starts (reported once for a follow-up; a steer injects right after). */
 	const pendingUserInput = (ctx: ExtensionContext | undefined): QueuedInput | undefined => {
 		if (!ctx?.hasPendingMessages?.()) {
 			lastInput = undefined;
 			return undefined;
 		}
 		const kind = lastInput?.kind ?? "steer";
-		// A follow-up only arrives when the turn ends: a wait started again after being told about it blocks.
+		// pi delivers follow-ups only after the turn ends.
 		if (kind === "followUp" && lastInput?.reported) return undefined;
 		if (lastInput) lastInput.reported = true;
 		return kind;
@@ -269,7 +221,6 @@ export default function (pi: ExtensionAPI) {
 			: `${head} as a follow-up, delivered when you end your turn. ${agents} End your turn to read it (wait again only if you must keep blocking).`;
 	};
 
-	/** Agents drawn by a visible live card: its agents and their nested subagents. */
 	const coveredByVisibleCard = (): Set<string> => {
 		const covered = new Set<string>();
 		const visit = (c: Child, foldedIds?: ReadonlySet<string>) => {
@@ -293,17 +244,17 @@ export default function (pi: ExtensionAPI) {
 		const view = cards.size && !inNativeView ? readScreen(tuiRef) : undefined;
 		for (const [key, card] of cards) {
 			const live = card.ids.some((id) => subtreeActive(hub.children.get(id)));
-			// No signature yet = registered but not drawn yet (it is at the bottom): keep the optimistic default.
 			if (card.sig && !inNativeView) card.visible = view ? onScreen(view.lines, card.sig) : false;
+			// Repainting rows above pi's main-screen viewport clears scrollback.
 			if (!view || view.free || card.visible) {
 				try {
-					card.invalidate(); // re-runs renderResult, which re-registers (or drops) the card
+					card.invalidate();
 				} catch {}
 			}
 			if (!live) cards.delete(key);
 		}
 		try {
-			tuiRef?.requestRender?.(); // keep the widget's spinner/durations fresh
+			tuiRef?.requestRender?.();
 		} catch {}
 		if (!hub.hasActive() && cards.size === 0) stopTicker();
 	};
@@ -329,7 +280,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// ---------- bottom widget: running agents not visible in ANSI, all running agents in native mode ----------
 	const setWidgetCollapsed = (collapsed: boolean, ui: ExtensionContext["ui"]) => {
 		try {
 			writeConfig(agentDir, { widgetCollapsed: collapsed });
@@ -387,7 +337,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_e, ctx) => {
 		widgetCollapsed = readConfig(agentDir, (message) => ctx.ui.notify(message, "warning")).widgetCollapsed;
 		uiActive = ctx.hasUI && ctx.mode === "tui";
-		// `^model` mentions: the source reads the live ctx on every use (models can refresh).
 		mentionSource = {
 			models: () => {
 				const scoped = ctx.scopedModels.map((s) => s.model);
@@ -403,7 +352,6 @@ export default function (pi: ExtensionAPI) {
 			offMentionChips?.();
 			offMentionChips = registerEditorChipProvider("subagent.mentions", mentionChipProvider);
 			void seedMentionHistory().catch(() => {});
-			// Agent inspector: ctrl+s / alt+a, or a deliberate ←← on an empty editor (inspector.ts).
 			try {
 				offHubKeys?.();
 				offHubKeys = ctx.ui.onTerminalInput(
@@ -440,8 +388,7 @@ export default function (pi: ExtensionAPI) {
 		inNativeView = false;
 		uiActive = false;
 		tuiRef = undefined;
-		// Each isolated agent saves unmerged changes as a patch and removes its worktree (or keeps and
-		// untracks it when they could not be saved); then sweep any tracked leftovers.
+		// Dispose agents before sweeping worktrees to preserve unsaved changes.
 		const notes = await hub.disposeAll();
 		await removeAllWorktrees();
 		const kept = notes.filter((n) => n.includes("NOT saved"));
@@ -452,7 +399,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// ---------- `^model` mentions ----------
 	const buildMentionNotice = (text: string) => {
 		if (!mentionSource) return undefined;
 		let mentions: ReturnType<typeof findMentions> = [];
@@ -462,7 +408,6 @@ export default function (pi: ExtensionAPI) {
 			return undefined;
 		}
 		if (mentions.length === 0) return undefined;
-		// Picked models are listed first the next time `^` opens.
 		recordMentions(mentions);
 		if (!pi.getActiveTools().includes("task")) return undefined;
 		return {
@@ -473,15 +418,12 @@ export default function (pi: ExtensionAPI) {
 		};
 	};
 
-	// Idle prompt: attach the notice to the run it starts.
 	pi.on("before_agent_start", async (event) => {
 		if (event.messageType !== "user") return;
 		const message = buildMentionNotice(event.prompt);
 		return message ? { message } : undefined;
 	});
 
-	// Prompt typed while the agent is busy (steer / follow-up): queue the notice with it, and end a
-	// blocking `irc wait` so the model reads the prompt now.
 	pi.on("input", async (event, ctx) => {
 		if (!event.streamingBehavior) return;
 		userInputQueued(event.streamingBehavior, ctx);
@@ -489,8 +431,6 @@ export default function (pi: ExtensionAPI) {
 		if (message) await pi.sendMessage(message, { deliverAs: event.streamingBehavior });
 	});
 
-	// A delivered result / message reached the transcript: it is no longer queued behind an `irc wait`
-	// (hub.parentBacklog). Nothing stays queued once the run settled.
 	pi.on("message_start", async (event) => {
 		const m = event.message as { role?: string; customType?: string; details?: unknown; content?: unknown };
 		if (m.role !== "custom" || (m.customType !== RESULT_MESSAGE_TYPE && m.customType !== IRC_MESSAGE_TYPE)) return;
@@ -500,10 +440,7 @@ export default function (pi: ExtensionAPI) {
 		hub.clearParentBacklog();
 	});
 
-	// In print/json mode the process exits when the parent settles, so hold the parent
-	// open while background agents are still working and feed it their results. A run can end without
-	// any event for the main agent (an agent woken quietly by a broadcast or a relayed reply, a held
-	// message's own turn after the result): the wait also ends, quietly, once nothing is active.
+	// pi exits on settle in print and JSON modes.
 	pi.on("agent_before_settle", async (event, ctx) => {
 		if (ctx.hasUI || !hub.hasActive()) return;
 		const quiet = new AbortController();
@@ -535,16 +472,13 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	// ---------- task tool ----------
 	const description = buildTaskDescription(discoverAgents(process.cwd(), false), DEFAULT_AGENT, MAX_TASKS_PER_CALL, {
 		canNest: MAX_DEPTH > 1,
 	});
 
-	/** Snapshot the card for a task call: live hub state when available, persisted details otherwise. */
 	const cardSnapshot = (details: TaskDetails, context: string | undefined, expanded: boolean, isError: boolean): CardSnapshot => {
 		const now = Date.now();
 		const liveHub = details.hub === hub.instanceId;
-		// Live rows carry their nested subagents (snapshotChild recurses into child.owned).
 		const rows: RowSnapshot[] = details.items.map((item, i) => {
 			const c = liveHub ? hub.children.get(item.id) : undefined;
 			return c ? snapshotChild(c, i, now, expanded) : snapshotDetached(item, i);
@@ -578,7 +512,6 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const startedAt = Date.now();
 			const agents = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
-			// Same body as spawning children's own task tool (hub.spawnTasks); the main agent may spawn any agent.
 			const r = await hub.spawnTasks(params, ctx, { policy: unrestrictedPolicy(agents), cwd: ctx.cwd });
 			if (r.children.length === 0 && r.failures.length === 0) return textResult(r.text, undefined, true);
 			const details: TaskDetails = {
@@ -600,7 +533,6 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, context) {
-			// Once a result exists the result card draws the header, so the call slot collapses.
 			if (context.state?.hasResult || (context.executionStarted && !context.isPartial)) return EMPTY_COMPONENT;
 			return new LinesComponent((width) => buildCallLines(args, theme, width, context.expanded));
 		},
@@ -630,7 +562,7 @@ export default function (pi: ExtensionAPI) {
 				const prev = cards.get(context.toolCallId);
 				const card: LiveCard = { ids: details.ids, invalidate: context.invalidate, visible: prev?.visible ?? true, sig: prev?.sig, foldedIds: prev?.foldedIds };
 				component.onRender = (lines) => {
-					// Blank lines stay in (they match any row) so the consecutive-line match stays aligned.
+					// Keep blank rows to align the screen match.
 					card.sig = lines.map((l) => stripTerminalSequences(l).trim());
 					card.foldedIds = foldedIds;
 				};
@@ -642,11 +574,9 @@ export default function (pi: ExtensionAPI) {
 			return component;
 		},
 
-		// Native (TSP) terminals: `Task · N agents` head + one agent node per subagent (native.ts).
 		...native.task,
 	});
 
-	// ---------- irc tool (parent side) ----------
 	pi.registerTool({
 		name: "irc",
 		label: "IRC",
@@ -670,7 +600,6 @@ export default function (pi: ExtensionAPI) {
 				case "list": {
 					const list = describeTree(hub.tree());
 					const now = Date.now();
-					// Roster snapshot for the native view (JSON rows, nested agents under their owner).
 					const details: IrcDetails = {
 						op: "list",
 						agents: [...hub.children.values()].filter((c) => c.ownerId === PARENT_ID).map((c) => persistRow(c, now)),
@@ -685,33 +614,28 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "kill":
 					try {
-						// The main agent is the killer: a wake turn it started needs no "killed before it replied" note.
 						const notes = await hub.kill(params.id ?? "", { by: PARENT_ID });
 						return textResult([`Killed ${params.id}.`, ...notes].join("\n"));
 					} catch (e) {
 						return textResult(e instanceof Error ? e.message : String(e), undefined, true);
 					}
 				case "wait": {
-					// A user prompt is already queued (typed while this call was generated): don't block it.
 					const pending = pendingUserInput(ctx);
 					if (pending) return textResult(userInputText(pending, false), { op: "wait", pending } satisfies IrcDetails);
-					// A `task` call of the same tool batch may still be validating: its agents must exist before
-					// `from` is checked and before "nothing is running" is concluded.
+					// A sibling task call may still be registering its agents.
 					await hub.spawnsSettled(PARENT_ID);
 					const from = params.from?.trim() || undefined;
 					if (from && !hub.children.has(from)) {
 						return textResult(`Unknown agent "${from}". Known: ${[...hub.children.keys()].join(", ") || "none"}`, undefined, true);
 					}
 					const filter = (ev: ParentEvent) => !from || (ev.kind === "done" ? ev.done.id === from : ev.msg.from === from);
-					// Already handed to pi but injected only after this tool batch: blocking would wait in front of it.
+					// pi injects queued results only after this tool batch.
 					const queued = hub.queuedForParent(filter).map((ev) => (ev.kind === "done" ? `result of ${ev.done.id}` : `message from ${ev.msg.from}`));
 					if (queued.length > 0) {
 						const more = queued.length > 1 ? ` (and ${queued.length - 1} more)` : "";
 						return textResult(`Already arrived: ${queued[0]}${more}; delivered right after this call.`, { op: "wait", queued } satisfies IrcDetails);
 					}
 					if (!hub.hasActive() && !from) return textResult("No running subagents to wait for.", { op: "wait", idle: true } satisfies IrcDetails);
-					// Nothing can come from an agent that is not running; a wait on one also ends when it stops
-					// (its result or reply resolves the wait first).
 					const target = from ? hub.children.get(from) : undefined;
 					if (target && !subtreeActive(target)) {
 						return textResult(
@@ -720,7 +644,6 @@ export default function (pi: ExtensionAPI) {
 						);
 					}
 					const timeout = Math.max(1, params.timeoutSec ?? 300) * 1000;
-					// The user submitting a prompt ends the wait (see userInputQueued).
 					const interrupt = new AbortController();
 					let interruptedBy: QueuedInput | undefined;
 					const end = (kind: QueuedInput) => {
@@ -728,9 +651,7 @@ export default function (pi: ExtensionAPI) {
 						interrupt.abort();
 					};
 					waitBreakers.add(end);
-					// A wait also ends when nothing can arrive any more: the agent named in `from` stopped, or,
-					// without `from`, no agent is active (the last one may finish without an event for the main
-					// agent, e.g. after a broadcast nobody answers). An event resolves the wait first.
+					// Delivery must resolve the wait before inactivity aborts it.
 					let stopped = false;
 					const stop = () => {
 						stopped = true;
@@ -755,13 +676,11 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 						const now = Date.now();
-						// One progress row per still-active agent, so a looping one or one near its context limit shows.
 						const text = ev
 							? formatParentEvent(ev)
 							: active.length
 								? `Timed out; agents still running:\n${active.map((c) => describeProgress(c, now)).join("\n")}\nTheir results still auto-deliver. Still blocked on one? Call irc wait again; otherwise keep working or end your turn. NEVER use sleep to wait longer.`
 								: "Timed out; agents still running: none";
-						// The delivered event (JSON copy) for the native view; older sessions fall back to the text.
 						const details: IrcDetails = ev
 							? { op: "wait", event: jsonCopy(ev), interrupted: interruptedBy }
 							: { op: "wait", timedOut: true, running, runningLabels, interrupted: interruptedBy };
@@ -796,11 +715,9 @@ export default function (pi: ExtensionAPI) {
 			});
 		},
 
-		// Native (TSP) terminals: per-op views (message, delivered result as an agent node, roster…; native.ts).
 		...native.irc,
 	});
 
-	// ---------- transcript rendering for delivered results / messages ----------
 	const expandHint = () => {
 		try {
 			return keyHint("app.tools.expand", "to expand");
@@ -851,14 +768,12 @@ export default function (pi: ExtensionAPI) {
 		}
 		return box;
 	};
-	/** The same message for native (TSP) terminals: an agent node / `from → to` + markdown (native.ts); ANSI unchanged. */
 	const nativeEvent = (message: any, expanded: boolean, component: Component): Component =>
 		withNativeDescribe(component, (cx) => native.describeEvent(message, expanded, cx));
 	pi.registerMessageRenderer(RESULT_MESSAGE_TYPE, (m, o, t) => nativeEvent(m, o.expanded, renderEvent(m, o.expanded, o.outputPad, t)));
 	pi.registerMessageRenderer(LEGACY_RESULT_MESSAGE_TYPE, (m, o, t) => nativeEvent(m, o.expanded, renderEvent(m, o.expanded, o.outputPad, t)));
 	pi.registerMessageRenderer(IRC_MESSAGE_TYPE, (m, o, t) => nativeEvent(m, o.expanded, renderEvent(m, o.expanded, o.outputPad, t)));
 
-	// ---------- user commands ----------
 	const idCompletions = (prefix: string) => {
 		const first = prefix.split(/\s+/)[0] ?? "";
 		if (prefix.includes(" ")) return null;
@@ -918,11 +833,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (ctx.mode === "tui") {
-				// Not awaited: the command returns while the inspector stays open.
 				void showInspector(ctx.ui, { agentId: id || undefined });
 				return;
 			}
-			// Dialog-only UIs (RPC): pick an agent, then an action.
 			const list = hub.tree();
 			if (list.length === 0) {
 				ctx.ui.notify("No subagents.", "info");
@@ -945,8 +858,6 @@ export default function (pi: ExtensionAPI) {
 					`${describeChild(child)}${owner}\nTask: ${child.task}\n\n## Recent activity\n${child.activity.slice(-20).join("\n")}\n\n## Latest output\n${out}`,
 				);
 			} else if (action === "Kill") {
-				// Its owner (main agent or spawning child) may still be expecting this agent's result: deliver an aborted one.
-				// Its own subagents are killed first.
 				const notes = await hub.kill(child.id, { notify: true, by: USER_ID });
 				ctx.ui.notify([`Killed ${child.id}`, ...notes].join("\n"), "info");
 			}

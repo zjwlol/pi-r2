@@ -1,21 +1,3 @@
-/**
- * The inline /btw answer panel and the always-mounted dock widget that hosts it.
- *
- * `BtwPanel` ports oh-my-pi `packages/tui/src/overlays/btw-panel.ts` (`BtwPanelComponent`, with
- * the box of `chrome/overlay-box.ts` `OverlayPanel` and the body / footer shell of
- * `chrome/streaming-panel.ts` folded in): a rounded box titled `/btw <question>` whose body
- * streams the answer as markdown and whose footer names what the keys do now.
- *
- * - ANSI: `render(width)`; every row is exactly `width` cells. Not upstream: the body is cut to
- *   `maxBodyRows()` rows (vanilla widgets cannot scroll), the tail while running, the head after.
- * - Native (tsp-native calls `describe`): a borderless `col` with role `omp.overlay.btw`, headed
- *   by the question. Memo contract: the same node object while nothing shown changed.
- *
- * `BtwDock` is mounted as the `btw` widget for the whole session, renders nothing while hidden
- * and records which renderer painted it last, which is how the controller tells ANSI from
- * native rendering (no import from tsp-native/).
- */
-
 import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, getKeybindings, Markdown, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { bottomBorder, boxRow, formatKey, GLYPH, keyHint, topBorder } from "./chrome.ts";
@@ -46,19 +28,13 @@ export type BtwPanelState = "running" | "complete" | "branching" | "aborted" | "
 
 export interface BtwPanelOptions {
 	question: string;
-	/** Heading shown instead of `/btw <question>`, e.g. `/sitrep the migration` for a side command. */
 	title?: string;
 	theme: () => Theme;
 	requestRender: () => void;
 	canBranch?: () => boolean;
 	canFollowUp?: () => boolean;
-	/**
-	 * Given only when `btw.inject` was on for this question: the answer's `<inject>` block shows
-	 * apart from its prose, and the inject key is offered while this returns true.
-	 */
 	canInject?: () => boolean;
 	injectKey: string;
-	/** Rows available for the body (height guard). */
 	maxBodyRows?: () => number;
 }
 
@@ -67,7 +43,6 @@ const NO_TEXT = "No text returned.";
 const COPIED = `${GLYPH.check} Copied to clipboard`;
 const BRANCHING = `${GLYPH.pending} Branching to chat…`;
 
-/** Primary key of `app.interrupt` (interactive mode registers pi's keybindings with pi-tui); Escape when unbound. */
 function interruptKey(): string {
 	try {
 		const keys = (getKeybindings() as unknown as { getKeys(action: string): readonly string[] }).getKeys("app.interrupt");
@@ -87,7 +62,6 @@ export class BtwPanel implements Component {
 	private closed = false;
 	private copied = false;
 	private injected = false;
-	/** Bumped by every change of what the panel shows; keys the body cache. */
 	private version = 0;
 	private markdown: Markdown | undefined;
 	private body: { version: number; width: number; lines: string[] } | undefined;
@@ -97,7 +71,6 @@ export class BtwPanel implements Component {
 
 	constructor(options: BtwPanelOptions) {
 		this.options = options;
-		// A title inset into one border row never carries control sequences, tabs or line breaks.
 		this.baseTitle = sanitizeDisplayLine(options.title ?? `/btw ${options.question}`)
 			.replace(/\s+/g, " ")
 			.trim();
@@ -123,21 +96,18 @@ export class BtwPanel implements Component {
 		this.transition("complete", undefined);
 	}
 
-	/** Visual confirmation that `c` copied the answer to the clipboard. */
 	markCopied(): void {
 		if (this.closed || !this.isCopyable()) return;
 		this.copied = true;
 		this.rebuild();
 	}
 
-	/** Shows the answer's steering prompt as sent (arrow, green), or back to pending when a send failed. */
 	setInjected(injected: boolean): void {
 		if (this.closed || this.injected === injected) return;
 		this.injected = injected;
 		this.rebuild();
 	}
 
-	/** Shows that the completed answer is being promoted into a session branch. */
 	markBranching(): void {
 		this.transition("branching", undefined);
 	}
@@ -162,13 +132,11 @@ export class BtwPanel implements Component {
 		return this.isCopyable() ? this.visibleAnswer : undefined;
 	}
 
-	/** Later mutators are no-ops (late stream output of a replaced panel). */
 	close(): void {
 		this.closed = true;
 	}
 
 	invalidate(): void {
-		// Theme change: rebuild Markdown with the current markdown theme.
 		this.markdown = undefined;
 		this.body = undefined;
 		this.native = undefined;
@@ -194,6 +162,7 @@ export class BtwPanel implements Component {
 		const injectKey = this.activeInjectKey();
 		const live = this.state === "running" || this.state === "branching";
 		const spinner = live && cx.supports("spinner");
+		// The reconciler skips nodes with unchanged references.
 		const memo = this.native;
 		if (
 			memo &&
@@ -204,8 +173,6 @@ export class BtwPanel implements Component {
 		) {
 			return memo.node;
 		}
-		// Inline in the dock, styled as a sheet by role: a borderless column headed by the question.
-		// The command word is the accent; the rest of the heading is the question or arguments.
 		const space = this.baseTitle.indexOf(" ");
 		const command = space === -1 ? this.baseTitle : this.baseTitle.slice(0, space);
 		const rest = space === -1 ? "" : this.baseTitle.slice(space);
@@ -224,8 +191,6 @@ export class BtwPanel implements Component {
 		return described;
 	}
 
-	// ---------- state ----------
-
 	private transition(state: BtwPanelState, errorMessage: string | undefined): void {
 		if (this.closed) return;
 		this.state = state;
@@ -240,21 +205,14 @@ export class BtwPanel implements Component {
 		this.options.requestRender();
 	}
 
-	/**
-	 * The answer around its `<inject>` block, which displays apart from the prose only while
-	 * streaming or once the tag closed: an unclosed block in a finished answer stays plain text.
-	 */
 	private injectParts(): InjectParts | undefined {
 		const parts = this.options.canInject ? splitInject(this.visibleAnswer) : undefined;
 		return parts && (parts.closed || this.state === "running") ? parts : undefined;
 	}
 
-	/** The inject key while it can send the answer's steering prompt. */
 	private activeInjectKey(): string | undefined {
 		return this.options.canInject?.() ? this.options.injectKey : undefined;
 	}
-
-	// ---------- ANSI ----------
 
 	private bodyLines(theme: Theme, width: number): string[] {
 		const cached = this.body;
@@ -270,8 +228,6 @@ export class BtwPanel implements Component {
 				lines = renderInjectAnswer(theme, parts, this.injected, width);
 			} else {
 				this.markdown ??= new Markdown("", 0, 0, getMarkdownTheme());
-				// Model output is untrusted: no control sequences reach the terminal. `visibleAnswer`
-				// itself stays raw (copy and `<inject>` parsing read it).
 				this.markdown.setText(sanitizeDisplayText(this.visibleAnswer));
 				lines = this.markdown.render(width);
 			}
@@ -280,7 +236,6 @@ export class BtwPanel implements Component {
 		return lines;
 	}
 
-	/** The body within the height budget: the newest rows while the answer streams, the first rows after. */
 	private guardedBody(theme: Theme, width: number): string[] {
 		const lines = this.bodyLines(theme, width);
 		const budget = this.options.maxBodyRows?.();
@@ -294,7 +249,6 @@ export class BtwPanel implements Component {
 	}
 
 	private footerLine(theme: Theme): string {
-		// The key router sends `app.interrupt` (Escape by default) to the panel.
 		const esc = interruptKey();
 		switch (this.state) {
 			case "running":
@@ -319,8 +273,6 @@ export class BtwPanel implements Component {
 				return theme.fg("error", `${GLYPH.error} Error · ${formatKey(esc)} to close`);
 		}
 	}
-
-	// ---------- native ----------
 
 	private describeBody(): NativeNode {
 		if (this.state === "error") {
@@ -358,11 +310,6 @@ export class BtwPanel implements Component {
 	}
 }
 
-/**
- * The `btw` widget: mounted above the editor for the whole session, empty while no panel shows.
- * tsp-native describes it (`describe`), the ANSI TUI renders it (`render`); whichever ran last
- * tells the controller which surface the user is looking at.
- */
 export class BtwDock implements Component {
 	private current: BtwPanel | undefined;
 	private painted: "ansi" | "native" | undefined;

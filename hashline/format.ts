@@ -1,32 +1,21 @@
-/**
- * hashline/format.ts: header / numbered-line formatting, the 4-hex content tag, text normalization
- * and the read-output row recognizers.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/format.rs`, `prefixes.rs` (part),
- * `crates/pi-edit/src/store.rs::file_hash` and `crates/pi-edit/src/text.rs` (part) (MIT).
- * Pure: no imports.
- */
 
 export const HL_FILE_HASH_EXAMPLES = ["1A2B", "3C4D", "9F3E"] as const;
 export const BOM = "\uFEFF";
 
-/** `[path#TAG]`. */
 export function formatHashlineHeader(path: string, tag: string): string {
 	return `[${path}#${tag}]`;
 }
 
-/** `LINE:TEXT`. */
 export function formatNumberedLine(lineNumber: number, line: string): string {
 	return `${lineNumber}:${line}`;
 }
 
-/** Lines addressable by anchors: split on `\n`, without the empty element after a final `\n`. */
 export function splitAddressableFileLines(text: string): string[] {
 	const lines = text.split("\n");
 	if (text.endsWith("\n")) lines.pop();
 	return lines;
 }
 
-/** Number every `\n`-separated row of `text`, starting at `startLine`. */
 export function formatNumberedLines(text: string, startLine: number): string {
 	return text
 		.split("\n")
@@ -34,7 +23,6 @@ export function formatNumberedLines(text: string, startLine: number): string {
 		.join("\n");
 }
 
-/** Example anchors for diagnostics: `"119", "112", "7"` for prefix "119"; `"160", "42", "7"` for "". */
 export function describeAnchorExamples(linePrefix: string): string {
 	let examples: string[];
 	if (linePrefix === "") examples = ["160", "42", "7"];
@@ -45,19 +33,14 @@ export function describeAnchorExamples(linePrefix: string): string {
 	return examples.map((e) => `"${e}"`).join(", ");
 }
 
-// ── text normalization ──────────────────────────────────────────────────
-
-/** `\r\n` and lone `\r` become `\n`. */
 export function normalizeToLf(text: string): string {
 	return text.includes("\r") ? text.replace(/\r\n?/g, "\n") : text;
 }
 
-/** Split a leading UTF-8 BOM off: `{ bom, text }`. */
 export function stripBom(content: string): { bom: string; text: string } {
 	return content.startsWith(BOM) ? { bom: BOM, text: content.slice(1) } : { bom: "", text: content };
 }
 
-/** The first line ending in `content`: "\r\n" or "\n" ("\n" when there is none). */
 export function detectLineEnding(content: string): "\n" | "\r\n" {
 	const lf = content.indexOf("\n");
 	if (lf === -1) return "\n";
@@ -69,8 +52,6 @@ export function restoreLineEndings(text: string, ending: "\n" | "\r\n"): string 
 	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
 }
 
-// ── content tag ─────────────────────────────────────────────────────────
-
 const P1 = 0x9e3779b1;
 const P2 = 0x85ebca77;
 const P3 = 0xc2b2ae3d;
@@ -81,7 +62,6 @@ function rotl(x: number, r: number): number {
 	return (x << r) | (x >>> (32 - r));
 }
 
-/** xxHash32 of `bytes` with `seed`, as an unsigned 32-bit number. */
 export function xxh32(bytes: Uint8Array, seed = 0): number {
 	const len = bytes.length;
 	const read32 = (i: number) => bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24);
@@ -121,10 +101,6 @@ export function xxh32(bytes: Uint8Array, seed = 0): number {
 	return h >>> 0;
 }
 
-/**
- * The 4-hex uppercase content tag: xxHash32 (seed 0) of the UTF-8 bytes of `text` with trailing
- * spaces, tabs and CRs removed from every line, low 16 bits.
- */
 export function computeFileHash(text: string): string {
 	const stripped = text
 		.split("\n")
@@ -134,13 +110,10 @@ export function computeFileHash(text: string): string {
 	return (digest & 0xffff).toString(16).toUpperCase().padStart(4, "0");
 }
 
-// ── read-output rows (prefixes.rs) ──────────────────────────────────────
-
 const HL_PREFIX_RE = /^\s*(?:(?:>>>|>>)\s*)?(?:[+*-]\s*)?(\d+)[:|]/;
 const READ_RANGE_ELISION_RE = /^\s*[1-9]\d*\s*-\s*[1-9]\d*:.*(?:…|\.\.\.).*$/;
 const READ_SINGLE_ELISION_RE = /^\s*(?:…|\.\.\.)\s*$/;
 
-/** A truncation / continuation notice printed by `read`. */
 export function isReadTruncationNotice(line: string): boolean {
 	const trimmed = line.trim();
 	if (trimmed.length < 2 || !trimmed.startsWith("[") || !trimmed.endsWith("]")) return false;
@@ -160,12 +133,10 @@ export function isReadTruncationNotice(line: string): boolean {
 	return showing || more || elided || oversized;
 }
 
-/** Display-only rows of read output: notices and elision markers. */
 export function isReadMetadataLine(line: string): boolean {
 	return isReadTruncationNotice(line) || READ_RANGE_ELISION_RE.test(line) || READ_SINGLE_ELISION_RE.test(line);
 }
 
-/** Strip at most one leading `N:` / `N|` prefix (with optional `>>`, `+`, `*`, `-` markers). */
 export function stripOneLeadingHashlinePrefix(line: string): string {
 	return line.replace(HL_PREFIX_RE, "");
 }

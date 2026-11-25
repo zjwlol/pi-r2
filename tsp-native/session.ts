@@ -1,12 +1,3 @@
-/**
- * The TSP native session: detection, the hello/DA1 probe, the stdin
- * reassembly shim, the prototype patches that swap pi's row renderer for the
- * native backend, the erase/alt-screen bookkeeping around the switch, the
- * DA1 sentinel that holds pi's exit drain open until in-flight acks are in,
- * and the ANSI fallback. One instance per loaded extension; the process-wide registry
- * on `globalThis` holds the installed trampolines so `/reload` can hand a live
- * surface from the old instance to the new one.
- */
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -25,27 +16,17 @@ type Any = Record<string, any>;
 
 export const EXT_VERSION = "0.1.0";
 export const APP_NAME = "pi";
-/** Features this program applies when the terminal sends them. */
 export const HELLO_FEATURES = ["edit", "undo", "send"] as const;
 
-/** How long a hello waits for its reply through rmux/tmux, which answer DA1 themselves. */
 const MUX_HELLO_TIMEOUT_MS = 1000;
-/** Safety deadline elsewhere; the DA1 sentinel normally resolves far sooner. */
 const HELLO_TIMEOUT_MS = 2000;
-/** A partial APC/DA1 head held back this long without more bytes is released as keys. */
 const PARTIAL_FLUSH_MS = 30;
-/** A TSP message head without its terminator is dropped after this long (never leaked as keys). */
 const PARTIAL_DROP_MS = 1500;
-/** An orphaned session (its extension instance unloaded) reverts to ANSI after this long without a successor. */
 const ORPHAN_MS = 4000;
-/** rmux `pane_tsp_view` poll interval. */
 const RMUX_POLL_MS = 2000;
 
-/** Description roots that make a component a modal sheet of its own (omp hoists these into `layer`). */
 const SHEET_KINDS: ReadonlySet<string> = new Set(["picker", "prefs", "overlay"]);
-/** Describers whose components are never sheets (and whose fingerprints are not free to run twice a frame). */
 const NOT_SHEETS: ReadonlySet<string> = new Set(["Editor", "Footer", "Container", "Text", "Markdown", "Spacer", "DynamicBorder", "Loader", "MouseRegion", "IdleStatus", "UserMessage", "AssistantMessage", "ToolExecution"]);
-/** How deep under a dock component (through plain Containers: pi's editorContainer) a sheet is looked for. */
 const SHEET_DEPTH = 3;
 
 const ENTER_ALT_SCREEN = "\x1b[?1049h";
@@ -56,15 +37,12 @@ const ENABLE_BUTTON_MOTION_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h
 const ENABLE_ALL_MOTION_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
-// ── Detection ───────────────────────────────────────────────────────────
-
 export interface Detection {
 	probe: boolean;
 	reason: string;
 	mux: boolean;
 }
 
-/** Whether to send a hello at all, and why. Never probes when nothing in the environment names a TSP path. */
 export function detect(env: NodeJS.ProcessEnv = process.env): Detection {
 	const override = env.PI_TUI_NATIVE;
 	const program = env.TERM_PROGRAM?.toLowerCase();
@@ -77,16 +55,12 @@ export function detect(env: NodeJS.ProcessEnv = process.env): Detection {
 	return { probe: false, reason: "no TSP terminal in the environment (TERM_PROGRAM/RMUX_TSP/PI_TUI_NATIVE)", mux };
 }
 
-// ── Registry (process-wide trampolines) ──────────────────────────────────
-
-/** pi-tui's `Terminal.drainInput`. */
 type DrainInput = (this: Any, maxMs?: number, idleMs?: number) => Promise<void>;
 
 interface Hooks {
 	render(tui: Any): boolean;
 	stop(tui: Any, options: Any): void;
 	input(buffer: Any, data: string): string;
-	/** Stands in for `terminal.drainInput` (pi awaits it before stopping at exit); `original` is the terminal's own. */
 	drain(terminal: Any, original: DrainInput, maxMs: number | undefined, idleMs: number | undefined): Promise<void>;
 }
 
@@ -96,18 +70,15 @@ interface Patched {
 	baseProto: Any;
 	baseStop: (this: Any, options?: Any) => void;
 	stdinProcess: (this: Any, data: unknown) => void;
-	/** The terminal instance whose `drainInput` is wrapped (see {@link wrapDrainInput}); absent until a session binds one. */
 	drain?: { terminal: Any; original: DrainInput; wrapper: DrainInput; own: boolean };
 }
 
-/** What a successor needs from an unloaded instance (duck-typed: the class comes from the old module). */
 export interface OrphanHandle {
 	readonly tui: Any | null;
 	readonly terminal: Any | null;
 	readonly hello: TspHello | null;
 	readonly lastProbe: ProbeResult | null;
 	readonly state: SessionState;
-	/** Hand over the live backend (if any) and stop everything else; returns the surface to continue. */
 	surrender(): { backend: NativeBackend | null; seq: number; surfaceCounter: number };
 }
 
@@ -115,7 +86,6 @@ interface Registry {
 	patched: Patched | null;
 	active: Hooks | null;
 	orphan: { session: OrphanHandle; timer: ReturnType<typeof setTimeout> } | null;
-	/** `/tsp off` persists across reloads within the process. */
 	userOff: boolean;
 }
 
@@ -133,7 +103,6 @@ function protoWithOwn(start: Any, name: string): Any | undefined {
 	return undefined;
 }
 
-/** Install the trampolines once per process; they delegate to `registry().active`. */
 export function installPatches(): void {
 	const reg = registry();
 	if (reg.patched) return;
@@ -166,7 +135,7 @@ export function installPatches(): void {
 			try {
 				h.stop(this, options);
 			} catch {
-				// never block pi's own stop
+				// A native cleanup error must not block pi's stop.
 			}
 		}
 		patched.baseStop.call(this, options);
@@ -199,18 +168,12 @@ export function uninstallPatches(): void {
 	reg.patched = null;
 }
 
-/**
- * Wrap `terminal.drainInput` with a trampoline to `registry().active` (as the prototype patches are), once per
- * terminal instance: the wrapper lives in the registry, so a reloaded instance reuses it and `uninstallPatches`
- * restores the terminal's own. Called wherever a session binds its terminal.
- */
 function wrapDrainInput(terminal: Any | null): void {
 	const reg = registry();
 	const patched = reg.patched;
 	if (!patched || !terminal || typeof terminal.drainInput !== "function") return;
 	if (patched.drain) {
 		if (patched.drain.terminal === terminal && terminal.drainInput === patched.drain.wrapper) return;
-		// Another terminal (or a wrapper someone replaced): give the old one its own back first.
 		if (patched.drain.terminal.drainInput === patched.drain.wrapper) {
 			if (patched.drain.own) patched.drain.terminal.drainInput = patched.drain.original;
 			else delete patched.drain.terminal.drainInput;
@@ -221,10 +184,10 @@ function wrapDrainInput(terminal: Any | null): void {
 	const own = Object.hasOwn(terminal, "drainInput");
 	const wrapper: DrainInput = function (this: Any, maxMs?: number, idleMs?: number): Promise<void> {
 		const h = reg.active;
-		// Hooks of an instance loaded before this patch existed have no `drain`.
 		if (h && typeof h.drain === "function") return h.drain(this, original, maxMs, idleMs);
 		return original.call(this, maxMs, idleMs);
 	};
+	// At exit pi awaits drainInput before it stops reading terminal input.
 	terminal.drainInput = wrapper;
 	patched.drain = { terminal, original, wrapper, own };
 }
@@ -233,16 +196,12 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ── Session ─────────────────────────────────────────────────────────────
-
 export type SessionState = "idle" | "probing" | "live" | "ansi" | "closed";
 
 interface ProbeRun {
 	startedAt: number;
 	timer: ReturnType<typeof setTimeout>;
-	/** Hold rendering until the probe resolves (initial probe: nothing painted yet). */
 	hold: boolean;
-	/** What to do with a positive reply. */
 	onNative: (hello: TspHello) => void;
 	onAnsi: (reason: string) => void;
 }
@@ -258,7 +217,6 @@ export class TspSession {
 	readonly detection: Detection;
 	readonly hooks: Hooks;
 	state: SessionState = "idle";
-	/** User asked for ANSI (`/tsp off`) or an exception reverted us: no automatic re-probe. */
 	disabled: string | null = null;
 	tui: Any | null = null;
 	terminal: Any | null = null;
@@ -308,8 +266,6 @@ export class TspSession {
 		this.log(`session created: probe=${detection.probe} (${detection.reason}) mux=${detection.mux}`);
 	}
 
-	// ── Logging ───────────────────────────────────────────────────────
-
 	log(message: string, data?: Record<string, unknown>): void {
 		const line = `${new Date().toISOString()} ${message}${data ? ` ${safeJson(data)}` : ""}`;
 		this.#log.push(line);
@@ -332,9 +288,6 @@ export class TspSession {
 		return this.#log.slice(-count);
 	}
 
-	// ── Lifecycle ─────────────────────────────────────────────────────
-
-	/** Become the process's active session (installing the trampolines). */
 	activate(): void {
 		installPatches();
 		registry().active = this.hooks;
@@ -346,7 +299,6 @@ export class TspSession {
 		if (this.backend?.live) this.tui?.requestRender();
 	}
 
-	/** Hand everything to a successor (called by the new instance after a reload). */
 	surrender(): { backend: NativeBackend | null; seq: number; surfaceCounter: number } {
 		this.#cancelProbe();
 		this.#stopRmuxPoll();
@@ -357,7 +309,6 @@ export class TspSession {
 		return { backend: seq > 0 ? backend : null, seq, surfaceCounter: this.#surfaceCounter };
 	}
 
-	/** Continue the surface an unloaded instance left live (reload): same surface id, sequence continues. */
 	takeOver(previous: OrphanHandle): void {
 		this.tui = previous.tui;
 		this.terminal = previous.terminal;
@@ -387,10 +338,6 @@ export class TspSession {
 		}
 	}
 
-	/**
-	 * The extension instance is going away. `reload`-like reasons keep the
-	 * surface live for a successor (orphan); anything else tears down now.
-	 */
 	shutdown(reason: string): void {
 		const reg = registry();
 		if (reason !== "quit" && this.backend?.live && reg.active === this.hooks) {
@@ -410,7 +357,6 @@ export class TspSession {
 		this.dispose(reason);
 	}
 
-	/** Full teardown: close the surface, restore ANSI, uninstall the trampolines and the input shim. Idempotent. */
 	dispose(reason: string): void {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -426,7 +372,7 @@ export class TspSession {
 			try {
 				this.backend!.stop(false);
 			} catch {
-				// terminal may be gone
+				// The terminal may already be gone.
 			}
 			releaseNativeSideEffects();
 			this.#restoreScreen();
@@ -441,15 +387,11 @@ export class TspSession {
 			try {
 				this.tui.requestRender(true);
 			} catch {
-				// ignore
 			}
 		}
 		this.log("disposed", { reason });
 	}
 
-	// ── Commands ──────────────────────────────────────────────────────
-
-	/** `/tsp off`: back to ANSI now and stay there. */
 	off(reason = "/tsp off"): void {
 		this.disabled = reason;
 		registry().userOff = true;
@@ -462,7 +404,6 @@ export class TspSession {
 		} else this.state = this.state === "idle" ? "ansi" : this.state;
 	}
 
-	/** `/tsp on`: re-probe (also clears a disabled flag). */
 	on(): string {
 		this.disabled = null;
 		registry().userOff = false;
@@ -501,8 +442,6 @@ export class TspSession {
 		return lines.join("\n");
 	}
 
-	// ── Hooks ─────────────────────────────────────────────────────────
-
 	#onRender(tui: Any): boolean {
 		if (this.#closed || tui.stopped) return false;
 		if (this.terminal && tui.terminal !== this.terminal) return false;
@@ -514,7 +453,6 @@ export class TspSession {
 			if (first) {
 				const reg = registry();
 				if (reg.orphan && (reg.orphan.session as unknown) !== this) {
-					// A predecessor left a live surface for us.
 					const previous = reg.orphan.session;
 					clearTimeout(reg.orphan.timer);
 					reg.orphan = null;
@@ -524,7 +462,6 @@ export class TspSession {
 				if (this.state === "idle" && this.detection.probe && !this.disabled) this.#reprobe(true);
 			}
 		}
-		// After a stop/start cycle (suspend, external editor, mode switch) the surface was closed: re-probe and adopt it.
 		if (this.state === "ansi" && this.#resumeOnRender && !this.#probe && !this.disabled && this.detection.probe) {
 			this.#resumeOnRender = false;
 			this.#reprobe(true);
@@ -544,10 +481,9 @@ export class TspSession {
 		this.#cancelProbe();
 		this.#stopRmuxPoll();
 		if (this.state === "live" && this.backend?.live) {
-			// Terminal handed back (quit, suspend, external editor, mode switch): keep the transcript, close live chrome.
 			this.backend.stop(true);
 			releaseNativeSideEffects();
-			// A fullscreen TUI's own stop paths skip the alt screen (we already left it): nothing to restore here.
+			// pi skips alternate screen cleanup when native rendering has already left it.
 			this.state = "ansi";
 			this.#pendingResume = true;
 			this.#resumeOnRender = true;
@@ -558,17 +494,9 @@ export class TspSession {
 	}
 
 	/**
-	 * pi's quit awaits `terminal.drainInput()` and then stops reading; pi-tui's returns after 50 ms without input.
-	 * A frame sent shortly before may be acknowledged later than that (rsttyd acks from the browser, so over the
-	 * network; rmux, SSH), and the `ack` would be typed into the shell. While the surface is live, a DA1 query is
-	 * written first: the terminal answers it after everything it sent before reading it, so draining until the
-	 * input shim sees that reply (and input has gone idle after it) takes the in-flight messages in. Bounded by
-	 * `maxMs`, as pi's drain is. A terminal without a live surface is not queried: its DA1 reply could itself leak.
-	 * The synchronous `ui.stop()` paths (external editor, suspend) cannot wait and are not covered (omp
-	 * `terminal.ts` `drainInput`, f94a57db67).
+	 * The terminal sends earlier frame acknowledgements before answering DA1.
 	 */
 	async #onDrain(terminal: Any, original: DrainInput, maxMs: number | undefined, idleMs: number | undefined): Promise<void> {
-		// A terminal that isn't reading input can't hand us the reply (as in `#reprobe`).
 		const reading = !("inputHandler" in terminal) || terminal.inputHandler !== undefined;
 		const backend = this.backend;
 		if (this.#closed || terminal !== this.terminal || this.state !== "live" || !backend?.live || !reading) return original.call(terminal, maxMs, idleMs);
@@ -590,12 +518,10 @@ export class TspSession {
 		try {
 			for (;;) {
 				const before = Date.now();
-				// pi's own drain (it also takes the input handler away): returns once input has been idle, or at the deadline.
 				await original.call(terminal, Math.max(0, endTime - before), idle);
 				if (sentinel.answered) break;
 				const now = Date.now();
 				if (now >= endTime) break;
-				// The reply is still out: drain again. A terminal whose drain returns at once must not spin.
 				if (now === before) await sleep(Math.min(Math.max(1, idle), endTime - now));
 			}
 		} finally {
@@ -604,17 +530,13 @@ export class TspSession {
 		}
 	}
 
-	/** The closed surface is adopted (not re-opened) by the next positive probe. */
 	#pendingResume = false;
-	/** After a stop/start cycle the next render re-probes. */
 	#resumeOnRender = false;
-
-	// ── Probe ─────────────────────────────────────────────────────────
 
 	#reprobe(hold: boolean, manual = false): void {
 		if (!this.tui || !this.terminal || this.#probe) return;
 		if (!this.detection.probe && !manual) return;
-		// A terminal that isn't reading input (stopped for exit) can't answer; a late DA1 reply would reach the shell.
+		// A DA1 reply can reach the shell once pi stops reading input.
 		if ("inputHandler" in this.terminal && this.terminal.inputHandler === undefined) {
 			this.log("probe skipped: terminal not started");
 			return;
@@ -645,7 +567,7 @@ export class TspSession {
 		};
 		this.#probe.timer.unref?.();
 		try {
-			// The DA1 sentinel: a terminal that doesn't speak TSP answers it first. rmux orders a hello reply ahead of its own DA1.
+			// TSP terminals answer the hello before DA1.
 			terminal.write(`${encodeTspHelloQuery(APP_NAME, HELLO_FEATURES, EXT_VERSION)}\x1b[c`);
 			this.log("hello sent", { hold, manual, timeout });
 		} catch (error) {
@@ -672,7 +594,6 @@ export class TspSession {
 		else probe.onNative(hello);
 	}
 
-	/** A complete TSP message from the terminal (replies and events). */
 	onTspMessage(sequence: string): void {
 		if (this.#closed) return;
 		try {
@@ -692,14 +613,11 @@ export class TspSession {
 		}
 	}
 
-	/** The DA1 sentinel answered while a probe is pending: the terminal doesn't speak TSP. */
 	onDa1Sentinel(): boolean {
 		if (!this.#probe) return false;
 		this.#resolveProbe(null, "DA1 answered before a hello reply: the terminal, or a layer in between, dropped the APC query");
 		return true;
 	}
-
-	// ── Switching ─────────────────────────────────────────────────────
 
 	#goNative(hello: TspHello): void {
 		if (!this.tui || !this.terminal) return;
@@ -727,7 +645,6 @@ export class TspSession {
 		}
 	}
 
-	/** Leave native rendering: close the surface, hand the screen back to pi's row renderer. */
 	#goAnsi(reason: string, keep: boolean): void {
 		this.#cancelProbe();
 		if (this.backend?.live) {
@@ -748,7 +665,6 @@ export class TspSession {
 		}
 	}
 
-	/** Any exception in the native path: ANSI for the rest of the session, one warning. */
 	fail(error: unknown): void {
 		const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
 		this.warn("native rendering failed; reverting to ANSI", { error: message });
@@ -757,14 +673,12 @@ export class TspSession {
 		try {
 			this.#goAnsi(this.disabled, false);
 		} catch (inner) {
-			// Last resort: make sure pi paints something.
 			this.state = "ansi";
 			this.backend = null;
 			releaseNativeSideEffects();
 			try {
 				this.tui?.requestRender(true);
 			} catch {
-				// ignore
 			}
 			this.log(`fallback itself failed: ${String(inner)}`);
 		}
@@ -773,12 +687,10 @@ export class TspSession {
 			try {
 				this.ctx?.ui.notify(`tsp-native: native rendering failed, back to ANSI (${error instanceof Error ? error.message : String(error)}). /tsp on to retry.`, "warning");
 			} catch {
-				// no UI
 			}
 		}
 	}
 
-	/** Erase whatever pi's row renderer painted so the surface opens where the rows began. */
 	#eraseRows(): void {
 		const tui: Any = this.tui!;
 		const terminal = this.terminal!;
@@ -804,7 +716,6 @@ export class TspSession {
 		terminal.hideCursor?.();
 	}
 
-	/** Back to rows: a fullscreen TUI re-enters the alternate screen; a regular one repaints from a cleared screen. */
 	#restoreScreen(): void {
 		const tui = this.tui;
 		const terminal = this.terminal;
@@ -817,8 +728,6 @@ export class TspSession {
 		}
 		tui.resetRenderState?.();
 	}
-
-	// ── Backend host ──────────────────────────────────────────────────
 
 	#host(): BackendHost {
 		return {
@@ -843,7 +752,6 @@ export class TspSession {
 			onTerminalEvent: (event) => this.#onTerminalEvent(event),
 			resolver: {
 				describe: (component, cx) => {
-					// A container a sheet was hoisted out of describes without it (the sheet is in `layer`).
 					const hoisted = this.#hoistedFrom.get(component);
 					return hoisted ? this.#withoutSheets(component, hoisted) : describeComponent(component, cx);
 				},
@@ -856,7 +764,6 @@ export class TspSession {
 	#onTerminalEvent(event: TspEvent): void {
 		switch (event.ev) {
 			case "gone": {
-				// Adopt found nothing: open a fresh surface.
 				this.log("surface gone; opening a fresh one");
 				if (this.hello && this.state === "live") {
 					this.backend?.detach();
@@ -881,23 +788,13 @@ export class TspSession {
 		return this.#overlayWidths.get(component) ?? (cx.cols > 0 ? cx.cols : undefined);
 	}
 
-	/**
-	 * `main` = the transcript's blocks: pi's document container (`tui.children[0]` in both TUI modes; fullscreen only
-	 * adds a layout root over the same children) with its plain layout containers opened, so each chat entry is a
-	 * direct child, as omp's blocks are. `dock` = everything else pi mounted, `layer` = visible overlays.
-	 *
-	 * Sheets (omp's docked-picker hoisting): a component pi mounted in the dock (a selector swapped into the editor
-	 * slot) whose description root is a `picker`, `prefs` or `overlay` is its own modal sheet: it goes into `layer`
-	 * as is, and the container it sits in describes without it for the frame. Overlay-stack components that are
-	 * sheets (`nativeSheet(cx)`, or such a root) go in unwrapped too. While any sheet or modal overlay is up, the
-	 * terminal's focus follows pi's only inside it (see {@link #focused}).
-	 */
 	#regions(cx: DescribeContext): NativeRegions {
 		const tui = this.tui!;
 		const children: Component[] = tui.children ?? [];
+		// The first child of pi's TUI is the transcript in either screen mode.
 		const main = children.length > 0 ? transcriptBlocks(children[0]!) : [];
 		const mounted = children.slice(1);
-		// Before anything below is described: the editor then leaves its list out of the composer.
+		// Mark autocomplete as layered before describing the editor to prevent a duplicate list.
 		const complete = editorAutocompleteOverlay(mounted);
 		const sheets: Component[] = [];
 		const hoistedFrom = new Map<Component, readonly Component[]>();
@@ -936,32 +833,25 @@ export class TspSession {
 		return { main, dock, layer };
 	}
 
-	/** Containers a sheet was hoisted out of this frame, with the hoisted children. */
 	#hoistedFrom = new Map<Component, readonly Component[]>();
-	/** Sheets and modal overlays up this frame (outermost components). */
 	#modalRoots: readonly Component[] = [];
-	/** A hoisting container's description without its sheets, kept while its other children stay the same. */
 	#stripped = new WeakMap<Component, { rest: readonly Component[]; node: NativeNode }>();
 
-	/** Whether `component` describes as a sheet: a `picker`, `prefs` or `overlay` root (or says so: `nativeSheet`). */
 	#isSheet(component: Component, cx: DescribeContext): boolean {
 		const a = component as Any;
 		if (typeof a.nativeSheet === "function") {
 			try {
 				if (a.nativeSheet(cx) === true) return true;
 			} catch {
-				// not a sheet
 			}
 		}
 		const by = describerFor(component);
 		const own = typeof a.describe === "function" && !isPlainContainer(component);
-		// The editor and other chrome are never sheets; don't run their fingerprints twice a frame.
 		if (by ? NOT_SHEETS.has(by.name) : !own) return false;
 		const described = describeComponent(component, cx);
 		return described !== null && SHEET_KINDS.has(described.k);
 	}
 
-	/** Sheets mounted inside `container` through plain Containers (pi's editorContainer holds a selector). */
 	#findSheets(container: Component, cx: DescribeContext, sheets: Component[], hoistedFrom: Map<Component, readonly Component[]>, depth: number): void {
 		if (depth > SHEET_DEPTH || !isPlainContainer(container)) return;
 		const kids: Component[] = (container as Any).children;
@@ -987,14 +877,11 @@ export class TspSession {
 		return described;
 	}
 
-	/**
-	 * The component whose first `editor`/`input` the terminal focuses: pi's focused one, unless a sheet or modal
-	 * overlay is up and it lies outside every one of them (then none: the terminal keeps no field, keys reach pi).
-	 */
 	#focused(): Component | null {
 		const focused = (this.tui?.focusedComponent as Component | null | undefined) ?? null;
 		if (!focused || this.#modalRoots.length === 0) return focused;
 		for (const root of this.#modalRoots) if (root === focused || contains(root, focused)) return focused;
+		// A focused terminal field outside the modal can intercept keys meant for pi.
 		return null;
 	}
 
@@ -1005,10 +892,8 @@ export class TspSession {
 			const layout = typeof this.tui!.resolveOverlayLayout === "function" ? this.tui!.resolveOverlayLayout(options ?? {}, 0, cols, Math.max(1, Number(this.terminal?.rows ?? 24))) : undefined;
 			if (layout && typeof layout.width === "number" && layout.width > 0) width = Math.min(cols, layout.width);
 		} catch {
-			// use the surface width
 		}
 		this.#overlayWidths.set(component, width);
-		// A component describing its own sheet (a picker, prefs or overlay root) goes in unwrapped (omp backend.ts).
 		if (this.#isSheet(component, cx)) return component;
 		const own = overlaySpec((component as Any).nativeOverlay);
 		const anchor = own.anchor ?? (options?.anchor?.startsWith?.("top") ? "top" : options?.anchor?.startsWith?.("bottom") ? "bottom" : "center");
@@ -1041,7 +926,7 @@ export class TspSession {
 			try {
 				variant[key] = colorToHex(colors[key]);
 			} catch {
-				// skip tokens that aren't colors
+				// Theme entries are not always colors.
 			}
 		}
 		const dark = theme.appearance !== "light";
@@ -1049,8 +934,6 @@ export class TspSession {
 		this.#paletteCache = { theme, colors, palette };
 		return palette;
 	}
-
-	// ── rmux view polling ─────────────────────────────────────────────
 
 	#startRmuxPoll(): void {
 		if (this.#rmuxTimer || this.#closed || this.disabled) return;
@@ -1080,16 +963,13 @@ export class TspSession {
 		this.#rmuxSeen = 0;
 	}
 
-	/** rmux's desired renderer for the pane's viewers; act after two consistent readings. */
 	#onRmuxView(view: string): void {
 		if (this.#logPath) this.log(`rmux poll: ${view} (state=${this.state})`);
 		if (view !== this.#rmuxView) {
 			this.#rmuxView = view;
 			this.#rmuxSeen = 0;
 		}
-		// Going native is cheap and reversible: act on the first reading; leaving native repaints everything: wait for two.
 		const seen = ++this.#rmuxSeen;
-		// A failed re-probe (no reply) while rmux still says native retries every fifth reading (~10 s).
 		if (view === "native" ? seen !== 1 && seen % 5 !== 0 : seen !== 2) return;
 		if (view === "native" && this.state === "ansi" && !this.#probe) {
 			this.log("rmux view is native again: re-probing");
@@ -1103,23 +983,15 @@ export class TspSession {
 	}
 }
 
-// ── Input shim ──────────────────────────────────────────────────────────
-
 const DA1_PATTERN = /\x1b\[\?[\d;]*c/;
 const DA1_PREFIX = /\x1b(\[(\?[\d;]*)?)?$/;
 
-/**
- * Sits in front of pi's StdinBuffer: reassembles `ESC _ tsp;… ESC \` messages
- * across chunks (so a split reply never reaches the editor as keys), and
- * swallows the DA1 sentinel while a probe or an exit drain is pending.
- */
 export class InputShim {
 	#session: TspSession;
 	#pending = "";
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#pendingSince = 0;
 	probing = false;
-	/** Set while an exit drain waits for its DA1 sentinel (`TspSession` `#onDrain`): called once, on the reply. */
 	drainSentinel: (() => void) | undefined;
 
 	constructor(session: TspSession) {
@@ -1133,14 +1005,12 @@ export class InputShim {
 		this.#answerDrain();
 	}
 
-	/** Release a pending exit drain (its sentinel answered, or the shim is going away). */
 	#answerDrain(): void {
 		const answered = this.drainSentinel;
 		this.drainSentinel = undefined;
 		answered?.();
 	}
 
-	/** Returns the bytes pi should see; TSP messages and the sentinel are consumed. */
 	filter(data: string): string {
 		if (this.#timer) {
 			clearTimeout(this.#timer);
@@ -1152,15 +1022,13 @@ export class InputShim {
 		for (;;) {
 			const start = buf.indexOf(TSP_PREFIX);
 			if (start === -1) {
-				// A tail that could begin a TSP message (or the DA1 sentinel's reply while one is out) waits for the next chunk.
 				const hold = this.#partialTail(buf);
 				out += buf.slice(0, buf.length - hold.length);
 				this.#pending = hold;
 				break;
 			}
 			out += buf.slice(0, start);
-			// The body is JSON (every control character escaped): the next ESC is either the ST or an
-			// interruption by another sequence, which aborts the message (as oh-my-pi's reader does).
+			// JSON escapes ESC in the message body.
 			const esc = buf.indexOf("\x1b", start + TSP_PREFIX.length);
 			if (esc === -1) {
 				this.#pending = buf.slice(start);
@@ -1202,14 +1070,10 @@ export class InputShim {
 		return "";
 	}
 
-	/**
-	 * While a sentinel is out, the first DA1 reply pi isn't waiting for itself is its answer: a pending probe
-	 * resolves negatively, a pending exit drain is released.
-	 */
 	#consumeSentinel(out: string): string {
 		const terminal = this.#session.terminal as Any | null;
 		const tui = this.#session.tui as Any | null;
-		// pi's own DA1 queries (kitty keyboard negotiation, colour probes) are answered first; the next reply is ours.
+		// Replies to pi's DA1 queries arrive before the sentinel reply.
 		let owed: number = (terminal?.pendingKeyboardProtocolDeviceAttributes ?? 0) + (tui?.pendingTerminalColorQueries?.length ?? 0);
 		let at = 0;
 		for (;;) {
@@ -1238,20 +1102,17 @@ export class InputShim {
 			this.#session.warn("dropped an unterminated TSP message", { length: pending.length });
 			return;
 		}
-		// Not a TSP head after all (a lone Escape, a DA1 fragment): hand it to pi.
 		const buffer = (this.#session.terminal as Any | null)?.stdinBuffer;
 		const original = registry().patched?.stdinProcess;
 		if (buffer && original) original.call(buffer, pending);
 	}
 }
 
-/** An exact pi-tui `Container` (selectors and blocks extend it: those are components of their own). */
 function isPlainContainer(c: Component): boolean {
 	const ctor = (c as Any).constructor;
 	return (ctor === Container || ctor?.name === "Container") && Array.isArray((c as Any).children);
 }
 
-/** Whether `target` is `root` or mounted under it (`children` arrays, a `child`), a few levels deep. */
 function contains(root: Component, target: Component): boolean {
 	const seen = new Set<unknown>();
 	const visit = (c: unknown, depth: number): boolean => {
@@ -1265,7 +1126,6 @@ function contains(root: Component, target: Component): boolean {
 	return visit(root, 0);
 }
 
-/** What an overlay component asks of its `overlay` wrapper (omp's `nativeOverlay`). */
 interface OverlaySpec {
 	anchor?: "center" | "top" | "bottom" | { node: string; side: "above" | "below" } | { caret: string };
 	size?: "sm" | "md" | "lg" | "full";

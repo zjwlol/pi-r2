@@ -1,12 +1,3 @@
-/**
- * hashline/block.ts: what happens to block locators (`PUT N*:`, `CUT N*`, `PUT >N*:`, `PUT N* @r`).
- *
- * Upstream (oh-my-pi `crates/pi-edit/src/modes/hashline/block.rs`, MIT) resolves `N*` with a
- * tree-sitter parse of the file. Vanilla pi ships no parser, so this port behaves as upstream does
- * for a file whose language it does not know: replace / cut forms are rejected with upstream's
- * "could not resolve a syntactic block" message, insert / paste-after forms are applied as the
- * plain `PUT >N` with upstream's warning.
- */
 import {
 	blockUnresolvedMessage,
 	insertAfterBlockCloserLoweredWarning,
@@ -17,10 +8,8 @@ import {
 import { hasBlockEdit } from "./parser.ts";
 import { type Edit, HashlineError } from "./types.ts";
 
-/** A line holding only closing delimiters and an optional `;` or `,`. */
 export const STRUCTURAL_CLOSER_RE = /^\s*[)\]}]+[;,]?\s*$/;
 
-/** Lower block edits to ordinary edits, or throw HashlineError("apply") for replace / cut forms. */
 export function resolveBlockEdits(edits: readonly Edit[], text: string, onWarning: (warning: string) => void): Edit[] {
 	if (!hasBlockEdit(edits)) return [...edits];
 	const lines = text.split("\n");

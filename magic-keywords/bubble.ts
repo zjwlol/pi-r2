@@ -1,13 +1,3 @@
-/**
- * Glow magic keywords in sent user messages (static gradient), like oh-my-pi's
- * message bubbles.
- *
- * Built-in user messages are rendered by UserMessageComponent, which
- * extensions can't replace, so its render() is wrapped on the shared
- * prototype (once per process). Behavior is delegated to a hook on globalThis
- * that each extension runtime installs/clears, so /reload picks up new code.
- * Any failure falls back to the original rendering.
- */
 import { UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { findKeywords } from "./keywords.ts";
 import { type PaintOptions, paintLines } from "./paint.ts";
@@ -33,6 +23,7 @@ export function patchUserMessages(): boolean {
 	const origRender = proto.render;
 	if (typeof origRender !== "function") return false;
 
+	// Pi does not let extensions replace the built-in user message component.
 	proto.render = function (this: { text?: unknown }, width: number): string[] {
 		const lines: string[] = origRender.call(this, width);
 		const hook = (globalThis as GlobalWithHook)[HOOK];

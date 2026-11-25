@@ -1,42 +1,18 @@
-/**
- * Reconciler: turns successive component descriptions into minimal TSP ops.
- * Ported (simplified) from oh-my-pi `native/reconcile.ts`.
- *
- * Ids. Every component instance gets a stable base-36 id (its root node's
- * wire id); a node nested inside it gets `<base>.<keypath>`, where the keypath
- * joins each level's `key` (or child index) with `/`. Ids derive from the
- * description itself, so the reconciler's memory is, per mounted component,
- * the node object it last returned, the component boundaries found inside it,
- * and rows-fallback bookkeeping.
- *
- * Diffing. Reference-equal nodes are skipped without walking; component
- * boundaries inside them are still visited through the recorded boundary
- * list. Children are matched by id; keyed reorders become `move`s placed
- * around the longest run of children that kept their order; removals are
- * deferred to the end of the frame so a component moved elsewhere in the same
- * frame keeps its terminal-side state. Primary text that extends the previous
- * text becomes `text append`; editor/md edits past a shared head become
- * `splice`.
- *
- * Simplifications vs oh-my-pi: no settling, no overlay hoisting (the backend
- * places overlays under `layer` itself), and a component that reappears
- * inside a freshly added subtree is deleted and re-added rather than parked.
- */
 import { CURSOR_MARKER, type Component } from "@earendil-works/pi-tui";
 import { type DescribeContext, isComponent, type NativeChild, type NativeNode, type NativeRegions } from "./node.ts";
 import { TSP_TEXT_KINDS, type TspKind, type TspNode, type TspOp } from "./wire.ts";
 
-/** pi-tui's fake cursor markers (not exported from its index). */
+/**
+ * These escapes must match pi's fake cursor markers.
+ */
 const FAKE_CURSOR_START = "\x1b_pi:fc\x07";
 const FAKE_CURSOR_END = "\x1b_pi:/fc\x07";
 
 export interface NativeTarget {
 	readonly component: Component;
-	/** Keypath inside the component ("" for its root node). */
 	readonly keypath: string;
 }
 
-/** Describes a component (null: fall back to rows) and names the rows width to use for it. */
 export interface Resolver {
 	describe(component: Component, cx: DescribeContext): NativeNode | null;
 	rowsCols?(component: Component, cx: DescribeContext): number | undefined;
@@ -53,10 +29,11 @@ const REGION_IDS = ["main", "dock", "layer"] as const;
 type RegionId = (typeof REGION_IDS)[number];
 const RESERVED_IDS: ReadonlySet<string> = new Set(REGION_IDS);
 const TEXT_KINDS: ReadonlySet<string> = new Set(TSP_TEXT_KINDS);
-/** Process-wide counter (survives extension reloads, so ids never collide across module instances). */
+/**
+ * Component IDs must stay unique across extension reloads.
+ */
 const kNextId = "__piTspNativeNextComponentId__";
 
-/** Stable base-36 wire id of a component instance (its root node's id). */
 export function nativeComponentId(component: Component): string {
 	const tagged = component as IdTagged;
 	let id = tagged[kNativeId];
@@ -106,7 +83,6 @@ export function deepEqual(a: unknown, b: unknown): boolean {
 	return true;
 }
 
-/** Longest increasing subsequence over non-negative `sources`; marks the members. */
 function stableMask(sources: readonly number[]): boolean[] {
 	const n = sources.length;
 	const mask = Array.from({ length: n }, () => false);
@@ -149,7 +125,6 @@ interface CompEntry {
 
 type Entry = NodeEntry | CompEntry;
 
-/** A nested component boundary met by a component's walk, with its document position. */
 interface Inner {
 	readonly comp: Component;
 	readonly parent: string;
@@ -171,13 +146,11 @@ interface CompState {
 
 interface Walk {
 	readonly owner: Owner;
-	/** Records the owner's boundaries (null: don't record). */
 	readonly inner: Inner[] | null;
 }
 
 const EMPTY_ENTRIES: readonly Entry[] = [];
 
-/** One surface's reconciler. */
 export class Reconciler {
 	readonly surface: string;
 	#resolver: Resolver;
@@ -191,9 +164,7 @@ export class Reconciler {
 	#regions: Record<RegionId, readonly Entry[]> | null = null;
 	#rows = 0;
 	#gone = new Set<string>();
-	/** Regions to re-add from scratch on the next frame (after `detachLive`/`resetRegions`). */
 	#readd: readonly RegionId[] = [];
-	/** Regions to delete first on the next frame (`resetRegions`). */
 	#predel: readonly RegionId[] = [];
 	#regionOwners: Record<RegionId, Owner> = {
 		main: { base: "main", state: null },
@@ -206,17 +177,14 @@ export class Reconciler {
 		this.#resolver = resolver;
 	}
 
-	/** `rows` fallback nodes in the last reconciled frame. */
 	get fallbackCount(): number {
 		return this.#rows;
 	}
 
-	/** Mounted components. */
 	get mounted(): number {
 		return this.#states.size;
 	}
 
-	/** Diff the regions against the previous frame; the first call adds everything. */
 	reconcile(regions: NativeRegions, cx: DescribeContext): TspOp[] {
 		this.#cx = cx;
 		this.#frame++;
@@ -241,6 +209,7 @@ export class Reconciler {
 			next[region] = entries;
 		}
 		this.#regions = next;
+		// Delete old subtrees after moves to preserve moved components.
 		for (const entry of this.#dels) this.#deleteEntry(entry);
 		this.#dels = [];
 		for (const [id, at] of this.#reveals) this.#ops.push(["reveal", id, at]);
@@ -250,9 +219,7 @@ export class Reconciler {
 	}
 
 	/**
-	 * The surface was closed (`keep:true`) and is being adopted: the terminal
-	 * dropped `dock`, `layer` and focus but kept `main`. The next frame re-adds
-	 * the live regions from scratch and keeps diffing `main`.
+	 * The terminal keeps only `main` after a close with `keep: true`.
 	 */
 	detachLive(): void {
 		const regions = this.#regions;
@@ -271,10 +238,6 @@ export class Reconciler {
 		this.#readd = ["dock", "layer"];
 	}
 
-	/**
-	 * Take over a surface another reconciler filled: the next frame deletes the
-	 * three regions and adds everything from scratch, in place.
-	 */
 	resetRegions(): void {
 		this.#states.clear();
 		this.#byId.clear();
@@ -284,7 +247,6 @@ export class Reconciler {
 		this.#gone.clear();
 	}
 
-	/** The component and keypath that described wire node `id`. */
 	target(id: string): NativeTarget | null {
 		const dot = id.indexOf(".");
 		const state = this.#byId.get(dot === -1 ? id : id.slice(0, dot));
@@ -293,7 +255,6 @@ export class Reconciler {
 		return { component: state.comp, keypath };
 	}
 
-	/** The component that described wire node `id`, then each component whose node contains it, innermost first. */
 	owners(id: string): Component[] {
 		const dot = id.indexOf(".");
 		const out: Component[] = [];
@@ -301,7 +262,6 @@ export class Reconciler {
 		return out;
 	}
 
-	/** The key a list item node was described with (its key, else its child index). */
 	itemKey(id: string): string {
 		const dot = id.indexOf(".");
 		if (dot === -1) return this.#byId.get(id)?.node?.key ?? id;
@@ -309,13 +269,11 @@ export class Reconciler {
 		return unescapeKey(id.slice(Math.max(dot, slash) + 1));
 	}
 
-	/** Wire id of the first `editor`/`input` `component` describes (for `focus`), or null. */
 	focusTarget(component: Component): string | null {
 		const state = this.#states.get(component);
 		return state ? this.#findEditor(state, 0) : null;
 	}
 
-	/** Stop referencing ids the terminal dropped (`gone`). */
 	forget(ids: readonly string[]): void {
 		for (const id of ids) this.#gone.add(id);
 	}
@@ -354,8 +312,6 @@ export class Reconciler {
 		return null;
 	}
 
-	// ── Entries ──────────────────────────────────────────────────────────
-
 	#entries(children: readonly NativeChild[] | undefined, keypath: string, owner: Owner): readonly Entry[] {
 		if (!children || children.length === 0) return EMPTY_ENTRIES;
 		const out: Entry[] = [];
@@ -381,8 +337,6 @@ export class Reconciler {
 		}
 		return out;
 	}
-
-	// ── Children ─────────────────────────────────────────────────────────
 
 	#diffChildren(parent: string, oldEntries: readonly Entry[], newEntries: readonly Entry[], tailBefore: string | null, walk: Walk): void {
 		const oldIndex = new Map<string, number>();
@@ -423,7 +377,6 @@ export class Reconciler {
 		}
 	}
 
-	/** Put a child that wasn't under `parent` last frame before `before`. */
 	#place(entry: Entry, parent: string, before: string | null, next: string | null, walk: Walk): void {
 		if (entry.comp === undefined) {
 			this.#ops.push(["add", entry.id, parent, before, this.#materialize(entry, walk)]);
@@ -466,8 +419,6 @@ export class Reconciler {
 		});
 	}
 
-	// ── Nodes ────────────────────────────────────────────────────────────
-
 	#diffNode(old: NodeEntry, next: NodeEntry, parent: string, before: string | null, walk: Walk): void {
 		if (old.node === next.node) {
 			this.#revisitNode(next, walk);
@@ -485,7 +436,6 @@ export class Reconciler {
 		this.#diffChildren(next.id, oldEntries, newEntries, null, walk);
 	}
 
-	/** Walk an unchanged node for the component boundaries inside it. */
 	#revisitNode(entry: NodeEntry, walk: Walk): void {
 		const entries = this.#entries(entry.node.c, entry.keypath, entry.owner);
 		for (let i = 0; i < entries.length; i++) {
@@ -542,7 +492,6 @@ export class Reconciler {
 		this.#ops.push(["text", id, "replace", newText]);
 	}
 
-	/** Props as sent: a card/section `head` child key and a list's `selected` key resolved to wire ids. */
 	#wireProps(node: NativeNode, entries: readonly Entry[]): Readonly<Record<string, unknown>> | undefined {
 		const props = node.p as Readonly<Record<string, unknown>> | undefined;
 		switch (node.k) {
@@ -563,7 +512,6 @@ export class Reconciler {
 		}
 	}
 
-	/** A full wire subtree for an entry; nested components get states. */
 	#materialize(entry: NodeEntry, walk: Walk): TspNode {
 		if (entry.node.reveal) this.#reveals.push([entry.id, entry.node.reveal]);
 		const entries = this.#entries(entry.node.c, entry.keypath, entry.owner);
@@ -582,7 +530,7 @@ export class Reconciler {
 			const before = i + 1 < entries.length ? entries[i + 1]!.id : null;
 			walk.inner?.push({ comp: child.comp, parent: entry.id, before });
 			if (state) {
-				// Mounted elsewhere: rebuild it here (its old node goes first so the id stays unique).
+				// The old node must be deleted before its ID can be reused.
 				this.#dropState(state);
 				this.#ops.push(["del", state.id]);
 			}
@@ -616,8 +564,6 @@ export class Reconciler {
 		state.container = this.#containerOf(parent);
 	}
 
-	// ── Components ───────────────────────────────────────────────────────
-
 	#createState(comp: Component, parent: string): CompState {
 		const id = nativeComponentId(comp);
 		const owner: { base: string; state: CompState | null } = { base: id, state: null };
@@ -639,7 +585,6 @@ export class Reconciler {
 		return state;
 	}
 
-	/** The component's description, or a `rows` node rendered at `cx.cols`. */
 	#resolve(state: CompState): NativeNode {
 		const comp = state.comp;
 		const cx = this.#cx!;
@@ -692,13 +637,10 @@ export class Reconciler {
 		state.node = next;
 	}
 
-	/** Replay an unchanged component's walk: visit its boundaries. */
 	#revisitComponent(state: CompState): void {
 		const walk: Walk = { owner: state.owner, inner: null };
 		for (const item of state.inner) this.#visitChild(item.comp, item.parent, item.before, item.before, walk);
 	}
-
-	// ── Removal ──────────────────────────────────────────────────────────
 
 	#deleteEntry(entry: Entry): void {
 		if (entry.comp !== undefined) {
@@ -743,7 +685,6 @@ function sameLines(a: readonly string[], b: readonly string[] | null): boolean {
 	return true;
 }
 
-/** Rows fallback lines: drop the hardware-cursor marker and draw the fake cursor as reverse video. */
 export function cleanRow(line: string): string {
 	if (!line.includes("\x1b_pi:")) return line;
 	return line.replaceAll(CURSOR_MARKER, "").replaceAll(FAKE_CURSOR_START, "\x1b[7m").replaceAll(FAKE_CURSOR_END, "\x1b[27m");

@@ -1,23 +1,13 @@
-/**
- * hashline/apply.ts: apply parsed edits to a text, with the text-only repairs.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/apply.rs` (MIT) as it behaves for a file
- * whose language upstream cannot parse: indentation repair, `PUT >N:` landing shift past closers,
- * boundary-echo dropping and the echo refusals stay; the tree-sitter verified repairs
- * (`repair_boundaries`, opener escape, parse-regression warning) are not ported.
- */
 import { STRUCTURAL_CLOSER_RE } from "./block.ts";
 import { type EmptyPaste, resolveClipboardEdits } from "./clipboard.ts";
 import * as M from "./messages.ts";
 import { type ApplyResult, type Clipboard, type DeleteEdit, type Edit, emptyClipboard, HashlineError, type InsertEdit } from "./types.ts";
 
 export interface ApplyOptions {
-	/** Clipboard shared across sections; a private empty one when omitted. Mutated by cuts. */
 	clipboard?: Clipboard;
-	/** Default "throw". */
 	onEmptyPaste?: EmptyPaste;
 }
 
-/** One `PUT N.=M:` as the parser lowers it: its replacement inserts, then one delete per replaced line. */
 export interface ReplacementGroup {
 	insertIndices: number[];
 	deleteIndices: number[];
@@ -26,7 +16,9 @@ export interface ReplacementGroup {
 	end: number;
 }
 
-/** The replacement group starting at `edits[start]`, if one starts there. */
+/**
+ * Replacement inserts must precede the deletes for their range.
+ */
 export function replacementGroup(edits: readonly Edit[], start: number): ReplacementGroup | undefined {
 	const first = edits[start];
 	if (!first || first.kind !== "insert" || !first.replacement || first.cursor.kind !== "before") return undefined;
@@ -61,7 +53,6 @@ function leadingIndent(line: string): string {
 function indentDeeper(deeper: string, shallower: string): boolean {
 	return deeper.length > shallower.length && deeper.startsWith(shallower);
 }
-/** Has a character other than tab, LF, VT, FF, CR, space. */
 function hasContent(text: string): boolean {
 	return /[^\t\n\v\f\r ]/.test(text);
 }
@@ -69,17 +60,12 @@ function rowsEqual(a: readonly string[], b: readonly string[]): boolean {
 	return a.length === b.length && a.every((row, i) => row === b[i]);
 }
 
-/** Lines (1-indexed) an edit is anchored on: a delete's line, an insert's before/after line. */
 function anchorLinesOf(edit: Edit): number[] {
 	if (edit.kind === "delete") return [edit.line];
 	if (edit.kind === "insert" && (edit.cursor.kind === "before" || edit.cursor.kind === "after")) return [edit.cursor.line];
 	return [];
 }
 
-/**
- * A replacement body written one indent level too shallow under a `{` line gets the missing indent
- * back, when at least two (and more than half) of its rows equal the rows they replace up to that indent.
- */
 function repairIndentation(edits: Edit[], lines: readonly string[]): string[] {
 	let repaired = false;
 	let start = 0;
@@ -128,7 +114,6 @@ function repairIndentation(edits: Edit[], lines: readonly string[]): string[] {
 	return repaired ? [M.REPLACEMENT_INDENT_AUTO_SHIFT_WARNING] : [];
 }
 
-/** How many of `rows`' first rows restate the lines just above line `start`. */
 function restatedAbove(rows: readonly string[], start: number, lines: readonly string[]): number {
 	const max = Math.min(rows.length, Math.max(0, start - 1));
 	for (let count = max; count >= 1; count--) {
@@ -138,7 +123,6 @@ function restatedAbove(rows: readonly string[], start: number, lines: readonly s
 	}
 	return 0;
 }
-/** How many of `rows`' last rows restate the lines just below line `end`. */
 function restatedBelow(rows: readonly string[], end: number, lines: readonly string[]): number {
 	const max = Math.min(rows.length, Math.max(0, lines.length - end));
 	for (let count = max; count >= 1; count--) {
@@ -147,7 +131,6 @@ function restatedBelow(rows: readonly string[], end: number, lines: readonly str
 	}
 	return 0;
 }
-/** restatedAbove / restatedBelow, except that a run equal to the range rows it lands on counts as content (0). */
 function restatedEdges(rows: readonly string[], lines: readonly string[], start: number, end: number): [number, number] {
 	const landsOn = (run: readonly string[], at: number) => {
 		const target = lines.slice(Math.min(at, lines.length));
@@ -160,14 +143,11 @@ function restatedEdges(rows: readonly string[], lines: readonly string[], start:
 
 type Echoed = { kind: "leading"; count: number } | { kind: "trailing"; count: number } | { kind: "both"; above: number; below: number };
 
-/** A replacement whose body restates a neighbouring line and is too short for its range. */
 interface Ambiguity {
 	start: number;
 	end: number;
 	echoed: Echoed;
-	/** Range rows the body leaves out. */
 	leftOut: [number, number];
-	/** An earlier pass dropped one copy of a repeated echo to expose this. */
 	repeated: boolean;
 }
 
@@ -192,7 +172,6 @@ function refusal(a: Ambiguity): HashlineError {
 	return new HashlineError("ambiguous_boundary", message);
 }
 
-/** Dropping the echo rows would leave the range exactly as it is: the body means the literal edit. */
 function dropIsNoop(group: ReplacementGroup, lines: readonly string[], dropL: number, dropT: number): boolean {
 	return rowsEqual(group.payload.slice(dropL, group.payload.length - dropT), lines.slice(group.start - 1, group.end));
 }
@@ -201,11 +180,9 @@ interface Normalized {
 	edits: Edit[];
 	warnings: string[];
 	ambiguities: Ambiguity[];
-	/** Start lines of groups kept as written because dropping their echo would be a no-op. */
 	literal: number[];
 }
 
-/** Drop body rows that restate the line(s) just outside a replaced range ("boundary echoes"). */
 function normalizeEchoes(edits: readonly Edit[], lines: readonly string[]): Normalized {
 	const out: Edit[] = [];
 	const warnings: string[] = [];
@@ -263,7 +240,6 @@ function normalizeEchoes(edits: readonly Edit[], lines: readonly string[]): Norm
 	return { edits: out, warnings, ambiguities, literal };
 }
 
-/** The common indent of a body's non-blank rows; undefined when it has none, is only closers, or mixes indents. */
 function bodyIndent(rows: readonly string[]): string | undefined {
 	const nonBlank = rows.filter(hasContent);
 	if (nonBlank.length === 0 || nonBlank.every((row) => STRUCTURAL_CLOSER_RE.test(row))) return undefined;
@@ -277,16 +253,8 @@ function bodyIndent(rows: readonly string[]): string | undefined {
 	return target;
 }
 
-/**
- * NOT upstream. Upstream vetoes a landing shift that breaks the parse (a shallower `case`, `} else {`);
- * without a parser, a body whose first row continues the enclosing construct is never moved.
- */
 const CONTINUATION_ROW_RE = /^\s*(?:[)\]}]|(?:case|default|else|elif|catch|except|finally)\b)/;
 
-/**
- * `PUT >N:` whose body is indented shallower than line N: the landing moves forward past the closing
- * lines (`}`, `)`, `]`) that follow N, down to the body's indent.
- */
 function repairLandings(edits: readonly Edit[], lines: readonly string[]): { edits: Edit[]; warnings: string[] } {
 	const groups: { anchor: number; lineNum: number; members: number[] }[] = [];
 	edits.forEach((edit, index) => {
@@ -330,7 +298,6 @@ function repairLandings(edits: readonly Edit[], lines: readonly string[]): { edi
 
 type Slot = "before" | "replacement" | "after" | "delete";
 
-/** Build the result text: `[text, firstChangedLine]`. Only insert and delete edits are used. */
 export function materialize(original: readonly string[], edits: readonly Edit[]): [string, number | undefined] {
 	let first: number | undefined;
 	const bof: string[] = [];
@@ -345,7 +312,7 @@ export function materialize(original: readonly string[], edits: readonly Edit[])
 			else anchored.push({ line: edit.cursor.line, slot: edit.replacement ? "replacement" : "before", text: edit.text });
 		}
 	}
-	// Stable: edits on one line keep their op order.
+	// Edits on the same line must stay in patch order.
 	anchored.sort((a, b) => a.line - b.line);
 	let lines: string[] = [];
 	let copied = 0;
@@ -388,7 +355,6 @@ export function materialize(original: readonly string[], edits: readonly Edit[])
 	return [lines.join("\n"), first];
 }
 
-/** The rows `committed` writes in place of `group`'s range. */
 function committedRows(group: ReplacementGroup, authored: readonly Edit[], committed: readonly Edit[], lines: readonly string[]): string[] {
 	const op = authored[group.insertIndices[0]].lineNum;
 	const own = committed.filter((edit) => {
@@ -403,10 +369,6 @@ function committedRows(group: ReplacementGroup, authored: readonly Edit[], commi
 	return rows.slice(group.start - 1, Math.max(0, rows.length - suffix));
 }
 
-/**
- * Last check: for every replacement whose body restates a neighbouring line, refuse when the rows
- * written in place of its range hold a second copy of that line or are fewer than the range.
- */
 function lossyEchoOutcome(
 	authored: readonly Edit[],
 	committed: readonly Edit[],
@@ -469,10 +431,6 @@ function lossyEchoOutcome(
 	return undefined;
 }
 
-/**
- * Apply parsed edits to LF-normalized `text`. Block edits must have been lowered first
- * (block.ts `resolveBlockEdits`). Throws HashlineError (apply | out_of_range | ambiguous_boundary).
- */
 export function applyEdits(text: string, edits: readonly Edit[], options: ApplyOptions = {}): ApplyResult {
 	if (edits.length === 0) return { text, firstChangedLine: undefined, warnings: [] };
 	const lines = text.split("\n");
@@ -485,7 +443,6 @@ export function applyEdits(text: string, edits: readonly Edit[], options: ApplyO
 		if (edit.kind === "cut" || edit.kind === "paste") throw new HashlineError("apply", M.UNRESOLVED_CLIPBOARD_INTERNAL);
 		target.push(edit);
 	}
-	// The empty element after a final newline is not a line: deleting it is ignored.
 	if (lines.length > 1 && lines[lines.length - 1] === "") {
 		const phantom = lines.length;
 		target = target.filter((edit) => !(edit.kind === "delete" && edit.line === phantom));

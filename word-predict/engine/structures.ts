@@ -1,22 +1,7 @@
-/**
- * Data structures behind prefix-constrained ranking.
- * Port of oh-my-pi `crates/pi-predict/src/ngram/structures.rs` (MIT).
- *
- * Base word ids are lexicographic ranks, so "every word starting with `prefix`"
- * is one contiguous id range `[lo, hi)`. Range sums (`Fenwick`), range top-k
- * (`MaxTree`) and id-sorted follower lists (`Followers`) then answer prefix
- * queries in O(log n) without per-prefix tables.
- *
- * Loaded by Node's type stripping (worker / CLI): erasable syntax only.
- */
-
-/** No id / no slot (`u32::MAX`). */
 export const NONE = 0xffff_ffff;
 
 /**
- * Order of two words by their UTF-8 bytes (= code-point order), which is the
- * order of every sorted word list in the engine. JS `<` compares UTF-16 units
- * and disagrees for astral characters versus U+E000–U+FFFF.
+ * The word lists require UTF-8 byte order even for astral characters.
  */
 export function cmpWords(a: string, b: string): number {
 	const n = a.length < b.length ? a.length : b.length;
@@ -25,7 +10,6 @@ export function cmpWords(a: string, b: string): number {
 		let y = b.charCodeAt(i);
 		if (x !== y) {
 			if (x >= 0xd800 && y >= 0xd800) {
-				// Surrogates (astral characters) sort above U+E000–U+FFFF.
 				x = x >= 0xe000 ? x - 0x800 : x + 0x2000;
 				y = y >= 0xe000 ? y - 0x800 : y + 0x2000;
 			}
@@ -35,11 +19,9 @@ export function cmpWords(a: string, b: string): number {
 	return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
 }
 
-/** Fenwick tree of `f64` counts over base ids (prefix sums with point updates). */
 export class Fenwick {
 	private readonly tree: Float64Array;
 
-	/** Build over `values[0, length)` in O(n). */
 	constructor(values: ArrayLike<number>, length: number) {
 		const tree = new Float64Array(length + 1);
 		for (let i = 0; i < length; i++) tree[i + 1] = values[i];
@@ -50,13 +32,14 @@ export class Fenwick {
 		this.tree = tree;
 	}
 
-	/** Add `delta` at `index`. */
 	add(index: number, delta: number): void {
 		const tree = this.tree;
 		for (let j = index + 1; j < tree.length; j += j & -j) tree[j] += delta;
 	}
 
-	/** Sum over `[0, end)`. */
+	/**
+	 * The end index is exclusive.
+	 */
 	prefix(end: number): number {
 		const tree = this.tree;
 		let sum = 0;
@@ -67,17 +50,12 @@ export class Fenwick {
 
 const NO_LEAF = 0xffff_ffff;
 
-/** Max segment tree over base ids: point updates and top-k inside a range. */
 export class MaxTree {
-	/** `f32` score per leaf (the array passed in; the tree owns it). */
 	private readonly values: Float32Array;
 	private readonly size: number;
-	/** Leaf id holding each subtree's max (`NO_LEAF` when empty). */
 	private readonly best: Uint32Array;
-	/** Scratch binary heap of tree nodes for `topK`. */
 	private readonly heap: number[] = [];
 
-	/** Build over `scores[0, length)` in O(n). */
 	constructor(scores: Float32Array, length: number) {
 		let size = 1;
 		while (size < length) size *= 2;
@@ -89,14 +67,12 @@ export class MaxTree {
 		for (let node = size - 1; node >= 1; node--) best[node] = this.pick(best[2 * node], best[2 * node + 1]);
 	}
 
-	/** The better of two leaves: the right one wins only when strictly greater. */
 	private pick(a: number, b: number): number {
 		if (a === NO_LEAF) return b;
 		if (b === NO_LEAF) return a;
 		return this.values[b] > this.values[a] ? b : a;
 	}
 
-	/** Set leaf `index` to `score` (rounded to `f32`). */
 	set(index: number, score: number): void {
 		this.values[index] = score;
 		const best = this.best;
@@ -109,11 +85,6 @@ export class MaxTree {
 		return this.values[this.best[node]];
 	}
 
-	/**
-	 * Append up to `k` ids of `[lo, hi)` to `out`, best first: best-first
-	 * expansion from the O(log n) canonical nodes covering the range. Equal
-	 * scores come out in the order upstream's heap gives them.
-	 */
 	topK(lo: number, hi: number, k: number, out: number[]): void {
 		if (lo >= hi || k === 0) return;
 		const heap = this.heap;
@@ -160,7 +131,6 @@ export class MaxTree {
 		heap[i] = node;
 	}
 
-	/** Remove and return the best node; the heap must not be empty. */
 	private pop(): number {
 		const heap = this.heap;
 		const top = heap[0];
@@ -181,24 +151,18 @@ export class MaxTree {
 	}
 }
 
-/**
- * Growable follower list of one context word, sorted by word id so a prefix
- * maps to a contiguous slice (overflow ids sit at the tail).
- */
 export class Followers {
-	/** Follower word ids, ascending. */
+	/**
+	 * Prefix lookups require follower IDs in ascending order.
+	 */
 	ids: number[] = [];
-	/** Weighted counts (`f32` values), parallel to `ids`. */
 	counts: number[] = [];
-	/** Sum of the weights added (`f64`). */
 	total = 0;
 
-	/** Number of distinct followers. */
 	get types(): number {
 		return this.ids.length;
 	}
 
-	/** First index whose id is `>= id`. */
 	lowerBound(id: number): number {
 		const ids = this.ids;
 		let lo = 0;
@@ -211,7 +175,6 @@ export class Followers {
 		return lo;
 	}
 
-	/** Add `weight` to `id`; true when `id` is a new follower. */
 	add(id: number, weight: number): boolean {
 		const at = this.lowerBound(id);
 		this.total += weight;
@@ -229,7 +192,6 @@ export class Followers {
 		return true;
 	}
 
-	/** Count of `id` (0 when absent). */
 	count(id: number): number {
 		const at = this.lowerBound(id);
 		return at < this.ids.length && this.ids[at] === id ? this.counts[at] : 0;
@@ -238,16 +200,8 @@ export class Followers {
 
 const EMPTY_HALF = 0xffff_ffff;
 
-/**
- * Open-addressing hash table from a 64-bit key, held as two `u32` halves, to
- * a `u32` or `f32` value (linear probing, load <= 3/4, no deletion: rebuild to
- * prune). Upstream packs the key into one `u64`; iteration order differs from
- * upstream's and is not observable.
- */
 export class IdTable<A extends Uint32Array | Float32Array> {
-	/** Values by slot; replaced when the table grows. */
 	values: A;
-	/** Whether the last `entry` call inserted its key. */
 	fresh = false;
 	private readonly make: (slots: number) => A;
 	private hi: Uint32Array;
@@ -255,7 +209,6 @@ export class IdTable<A extends Uint32Array | Float32Array> {
 	private mask: number;
 	private count = 0;
 
-	/** Table sized for about `capacity` entries; `make` allocates a zeroed value array. */
 	constructor(make: (slots: number) => A, capacity: number) {
 		let slots = 16;
 		while (slots * 3 < capacity * 4) slots *= 2;
@@ -266,12 +219,10 @@ export class IdTable<A extends Uint32Array | Float32Array> {
 		this.mask = slots - 1;
 	}
 
-	/** Number of stored keys. */
 	get size(): number {
 		return this.count;
 	}
 
-	/** Slot holding `(hi, lo)`, or the empty slot where it would go. */
 	private slot(hi: number, lo: number): number {
 		const his = this.hi;
 		const los = this.lo;
@@ -292,17 +243,13 @@ export class IdTable<A extends Uint32Array | Float32Array> {
 		}
 	}
 
-	/** Value stored at `(hi, lo)`. */
 	get(hi: number, lo: number): number | undefined {
 		const at = this.slot(hi, lo);
 		return this.hi[at] === hi && this.lo[at] === lo ? this.values[at] : undefined;
 	}
 
 	/**
-	 * Slot of `(hi, lo)` in `values`, inserting 0 when absent; `fresh` tells
-	 * whether it was inserted. Valid until the next `entry`. An insert may
-	 * replace `values`: call this first, then index `values` in a separate
-	 * statement (never `table.values[table.entry(…)] = …`).
+	 * Read `values` after calling `entry` because an insert can replace it.
 	 */
 	entry(hi: number, lo: number): number {
 		let at = this.slot(hi, lo);
@@ -321,7 +268,6 @@ export class IdTable<A extends Uint32Array | Float32Array> {
 		return at;
 	}
 
-	/** Every `(hi, lo, value)`, in slot order. */
 	forEach(visit: (hi: number, lo: number, value: number) => void): void {
 		const his = this.hi;
 		const los = this.lo;

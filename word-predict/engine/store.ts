@@ -1,23 +1,3 @@
-/**
- * word-predict: what the engine worker keeps on disk, and where its prompts
- * come from. Imported by the worker (`worker.ts`), by the replay CLI and by
- * the main thread (`../host.ts`), so it uses node:fs / node:crypto / node:path
- * only and is loadable by Node's type stripping.
- *
- * Port of oh-my-pi `packages/coding-agent/src/predict/daemon.ts`
- * (`PersistCadence`, ingestion), `packages/coding-agent/src/predict/foreign-history.ts`,
- * `packages/coding-agent/src/session/history-storage.ts` (`normalizePrompt`) and
- * `crates/pi-predict/src/ngram/mod.rs` (`write_atomic`) (MIT).
- *
- * Upstream keeps prompts in `history.db` and one daemon owns the engine state.
- * Here every pi process owns an engine, and two files under
- * `<agentDir>/word-predict/` tie them together without locks:
- *
- *   journal.jsonl   append-only; first line `{"journal":1,"id":"<16 hex>"}`, then
- *                   one `{"p":"<normalized prompt>","t":<epoch ms>}` per submission
- *   state.bin       snapshot + journal cursor + seen-prompt hashes, SHA-1 sealed,
- *                   replaced atomically (layout at `writeState`)
- */
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -25,19 +5,11 @@ import { threadId } from "node:worker_threads";
 
 export const STATE_FILE = "state.bin";
 export const JOURNAL_FILE = "journal.jsonl";
-/** Longer prompts are never learned (`learn` finds no words in them). */
+/**
+ * The prompt length limit is in UTF-16 code units.
+ */
 export const MAX_PROMPT_UNITS = 20_000;
 
-// ---------------------------------------------------------------------------
-// Normalization and identity
-// ---------------------------------------------------------------------------
-
-/**
- * Upstream's history normalization: `\n` line ends, no blanks before a line end, trimmed.
- * Upstream's `/[^\S\n]+\n/g` backtracks quadratically on a long blank run that no line end
- * follows (20,000 spaces: ~0.4 s on the submitting thread); trimming each line gives the same
- * result in linear time (`trimEnd` strips exactly `\s`).
- */
 export function normalizePrompt(prompt: string): string {
 	return prompt
 		.replace(/\r\n?/g, "\n")
@@ -47,27 +19,22 @@ export function normalizePrompt(prompt: string): string {
 		.trim();
 }
 
-/** 48-bit prefix of `sha1(utf8)`: the identity of a prompt in the seen set. */
 export function promptHash(normalized: string): number {
 	return createHash("sha1").update(normalized, "utf8").digest().readUIntBE(0, 6);
 }
 
-// ---------------------------------------------------------------------------
-// Journal
-// ---------------------------------------------------------------------------
-
 const JOURNAL_VERSION = 1;
 const JOURNAL_ID = /^[0-9a-f]{16}$/;
-/** A header line is ~40 bytes; anything longer in the first line is not one. */
 const HEADER_PROBE_BYTES = 256;
 const NEWLINE = 0x0a;
-/** The state directory and its files hold the user's prompts: owner only. Applied on creation, never to existing ones. */
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 
 interface JournalHeader {
 	id: string;
-	/** Byte offset of the first data line. */
+	/**
+	 * Byte offset of the first data line.
+	 */
 	end: number;
 }
 
@@ -79,7 +46,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-/** The header of an open journal, or undefined when its first line is not (yet) one. */
 function readHeader(fd: number): JournalHeader | undefined {
 	const probe = Buffer.allocUnsafe(HEADER_PROBE_BYTES);
 	const read = fs.readSync(fd, probe, 0, HEADER_PROBE_BYTES, 0);
@@ -96,7 +62,6 @@ function readHeader(fd: number): JournalHeader | undefined {
 	}
 }
 
-/** Header of the journal at `file`: `"missing"` when there is no file, undefined when it has no header. */
 function probeJournal(file: string): JournalHeader | "missing" | undefined {
 	let fd: number;
 	try {
@@ -120,12 +85,6 @@ function headerLine(id: string): string {
 	return `${JSON.stringify({ journal: JOURNAL_VERSION, id })}\n`;
 }
 
-/**
- * Replace a journal whose first line is not a header (damaged by hand, or a
- * creator died between `open` and `write`) by a new one with a fresh id that
- * keeps the intact data lines. Readers notice the new id and replay from the
- * first data line; the seen set keeps that idempotent.
- */
 function repairJournal(stateDir: string, file: string): string {
 	let kept = "";
 	try {
@@ -134,7 +93,6 @@ function repairJournal(stateDir: string, file: string): string {
 				const value: unknown = JSON.parse(line);
 				if (isRecord(value) && typeof value.p === "string") kept += `${line}\n`;
 			} catch {
-				// Damaged or partial line.
 			}
 		}
 	} catch (error) {
@@ -145,12 +103,10 @@ function repairJournal(stateDir: string, file: string): string {
 	return id;
 }
 
-/** Create the directory and the journal (with its header line) when missing; returns the journal id. */
 export function ensureJournal(stateDir: string): string {
 	fs.mkdirSync(stateDir, { recursive: true, mode: DIR_MODE });
 	const file = path.join(stateDir, JOURNAL_FILE);
-	// A file without a header is normally another process between its exclusive
-	// create and its header write: give it a moment before calling it damaged.
+	// An exclusive create can be visible before its header is written.
 	for (let attempt = 0; attempt < 25; attempt++) {
 		const header = probeJournal(file);
 		if (header === "missing") {
@@ -169,12 +125,10 @@ export function ensureJournal(stateDir: string): string {
 	return repairJournal(stateDir, file);
 }
 
-/** One O_APPEND write of `{"p":…,"t":…}\n`. */
 export function appendJournal(stateDir: string, normalized: string, now: number): void {
 	const file = path.join(stateDir, JOURNAL_FILE);
 	const line = Buffer.from(`${JSON.stringify({ p: normalized, t: now })}\n`, "utf8");
-	// No O_CREAT: a journal must never start with a data line. A journal that
-	// went missing is recreated (new id) first.
+	// The header must exist before the first append.
 	const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND;
 	let fd: number;
 	try {
@@ -185,8 +139,7 @@ export function appendJournal(stateDir: string, normalized: string, now: number)
 		fd = fs.openSync(file, flags);
 	}
 	try {
-		// One write(2) for the whole line, so lines of concurrent writers do not
-		// interleave; the loop only covers a short write (disk full, signal).
+		// Use one write per line to avoid interleaving concurrent appends.
 		let written = 0;
 		while (written < line.length) written += fs.writeSync(fd, line, written, line.length - written);
 	} finally {
@@ -194,11 +147,6 @@ export function appendJournal(stateDir: string, normalized: string, now: number)
 	}
 }
 
-/**
- * Prompts on the complete lines at or after `offset`; restarts after the header when the id changed
- * or the file shrank. A partial last line stays unread (the returned offset ends at the last `\n`);
- * damaged lines are skipped. A missing or headerless journal yields nothing and keeps the cursor.
- */
 export function readJournal(
 	stateDir: string,
 	journalId: string,
@@ -220,7 +168,6 @@ export function readJournal(
 		if (header.id !== journalId || !Number.isInteger(offset) || offset < header.end || offset > size) {
 			start = header.end;
 		} else if (offset > header.end) {
-			// A cursor always sits right after a line end; anything else is a rewritten file.
 			const before = Buffer.allocUnsafe(1);
 			if (fs.readSync(fd, before, 0, 1, offset - 1) !== 1 || before[0] !== NEWLINE) start = header.end;
 		}
@@ -235,13 +182,13 @@ export function readJournal(
 		let lineStart = 0;
 		for (;;) {
 			const lineEnd = bytes.indexOf(NEWLINE, lineStart);
+			// Advance the byte cursor only after a complete line.
 			if (lineEnd < 0 || lineEnd >= filled) break;
 			try {
 				const value: unknown = JSON.parse(bytes.toString("utf8", lineStart, lineEnd));
 				const prompt = isRecord(value) ? value.p : undefined;
 				if (typeof prompt === "string") prompts.push(prompt);
 			} catch {
-				// Damaged line: skip it.
 			}
 			lineStart = lineEnd + 1;
 		}
@@ -250,10 +197,6 @@ export function readJournal(
 		fs.closeSync(fd);
 	}
 }
-
-// ---------------------------------------------------------------------------
-// State container
-// ---------------------------------------------------------------------------
 
 export interface StateMeta {
 	journalId: string;
@@ -272,11 +215,9 @@ export interface LoadedState {
 
 const STATE_MAGIC = Buffer.from("PIWPST\0\0", "latin1");
 const STATE_VERSION = 1;
-/** magic + version + metaLen. */
 const STATE_HEADER_BYTES = 16;
 const SHA1_BYTES = 20;
 const HASH_BYTES = 6;
-/** Bound for the header-only read; a real meta is ~120 bytes. */
 const MAX_META_BYTES = 64 * 1024;
 
 function parseMeta(json: string): StateMeta {
@@ -299,17 +240,6 @@ function parseMeta(json: string): StateMeta {
 	};
 }
 
-/**
- * Atomic write; returns the file size. Layout, little endian:
- *
- *   0   "PIWPST\0\0"                        magic
- *   8   u32 version = 1
- *   12  u32 metaLen
- *   16  meta, UTF-8 JSON (`StateMeta`)
- *       u32 snapshotLen, snapshot           upstream's `ngram.snapshot` bytes
- *       u32 seenCount, seenCount × 6 bytes  48-bit big-endian prompt hashes, ascending
- *       20 bytes                            SHA-1 of every byte before it
- */
 export function writeState(
 	stateDir: string,
 	meta: StateMeta,
@@ -344,7 +274,6 @@ export function writeState(
 	return size;
 }
 
-/** undefined when the file is missing; throws when it is corrupt or of an unknown version. */
 export function readState(stateDir: string): LoadedState | undefined {
 	let bytes: Buffer;
 	try {
@@ -358,7 +287,7 @@ export function readState(stateDir: string): LoadedState | undefined {
 	}
 	const version = bytes.readUInt32LE(8);
 	if (version !== STATE_VERSION) throw new Error(`state: unsupported state version ${version}`);
-	// Node's zstd does not report a truncated frame, so integrity comes from here.
+	// The decompressor can accept truncated frames.
 	const sealed = bytes.length - SHA1_BYTES;
 	if (
 		sealed < STATE_HEADER_BYTES ||
@@ -383,7 +312,6 @@ export function readState(stateDir: string): LoadedState | undefined {
 	return { meta, snapshot, seen, bytes: bytes.length };
 }
 
-/** Meta of the current state.bin (header only); undefined when missing or unreadable. */
 export function readStateMeta(stateDir: string): StateMeta | undefined {
 	let fd: number | undefined;
 	try {
@@ -404,20 +332,16 @@ export function readStateMeta(stateDir: string): StateMeta | undefined {
 			try {
 				fs.closeSync(fd);
 			} catch {
-				// Nothing to do about a failed close of a read-only descriptor.
+				// A read-only close failure should not discard valid metadata.
 			}
 		}
 	}
 }
 
-/**
- * Write `dir/name` through `name.<pid>.<threadId>.tmp`, fsync, rename (upstream
- * `write_atomic`; the thread id keeps a worker and its main thread apart). The
- * file is created owner-only, and so is `dir` when it has to be created.
- */
 export function writeAtomic(dir: string, name: string, bytes: Uint8Array): void {
 	fs.mkdirSync(dir, { recursive: true, mode: DIR_MODE });
 	const target = path.join(dir, name);
+	// The worker and main thread can write the same target concurrently.
 	const temp = path.join(dir, `${name}.${process.pid}.${threadId}.tmp`);
 	try {
 		const fd = fs.openSync(temp, "w", FILE_MODE);
@@ -433,31 +357,23 @@ export function writeAtomic(dir: string, name: string, bytes: Uint8Array): void 
 		try {
 			fs.unlinkSync(temp);
 		} catch {
-			// The temp file may not exist.
+			// Keep the original write error if cleanup fails.
 		}
 		throw error;
 	}
 }
 
-// ---------------------------------------------------------------------------
-// History readers (bootstrap)
-// ---------------------------------------------------------------------------
-
 const CHUNK_BYTES = 256 * 1024;
-/** A longer line is skipped rather than buffered (tool results can be huge; prompts are not). */
 const MAX_LINE_BYTES = 64 * 1024 * 1024;
 
 /**
- * Call `visit(buffer, start, end)` for every line of `file` (final unterminated
- * line included), streaming through one growable buffer; the bytes are only
- * valid during the call. Never holds more than one line.
+ * The buffer can be overwritten after `visit` returns.
  */
 function forEachLine(file: string, visit: (bytes: Buffer, start: number, end: number) => void): void {
 	const fd = fs.openSync(file, "r");
 	try {
 		let buffer = Buffer.allocUnsafe(CHUNK_BYTES);
 		let filled = 0;
-		// Inside a line longer than MAX_LINE_BYTES: drop bytes up to its end.
 		let skipping = false;
 		for (;;) {
 			const read = fs.readSync(fd, buffer, filled, buffer.length - filled, null);
@@ -500,7 +416,6 @@ function forEachLine(file: string, visit: (bytes: Buffer, start: number, end: nu
 const ROLE_USER = Buffer.from('"role":"user"', "latin1");
 const ROLE_BASH = Buffer.from('"role":"bashExecution"', "latin1");
 
-/** `*.jsonl` files directly in `root` and in its immediate subdirectories, in name order. */
 function sessionFiles(root: string): string[] {
 	const files: string[] = [];
 	const list = (dir: string, descend: boolean): void => {
@@ -524,7 +439,6 @@ function sessionFiles(root: string): string[] {
 	return files;
 }
 
-/** The typed text of a session entry (`role: "user"` text, or the `!` / `!!` line of a bash execution). */
 function sessionPrompt(entry: unknown): { text: string; at: number } | undefined {
 	if (!isRecord(entry) || entry.type !== "message") return undefined;
 	const message = entry.message;
@@ -545,7 +459,6 @@ function sessionPrompt(entry: unknown): { text: string; at: number } | undefined
 			return undefined;
 		}
 	} else if (message.role === "bashExecution") {
-		// Upstream stores the typed `!` / `!!` line.
 		const command = message.command;
 		if (typeof command !== "string") return undefined;
 		text = (message.excludeFromContext ? "!!" : "!") + command;
@@ -553,7 +466,7 @@ function sessionPrompt(entry: unknown): { text: string; at: number } | undefined
 		return undefined;
 	}
 	if (!text) return undefined;
-	// The message timestamp is epoch ms; the entry timestamp an ISO string.
+	// Message timestamps from pi are in epoch milliseconds.
 	const stamp = message.timestamp;
 	const iso = entry.timestamp;
 	let at = 0;
@@ -566,22 +479,16 @@ function sessionPrompt(entry: unknown): { text: string; at: number } | undefined
 	return { text, at };
 }
 
-/**
- * User and bash prompts of every session file, unsorted. Only lines carrying
- * the bytes `"role":"user"` or `"role":"bashExecution"` are decoded and parsed
- * (a quote inside a JSON string is escaped, so tool output cannot fake them).
- * Unreadable files and damaged lines contribute nothing.
- */
 export function* readSessionPrompts(sessionDirs: readonly string[]): Generator<{ text: string; at: number }> {
 	const found: { text: string; at: number }[] = [];
 	const visit = (bytes: Buffer, start: number, end: number): void => {
 		const line = bytes.subarray(start, end);
+		// This byte filter relies on compact JSON from pi.
 		if (!line.includes(ROLE_USER) && !line.includes(ROLE_BASH)) return;
 		try {
 			const prompt = sessionPrompt(JSON.parse(line.toString("utf8")));
 			if (prompt) found.push(prompt);
 		} catch {
-			// Damaged or partial line.
 		}
 	};
 	for (const root of sessionDirs) {
@@ -590,20 +497,15 @@ export function* readSessionPrompts(sessionDirs: readonly string[]): Generator<{
 			try {
 				forEachLine(file, visit);
 			} catch {
-				// Unreadable file: keep what was read before the failure.
+				// A read failure must not discard prompts already read.
 			}
 			yield* found;
 		}
 	}
 }
 
-/** Claude Code placeholders for pasted text and images: not words the user typed. */
 const PLACEHOLDER = /\[(?:Pasted text|Image) #\d+[^\]]*\]/g;
 
-/**
- * Prompts of the given `history.jsonl` files (Claude Code, Codex), each in file order; missing or
- * unreadable files contribute nothing.
- */
 export function readForeignPrompts(files: readonly string[]): string[] {
 	const prompts: string[] = [];
 	const visit = (bytes: Buffer, start: number, end: number): void => {
@@ -611,13 +513,11 @@ export function readForeignPrompts(files: readonly string[]): string[] {
 		try {
 			value = JSON.parse(bytes.toString("utf8", start, end));
 		} catch {
-			// A partially-written line must not hide the readable prefix.
+			// A concurrent writer can leave the last line incomplete.
 			return;
 		}
 		if (!isRecord(value)) return;
-		// Claude Code writes `display`; Codex (and older Claude Code) `text`.
 		const text = value.display ?? value.text;
-		// Slash commands are not prose.
 		if (typeof text !== "string" || text.startsWith("/")) return;
 		const prompt = text.replace(PLACEHOLDER, " ").trim();
 		if (prompt) prompts.push(prompt);
@@ -626,22 +526,12 @@ export function readForeignPrompts(files: readonly string[]): string[] {
 		try {
 			forEachLine(file, visit);
 		} catch {
-			// Missing or unreadable: contributes what was read so far.
+			// A read failure must not discard prompts already read.
 		}
 	}
 	return prompts;
 }
 
-// ---------------------------------------------------------------------------
-// Persist cadence
-// ---------------------------------------------------------------------------
-
-/**
- * Trailing debounce capped by a maximum dirty age: each change pushes the
- * flush to `debounceMs` after it, but never past `maxDirtyMs` after the first
- * unflushed change. Consecutive flushes are therefore at least `debounceMs`
- * apart, and a steady stream of changes still flushes every `maxDirtyMs`.
- */
 export class PersistCadence {
 	private readonly debounceMs: number;
 	private readonly maxDirtyMs: number;
@@ -655,7 +545,6 @@ export class PersistCadence {
 		this.flush = flush;
 	}
 
-	/** Record a change and (re)arm the flush. */
 	touch(): void {
 		const now = Date.now();
 		this.dirtySince ??= now;
@@ -668,7 +557,6 @@ export class PersistCadence {
 		}, delay);
 	}
 
-	/** Drop a pending flush (the caller persists on stop instead). */
 	cancel(): void {
 		clearTimeout(this.timer);
 		this.timer = undefined;

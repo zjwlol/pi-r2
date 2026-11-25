@@ -1,8 +1,3 @@
-/**
- * Memorable two-word agent ids, AdjectiveNoun CamelCase (e.g. "SwiftFalcon", "CalmPanda"),
- * same shape as oh-my-pi's task name generator (smaller dictionary).
- */
-
 const ADJECTIVES = [
 	"able", "agile", "amber", "ancient", "arctic", "azure", "bold", "brave", "breezy", "bright",
 	"brisk", "calm", "candid", "careful", "cheerful", "clever", "cobalt", "cosmic", "crimson", "crisp",
@@ -35,7 +30,6 @@ function capitalize(s: string): string {
 	return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-/** Generate an AdjNoun id for which `taken(id)` is false. */
 export function generateTaskName(taken: (id: string) => boolean): string {
 	for (let attempt = 0; attempt < 64; attempt++) {
 		const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)]!;
@@ -52,7 +46,6 @@ export function generateTaskName(taken: (id: string) => boolean): string {
 	for (let n = 0; ; n++) if (!taken(`Task${n}`)) return `Task${n}`;
 }
 
-/** Agent id from a caller-supplied label: keeps `[A-Za-z0-9_-]`, max 32 chars; `undefined` when nothing survives. */
 export function sanitizeAgentId(value: string | undefined): string | undefined {
 	const sanitized = value
 		?.trim()

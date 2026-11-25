@@ -1,26 +1,3 @@
-/**
- * Counts, the interpolated chain's state, hygiene flags, and learning.
- * Port of oh-my-pi `crates/pi-predict/src/ngram/model.rs` (MIT).
- *
- * Probability chain (interpolated absolute discounting; `mu` adds a
- * Dirichlet-style floor so tiny contexts don't trust one observation),
- * evaluated by `interp` in `query.ts`:
- *
- *   p0(w)      = web unigram share                                  (static)
- *   p1(w)      = (c(w) + mu1·p0(w)) / (N + mu1)                      personal unigram, web prior
- *   q2(w|v)    = λw·pw(w|v) + (1 − λw·S(v))·p1(w)                    web bigram prior, S = covered mass
- *   p2(w|v)    = (max(c(vw) − d2, 0) + (d2·T(v) + mu2)·q2) / (c(v) + mu2)
- *   p3(w|u,v)  = (max(c(uvw) − d3, 0) + (d3·T(uv) + mu3)·p2) / (c(uv) + mu3)
- *
- * Every level is linear in its lower level, so the mass of all words under a
- * prefix follows the same recursion from range sums.
- *
- * Numeric types mirror upstream: word counts, follower counts, pair totals,
- * trigram counts, case-tail counts and the tree scores are `f32` (typed arrays
- * or `Math.fround` on every store); `total` and the Fenwick sums are `f64`.
- *
- * Loaded by Node's type stripping (worker / CLI): erasable syntax only.
- */
 import { forEachNeighbour, forEachSlip } from "./hygiene.ts";
 import { isLearnable, isTypedLike, proseWords } from "./prose.ts";
 import { Fenwick, Followers, IdTable, MaxTree, NONE, cmpWords } from "./structures.ts";
@@ -30,49 +7,36 @@ import { Vocab } from "./vocab.ts";
 import { NO_SLOT } from "./web.ts";
 import type { WebPrior } from "./web.ts";
 
-/** Tuning knobs of the n-gram engine. `DEFAULT_PARAMS` is upstream's operating point. */
 export interface Params {
-	/** Weight of prompts that don't look typed (pastes, logs, long dumps); an `f32`. */
 	pasteWeight: number;
-	/** Dirichlet strength of the web unigram prior (in history tokens). */
+	/**
+	 * The unigram prior strength is measured in weighted tokens.
+	 */
 	mu1: number;
-	/** Bigram discount. */
 	d2: number;
-	/** Bigram floor. */
 	mu2: number;
-	/** Trigram discount. */
 	d3: number;
-	/** Trigram floor. */
 	mu3: number;
-	/** Weight of the web bigram prior (0 disables it). */
 	webBigram: number;
-	/** Unigram candidates pulled from the range top-k tree. */
 	topK: number;
-	/** Occurrences in typed prompts before a word outside the web vocabulary and the dictionary is suggested. */
 	minCount: number;
-	/** Fold rare misspellings into a real edit-distance-1 neighbour. */
 	canonicalize: boolean;
-	/** Below this many occurrences a misspelling may fold into a web word. */
 	canonMaxCount: number;
-	/** A personal neighbour must be typed this many times as often to absorb a spelling. */
 	canonRatio: number;
-	/** Prior that a word is typed with plain (lowercase) casing. */
 	casePrior: number;
-	/** Pseudo-count of the case prior. */
 	caseStrength: number;
-	/** Prompt-local cache weight λ (0 disables it). */
 	cacheWeight: number;
-	/** Distance (UTF-8 bytes) at which a prompt-local occurrence weighs 1/e. */
+	/**
+	 * The decay length is in UTF-8 bytes.
+	 */
 	cacheDecay: number;
-	/** Extra cache weight (×(1 + boost)) after the same previous word. */
 	cacheContextBoost: number;
-	/** UTF-8 bytes of the text before the cursor the prompt-local cache scans. */
+	/**
+	 * The window length is in UTF-8 bytes.
+	 */
 	cacheWindow: number;
-	/** Session cache weight σ per occurrence (0 disables it). */
 	sessionWeight: number;
-	/** Recent prompts in the session cache. */
 	sessionPrompts: number;
-	/** Show threshold τ: the minimum confidence of a ghost, at every prefix length; an `f32`. */
 	showThreshold: number;
 }
 
@@ -100,30 +64,25 @@ export const DEFAULT_PARAMS: Readonly<Params> = Object.freeze({
 	showThreshold: 0.15,
 });
 
-/** Flag: a real spelling (dictionary or frequent web word). */
 const TRUSTED = 1;
-/** Flag: a habitual slip of a real word the user types; never suggested. */
 const SHADOWED = 2;
-/** Flag: some misspelling in the vocabulary is one slip away from this word. */
 const WATCH = 4;
 
-/** Words shorter than this (in code points) are never folded or shadowed. */
 const HYGIENE_MIN_CHARS = 5;
-/** Overflow size that triggers folding new words into the sorted base. */
 const COMPACT_AT = 4096;
-/** Spare per-id slots allocated beyond the vocabulary (two compaction rounds). */
 const ID_HEADROOM = 2 * COMPACT_AT;
 
 const ALPHABETIC = /\p{Alphabetic}/u;
 const LOWERCASE = /\p{Lowercase}/u;
 
-/** A non-plain case tail of a word (`aPI`, `pRs`) with its `f32` count. */
 export interface CaseTail {
 	form: string;
 	n: number;
 }
 
-/** UTF-16 offset of code point `k` of `text` (its length when shorter). */
+/**
+ * Returns a UTF-16 offset.
+ */
 function codePointOffset(text: string, k: number): number {
 	let at = 0;
 	for (let i = 0; i < k && at < text.length; i++) {
@@ -139,25 +98,20 @@ function codePointOffset(text: string, k: number): number {
 }
 
 /**
- * Lowercase remainder `rest` of a word after `typed` (`k` code points),
- * uppercased when the typed prefix is ALLCAPS.
+ * The prefix length `k` is in Unicode code points.
  */
 export function plainSuffix(rest: string, typed: string, k: number): string {
 	if (k >= 2 && ALPHABETIC.test(typed) && !LOWERCASE.test(typed)) return rest.toUpperCase();
 	return rest;
 }
 
-/** Recent-prompt word counts (a topic cache). */
 export class Session {
-	/** Word ids of each recent prompt, oldest first. */
 	prompts: number[][] = [];
 	private counts = new Map<number, number>();
-	/** Ids and their counts sorted by word; rebuilt lazily (only `range` reads them). */
 	private sortedIds: number[] = [];
 	private sortedCounts: number[] = [];
 	private stale = false;
 
-	/** Add one prompt's words and evict beyond `capacity` prompts. */
 	push(words: number[], capacity: number): void {
 		if (capacity === 0) return;
 		const counts = this.counts;
@@ -184,7 +138,6 @@ export class Session {
 		this.stale = false;
 	}
 
-	/** Visit `(id, count)` of the session words starting with `prefix`, in word order. */
 	range(prefix: string, vocab: Vocab, visit: (id: number, count: number) => void): void {
 		if (this.stale) this.resort(vocab);
 		const ids = this.sortedIds;
@@ -195,14 +148,12 @@ export class Session {
 			if (cmpWords(vocab.word(ids[mid]), prefix) < 0) lo = mid + 1;
 			else hi = mid;
 		}
-		// The words starting with `prefix` are contiguous from `lo`.
 		let end = lo;
 		while (end < ids.length && vocab.word(ids[end]).startsWith(prefix)) end += 1;
 		const counts = this.sortedCounts;
 		for (let at = lo; at < end; at++) visit(ids[at], counts[at]);
 	}
 
-	/** Renumber every id after a vocabulary compaction. */
 	remap(remap: Uint32Array): void {
 		for (const prompt of this.prompts) {
 			for (let i = 0; i < prompt.length; i++) prompt[i] = remap[prompt[i]];
@@ -217,46 +168,36 @@ export class Session {
 const makeU32 = (slots: number): Uint32Array => new Uint32Array(slots);
 const makeF32 = (slots: number): Float32Array => new Float32Array(slots);
 
-/** The learned model plus its static web prior. */
 export class Model {
 	readonly params: Params;
 	readonly web: WebPrior;
 	vocab: Vocab;
-	/** Weighted history count per id (`f32`). The per-id arrays are longer than the vocabulary. */
 	count: Float32Array;
-	/** Occurrences of the spelling in typed prompts (hygiene). */
 	raw: Uint32Array;
-	/** Web id per id (`NONE` outside the web vocabulary). */
 	webId: Uint32Array;
 	private flags: Uint8Array;
-	/** Follower-list index per context id (`NONE` = no followers). */
 	ctxSlot: Uint32Array;
 	followers: Followers[] = [];
-	/** Sum of weighted counts (`f64`). */
 	total = 0;
-	/** Vocabulary id per web id. */
 	webToId: Uint32Array;
 	private fen: Fenwick;
 	private tree: MaxTree;
-	/** Trigram contexts: `(u, v)` → pair index. */
 	pairs: IdTable<Uint32Array>;
-	/** Weighted count per pair index (`f32` values). */
 	pairTotals: number[] = [];
-	/** Distinct trigram words per pair index. */
 	pairTypeCounts: number[] = [];
-	/** Trigram counts keyed `(pair, w)`. */
 	tri: IdTable<Float32Array>;
-	/** Non-plain case tails per id, in first-seen order (the first form wins equal counts). */
+	/**
+	 * Keep case tails in first-seen order to break ties.
+	 */
 	tails = new Map<number, CaseTail[]>();
 	session = new Session();
-	/** Id of the sentence-start pseudo-word. */
 	bos: number;
-	/** Bumped by every learned-state change (invalidates query memos). */
+	/**
+	 * Bump when a mutation invalidates cached queries.
+	 */
 	version = 0;
 
-	// Learning scratch.
 	private readonly found: number[] = [];
-	/** Spellings folded in the current prompt: `original id, canonical id` pairs, flat. */
 	private readonly folds: number[] = [];
 	private readonly context: Context = { u: SLOT_NONE, v: SLOT_NONE, uWord: "", vWord: "" };
 	private readonly visitSlip = (candidate: string): void => {
@@ -264,10 +205,6 @@ export class Model {
 		if (other !== NONE && !this.found.includes(other)) this.found.push(other);
 	};
 
-	/**
-	 * Fresh model: the web vocabulary plus the sentence-start word (and
-	 * `extra`, see `withWords`).
-	 */
 	constructor(params: Params, web: WebPrior, extra: string[] = []) {
 		this.params = params;
 		this.web = web;
@@ -319,31 +256,23 @@ export class Model {
 		this.rebuildRanges();
 	}
 
-	/**
-	 * Model with no learned state whose sorted base holds the web vocabulary,
-	 * the sentence-start word, and `extra` (any order, repeats allowed).
-	 */
 	static withWords(params: Params, web: WebPrior, extra: string[]): Model {
 		return new Model(params, web, extra);
 	}
 
-	/** Weighted history count of `id` (`f32`). */
 	countOf(id: number): number {
 		return this.count[id];
 	}
 
-	/** Occurrences of `id` in typed (learnable) prompts. */
 	rawOf(id: number): number {
 		return this.raw[id];
 	}
 
-	/** Web unigram share of `id`. */
 	p0(id: number): number {
 		const wid = this.webId[id];
 		return wid === NONE ? 0 : this.web.p0[wid];
 	}
 
-	/** Rebuild the Fenwick and max trees over the sorted base. */
 	rebuildRanges(): void {
 		const base = this.vocab.baseLength;
 		const count = this.count;
@@ -354,12 +283,10 @@ export class Model {
 		this.tree = new MaxTree(scores, base);
 	}
 
-	/** Unigram prefix sum over base ids `[lo, hi)`. */
 	countSum(lo: number, hi: number): number {
 		return this.fen.prefix(hi) - this.fen.prefix(lo);
 	}
 
-	/** Append the top-`k` base ids of `[lo, hi)` by `count + mu1·p0` to `out`. */
 	topK(lo: number, hi: number, k: number, out: number[]): void {
 		this.tree.topK(lo, hi, k, out);
 	}
@@ -368,10 +295,6 @@ export class Model {
 		return (this.flags[id] & TRUSTED) !== 0;
 	}
 
-	/**
-	 * May `id` be suggested? Real spellings always; habitual slips never;
-	 * words unknown to the web need `minCount` typed occurrences.
-	 */
 	eligible(id: number): boolean {
 		const flags = this.flags[id];
 		return (
@@ -380,64 +303,53 @@ export class Model {
 		);
 	}
 
-	/** Id of a context slot (`SLOT_BOS` → bos, `SLOT_WORD` → vocab.find), or NONE. */
 	resolve(slot: Slot, word: string): number {
 		if (slot === SLOT_BOS) return this.bos;
 		if (slot === SLOT_WORD) return this.vocab.find(word);
 		return NONE;
 	}
 
-	/** Follower list of context `v`. */
 	followersOf(v: number): Followers | undefined {
 		const slot = this.ctxSlot[v];
 		return slot === NONE ? undefined : this.followers[slot];
 	}
 
-	/** Web bigram slot of context `v`. */
 	webSlotOf(v: number): number {
 		if (v === this.bos) return this.web.slot(this.web.length);
 		const wid = this.webId[v];
 		return wid === NONE ? NO_SLOT : this.web.slot(wid);
 	}
 
-	/** Pair index of context (u, v), or NONE. */
 	pairOf(u: number, v: number): number {
 		const pair = this.pairs.get(u, v);
 		return pair === undefined ? NONE : pair;
 	}
 
-	/** Weighted count of pair index `pair` (`f32`). */
 	pairTotal(pair: number): number {
 		return this.pairTotals[pair];
 	}
 
-	/** Distinct trigram words seen after pair index `pair`. */
 	pairTypes(pair: number): number {
 		return this.pairTypeCounts[pair];
 	}
 
-	/** Trigram count, 0 when absent. */
 	triCount(pair: number, w: number): number {
 		const count = this.tri.get(pair, w);
 		return count === undefined ? 0 : count;
 	}
 
-	/** Number of trigram contexts (status only). */
 	pairCount(): number {
 		return this.pairs.size;
 	}
 
-	/** Number of trigrams (status only). */
 	trigramCount(): number {
 		return this.tri.size;
 	}
 
-	/** Session words starting with `prefix`, in word order. */
 	sessionRange(prefix: string, visit: (id: number, count: number) => void): void {
 		this.session.range(prefix, this.vocab, visit);
 	}
 
-	/** Words with a learned count (status only). */
 	learnedWords(): number {
 		const count = this.count;
 		const n = this.vocab.length;
@@ -448,7 +360,6 @@ export class Model {
 		return learned;
 	}
 
-	/** Grow the per-id arrays to hold `needed` ids. */
 	private reserve(needed: number): void {
 		const have = this.count.length;
 		if (needed <= have) return;
@@ -485,17 +396,15 @@ export class Model {
 		return id;
 	}
 
-	/** Refill the session cache from restored prompts (oldest first). */
+	/**
+	 * Prompts must be restored oldest first.
+	 */
 	restoreSession(prompts: number[][]): void {
 		const session = new Session();
 		for (const prompt of prompts) session.push(prompt, this.params.sessionPrompts);
 		this.session = session;
 	}
 
-	/**
-	 * Maintain WATCH for a new word: a misspelling marks the real words one
-	 * slip away; a real word marks itself when a misspelling is.
-	 */
 	private linkSlips(id: number): void {
 		const wordChars = codePoints(this.vocab.word(id));
 		if (wordChars + 1 < HYGIENE_MIN_CHARS) return;
@@ -513,17 +422,12 @@ export class Model {
 		}
 	}
 
-	/** Ids of the vocabulary words one slip away from `id` (the shared scratch list). */
 	private collectSlips(id: number): number[] {
 		this.found.length = 0;
 		forEachSlip(this.vocab.word(id), this.visitSlip);
 		return this.found;
 	}
 
-	/**
-	 * Recompute SHADOWED for the misspelling `id`: one slip away from a real
-	 * word the user types at least 3 times and at least a third as often.
-	 */
 	private refreshShadow(id: number): void {
 		const found = this.collectSlips(id);
 		const floor = Math.max(this.raw[id] / 3, 3);
@@ -538,7 +442,6 @@ export class Model {
 		else this.flags[id] &= ~SHADOWED;
 	}
 
-	/** Hygiene upkeep after `id`'s typed count changed. */
 	private touchHygiene(id: number): void {
 		if (!this.params.canonicalize) return;
 		const flags = this.flags[id];
@@ -556,7 +459,6 @@ export class Model {
 		for (const other of neighbours) this.refreshShadow(other);
 	}
 
-	/** Recompute every hygiene flag (after a restore). */
 	sweepHygiene(): void {
 		const n = this.vocab.length;
 		const flags = this.flags;
@@ -573,11 +475,6 @@ export class Model {
 		}
 	}
 
-	/**
-	 * The real spelling a rare misspelling should count toward: a personal
-	 * word typed `canonRatio`× as often (and trusted or typed ≥ 10×), or,
-	 * while the spelling is still rare, a trusted web word.
-	 */
 	private canonical(id: number): number {
 		const params = this.params;
 		const word = this.vocab.word(id);
@@ -615,7 +512,6 @@ export class Model {
 		return best;
 	}
 
-	/** Learn one submitted prompt. */
 	learn(prompt: string): void {
 		this.version += 1;
 		const words = proseWords(prompt);
@@ -628,8 +524,8 @@ export class Model {
 		const session: number[] = [];
 		for (const word of words) {
 			const surface = prompt.slice(word.start, word.end);
-			// `u` before `v`: interning a new context word assigns its id.
 			const context = contextBefore(prompt, word.start, this.context);
+			// Intern `u` before `v` to preserve word ID order.
 			const uid = this.eventContext(context.u, context.uWord);
 			const vid = this.eventContext(context.v, context.vWord);
 
@@ -651,10 +547,6 @@ export class Model {
 		if (this.vocab.overflowLength >= COMPACT_AT) this.compact();
 	}
 
-	/**
-	 * Context id for a learning event; words folded earlier in this prompt map
-	 * to their canonical spelling.
-	 */
 	private eventContext(slot: Slot, word: string): number {
 		if (slot === SLOT_BOS) return this.bos;
 		if (slot !== SLOT_WORD) return NONE;
@@ -666,7 +558,6 @@ export class Model {
 		return id;
 	}
 
-	/** Count one word with its left context (`u`, `v`: ids or NONE). */
 	private add(u: number, v: number, surface: string, w: number, weight: number): void {
 		this.count[w] += weight;
 		this.total += weight;
@@ -699,11 +590,10 @@ export class Model {
 		this.pairTotals[pair] = Math.fround(this.pairTotals[pair] + weight);
 	}
 
-	/** Record the casing of `surface` when it is a non-plain form of `w`. */
 	private addTail(w: number, surface: string, weight: number): void {
 		const tail = caseTail(surface);
 		const word = this.vocab.word(w);
-		// Whole-string lowercasing here (Rust `str::to_lowercase`), unlike everywhere else.
+		// Final sigma needs surrounding characters when lowercasing.
 		if (tail === word || codePoints(tail) !== codePoints(word) || tail.toLowerCase() !== word) return;
 		let tails = this.tails.get(w);
 		if (tails === undefined) {
@@ -719,7 +609,6 @@ export class Model {
 		tails.push({ form: tail, n: weight });
 	}
 
-	/** Fold overflow words into the sorted base and renumber every table. */
 	compact(): void {
 		const oldBase = this.vocab.baseLength;
 		const { vocab, remap } = this.vocab.compacted();
@@ -749,8 +638,7 @@ export class Model {
 		}
 		this.bos = remap[this.bos];
 
-		// Follower lists stay sorted by id: base ids keep their relative order,
-		// so only the overflow tail needs sorting before the two runs merge.
+		// Remapped base IDs must stay in order for this merge.
 		const order: number[] = [];
 		for (const list of this.followers) {
 			const ids = list.ids;
@@ -798,12 +686,6 @@ export class Model {
 		this.version += 1;
 	}
 
-	/**
-	 * Drop trigrams seen only in pastes (weighted count below 1) and the
-	 * contexts left without trigrams; their `p3` is a constant multiple of
-	 * `p2`, so posteriors keep their order. Surviving contexts keep their
-	 * unpruned totals.
-	 */
 	pruneTrigrams(): void {
 		const renumber = new Uint32Array(this.pairTotals.length).fill(NONE);
 		const totals: number[] = [];
@@ -836,10 +718,6 @@ export class Model {
 		this.version += 1;
 	}
 
-	/**
-	 * P(typed case tail | word): share of the word's occurrences whose tail is
-	 * compatible with how the prefix was typed, smoothed toward `prior`.
-	 */
 	caseProb(id: number, tailPrefix: string, plain: boolean, prior: number): number {
 		const count = this.count[id];
 		let other = 0;
@@ -856,11 +734,6 @@ export class Model {
 		return (compatible + a * prior) / (count + a);
 	}
 
-	/**
-	 * Surface suffix of `id` after `typed`: the most frequent seen form
-	 * compatible with the typed case, else the lowercase rest (uppercased when
-	 * the prefix is ALLCAPS).
-	 */
 	suffix(id: number, typed: string, tailPrefix: string): string {
 		const word = this.vocab.word(id);
 		const k = codePoints(typed);

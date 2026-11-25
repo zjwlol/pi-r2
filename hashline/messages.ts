@@ -1,19 +1,11 @@
-/**
- * hashline/messages.ts: every error / warning text the model sees from the hashline parser, applier and patcher.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/messages.rs`, `mismatch.rs` and the
- * diagnostics of `patcher.rs` (MIT). The strings are upstream's, byte for byte.
- */
 import { formatNumberedLine } from "./format.ts";
 
-/** `JSON.stringify(s)` for a string. */
 export function jsonQuote(s: string): string {
 	return JSON.stringify(s);
 }
 
-/** Lines of context shown either side of an anchor in a mismatch reply. */
 export const MISMATCH_CONTEXT = 2;
 
-/** Sorted line numbers shown for `anchorLines`: each in-range anchor ± MISMATCH_CONTEXT. */
 export function anchoredContextLines(anchorLines: readonly number[], lineCount: number): number[] {
 	const display = new Set<number>();
 	for (const line of anchorLines) {
@@ -25,7 +17,6 @@ export function anchoredContextLines(anchorLines: readonly number[], lineCount: 
 	return [...display].sort((a, b) => a - b);
 }
 
-/** Numbered rows around the anchors: `*` marks an anchor, `...` separates non-adjacent runs. */
 export function formatAnchoredContext(anchorLines: readonly number[], fileLines: readonly string[]): string[] {
 	const display = anchoredContextLines(anchorLines, fileLines.length);
 	const anchors = new Set(anchorLines);
@@ -60,7 +51,6 @@ function blockFormAt(op: AbsoluteRangeOp, line: number, register: string | undef
 	return register !== undefined ? `PUT ${line}*${regSuffix(register)}` : `PUT ${line}*:`;
 }
 
-/** `PUT 9.=3:`: the end precedes the start. */
 export function invalidAbsoluteRangeMessage(patchLine: number, start: number, end: number, op: AbsoluteRangeOp, register: string | undefined): string {
 	const single = rangeOpSingle(op, start, register);
 	const countedEnd = start + end - 1;
@@ -96,7 +86,6 @@ export const DIFF_OLD_ROWS_IGNORED_WARNING = "Ignored unified-diff `-old` row(s)
 export const MINUS_ROW_REJECTED =
 	"`-` rows are not valid; the range already names the lines being changed. For Markdown bullets or other literal `-` lines, prefix the literal row with `+`: `+- item`.";
 
-/** `PUT N*:` / `CUT N*` cannot be resolved (this port has no syntax parser, so always). */
 export function blockUnresolvedMessage(line: number, op: AbsoluteRangeOp, fileLines: readonly string[] | undefined, register: string | undefined): string {
 	const phrase = blockFormAt(op, line, register);
 	const fallback =
@@ -151,7 +140,6 @@ export function twoSidedBoundaryEchoMessage(startLine: number, endLine: number, 
 	return `\`PUT ${startLine}.=${endLine}:\` rejected: the body restates both the ${above} line(s) just above and the ${below} line(s) just below the range${repeated ? " more than once" : ""}, and once the rows that restate lines outside the range are set aside, the rows left are too few to be the full final content of the selected range: they leave out ${lineSpan(leftOut[0], leftOut[1])}, which this edit would delete. ${REISSUE}`;
 }
 
-/** How a result would repeat a neighbouring line: a span written a second time, or extra copies of one line. */
 export type Restated = { kind: "span"; first: number; last: number } | { kind: "copies"; line: number; extra: number };
 
 export function boundaryEchoOutcomeMessage(
@@ -231,8 +219,6 @@ export function pathRecoveredFromTagMessage(authoredPath: string, resolvedPath: 
 	return `Path "${authoredPath}" does not exist; matched its filename and snapshot tag #${tag} to ${resolvedPath} (read earlier this session). Anchor future edits on [${resolvedPath}#TAG].`;
 }
 
-// ── patcher.rs diagnostics ──────────────────────────────────────────────
-
 export function noChangeDiagnostic(path: string): string {
 	return `Edits to ${path} parsed and applied cleanly, but produced no change: your body row(s) are byte-identical to the file at the targeted lines. The bug is somewhere else — re-read the file before issuing another edit. Do NOT widen the payload or add lines; verify the anchor first.`;
 }
@@ -241,22 +227,16 @@ export function noChangeLoopDiagnostic(path: string, count: number): string {
 	return `STOP. Edits to ${path} have been a byte-identical no-op ${count} times in a row — the patch body matches the file at the targeted lines and the soft hint did not break the cycle. Cease re-issuing this payload. Either the intended change is already on disk (move on), or your anchor is wrong (re-read the file with \`read\` to observe the current line numbers and tag, then author a different edit). This exact payload will keep being rejected until it changes.`;
 }
 
-// ── mismatch.rs ─────────────────────────────────────────────────────────
-
 export interface MismatchDetails {
 	path: string | undefined;
-	/** The tag the section carried; "" when it carried none. */
 	expectedFileHash: string;
 	actualFileHash: string;
 	fileLines: readonly string[];
 	anchorLines: readonly number[];
-	/** The store holds a version of this path with `expectedFileHash`. */
 	hashRecognized: boolean;
-	/** Other paths the store issued `expectedFileHash` for. */
 	tagOriginPaths: readonly string[];
 }
 
-/** Failure class of a mismatch (upstream `mismatch_error`). */
 export function mismatchKind(details: MismatchDetails): string {
 	if (details.hashRecognized) return "stale_tag";
 	if (details.expectedFileHash === "") return "missing_tag";

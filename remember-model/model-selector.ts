@@ -1,19 +1,3 @@
-/**
- * Patches pi's built-in /model selector (ModelSelectorComponent) so recently
- * used models are listed right after the current one, tagged with when they
- * were last used.
- *
- * /model is handled by interactive mode before extension commands run, so it
- * can't be replaced with registerCommand. Instead we wrap two of the
- * component's (TS-private, runtime-public) methods on the shared prototype:
- *   - sortModels: reorder as current → recent (MRU order) → pi's default order
- *   - updateList: append " · 5m ago" to visible recent rows
- *
- * The prototype is patched once per process; behavior is delegated to a hook
- * on globalThis that each extension runtime installs/clears, so /reload picks
- * up new code and a removed extension stops affecting the selector. If pi's
- * internals change shape, the wrappers fall back to the original behavior.
- */
 import { ModelSelectorComponent, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { modelKey, type RecentModel } from "./history.ts";
@@ -28,7 +12,6 @@ interface ModelItem {
 	id: string;
 }
 
-/** Shape of the ModelSelectorComponent internals we touch. */
 interface SelectorInternals {
 	currentModel?: { provider: string; id: string };
 	filteredModels?: ModelItem[];
@@ -40,7 +23,9 @@ interface SelectorInternals {
 const HOOK = Symbol.for("pi-extended.remember-model.selector-hook");
 const PATCHED = Symbol.for("pi-extended.remember-model.selector-patched");
 const RECENT = Symbol.for("pi-extended.remember-model.recent");
-/** Mirrors maxVisible in ModelSelectorComponent.updateList. */
+/**
+ * This must match the row limit in pi's model selector.
+ */
 const MAX_VISIBLE = 10;
 
 type GlobalWithHook = typeof globalThis & { [HOOK]?: SelectorHook };
@@ -51,7 +36,9 @@ export function setSelectorHook(hook: SelectorHook | undefined): void {
 
 const getHook = () => (globalThis as GlobalWithHook)[HOOK];
 
-/** Returns false if the selector doesn't look like what we expect (nothing patched). */
+/**
+ * Pi handles `/model` before it dispatches extension commands.
+ */
 export function patchModelSelector(): boolean {
 	const proto = (ModelSelectorComponent as unknown as { prototype?: Record<PropertyKey, unknown> } | undefined)
 		?.prototype;
@@ -81,7 +68,7 @@ export function patchModelSelector(): boolean {
 		try {
 			decorateRecent(this, hook.theme());
 		} catch {
-			// Cosmetic only.
+			// Decoration errors must not break model selection.
 		}
 	};
 
@@ -99,7 +86,7 @@ function sortByRecent<T extends ModelItem>(
 		current && item.provider === current.provider && item.id === current.id
 			? -1
 			: (rank.get(modelKey(item.provider, item.id)) ?? Number.MAX_SAFE_INTEGER);
-	// Array#sort is stable, so everything that isn't recent keeps pi's order.
+	// Equal ranks must preserve pi's ordering.
 	return [...sorted].sort((a, b) => score(a) - score(b));
 }
 
@@ -120,7 +107,6 @@ function decorateRecent(self: SelectorInternals, theme: Theme): void {
 		const item = items[i];
 		if (!(row instanceof Text) || !item) return;
 		const text = (row as unknown as { text?: unknown }).text;
-		// Bail out entirely if rows don't line up with items (pi internals changed).
 		if (typeof text !== "string" || !text.includes(item.id) || !text.includes(`[${item.provider}]`)) return;
 		if (current && current.provider === item.provider && current.id === item.id) continue;
 		const lastUsed = recent.get(modelKey(item.provider, item.id));

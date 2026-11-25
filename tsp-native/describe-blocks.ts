@@ -1,29 +1,3 @@
-/**
- * Native describers for pi's transcript and startup blocks that otherwise read
- * as a terminal (oh-my-pi's `chat/*` describes are the reference):
- *
- * - a user `!cmd` / `!!cmd` run (BashExecutionComponent) is omp's user run: a
- *   `tool` (role `omp.bash`, a `you` badge, `not sent` for `!!`) over one run
- *   box (`omp.run`: the command, the output as an `ansi` mini terminal
- *   following its tail, the state/time/truncation foot); a `card` where the
- *   terminal has no `tool` kind;
- * - compaction and branch summaries are omp's folded dividers (`section`s
- *   `omp.compaction` / `omp.branch`), a skill invocation omp's user-toned
- *   `omp.skill` card with its prompt behind a fold;
- * - an extension's message or entry renderer stays a describe boundary under
- *   an `omp.custom` col (its own describe wins); pi's default custom message
- *   look is omp's framed `omp.custom` card;
- * - pi's startup header is omp's `omp.welcome` splash (logo, wordmark and
- *   version, key hints as keycaps, the onboarding tip), the loaded-resources
- *   listings quiet `section`s, the Earendil announcement a card with its
- *   picture, Armin and the 3D egg pictures/`ansi`, a VisualLinePreview an
- *   `ansi` clamp — never `rows`.
- *
- * {@link toolResultImages} turns a tool result's image blocks into `image`
- * nodes (blobs) the tool describer appends to its body.
- *
- * Runtime imports stay off describers.ts (it registers these).
- */
 import { Buffer } from "node:buffer";
 import { pathToFileURL } from "node:url";
 import {
@@ -46,7 +20,6 @@ import { ansi, card, code, col, compact, type DescribeContext, EMPTY_NODE, md, t
 import { hasStyle, lineToSpans, spansThemeId } from "./spans.ts";
 import type { TspCardStatus, TspSpan, TspTone } from "./wire.ts";
 
-/** Loose view of private component state. */
 type Any = Record<string, any>;
 
 function is(component: Component, ctor: Function | undefined, name: string): boolean {
@@ -57,7 +30,9 @@ function is(component: Component, ctor: Function | undefined, name: string): boo
 	return false;
 }
 
-/** The exact class (by constructor name): pi's module-local classes (BuiltInHeader, ExpandableText, …) have no export to test against. */
+/**
+ * pi's startup display classes have no exported constructors.
+ */
 function exactly(component: Component, name: string): boolean {
 	return (component as Any).constructor?.name === name;
 }
@@ -66,7 +41,9 @@ function plain(s: string): string {
 	return stripAnsi(s).replaceAll("\x1b_pi:c\x07", "");
 }
 
-/** A ThemedText rebuilds its string lazily in render(): ask for it once so `text` is current (as the Text describers do). */
+/**
+ * pi normally rebuilds stale text during render.
+ */
 function refreshThemedText(a: Any): void {
 	if (a.stale === true && typeof a.build === "function") {
 		a.stale = false;
@@ -78,7 +55,6 @@ function rootToggle(event: NativeUiEvent): boolean | undefined {
 	return event.type === "toggle" && event.key === "" ? !event.collapsed : undefined;
 }
 
-/** omp's `formatNumber`: 999, 1.2K, 19K, 1.5M. */
 function formatNumber(n: number): string {
 	const trim1 = (v: number) => {
 		const s = v.toFixed(1);
@@ -108,9 +84,9 @@ function styledLine(line: string, role: string, key: string): NativeNode {
 	return text(spans, { role, wrap: "word" }, key);
 }
 
-// ── Images (blobs) ──────────────────────────────────────────────────────
-
-/** rsttyd's `MAX_BLOB` (decoded bytes): bigger blobs are rejected, so they aren't registered. */
+/**
+ * Match the terminal's cap on decoded blob bytes.
+ */
 const MAX_BLOB_BYTES = 16 * 1024 * 1024;
 const NO_IMAGES: NativeNode[] = [];
 
@@ -120,7 +96,6 @@ interface DecodedImage {
 	readonly h: number | undefined;
 }
 
-/** Decoded payloads by their base64 text (bounded): a payload is decoded and hashed once, whichever result object carries it. */
 const decodedImages = new Map<string, DecodedImage | null>();
 const MAX_DECODED_IMAGES = 64;
 
@@ -134,7 +109,7 @@ function decodeImage(data: string, mime: string): DecodedImage | null {
 	let entry: DecodedImage | null = null;
 	try {
 		const buffer = Buffer.from(data, "base64");
-		// A small Buffer is a view into Node's shared pool: keep a copy of its own.
+		// Small buffers can retain the entire shared allocation.
 		const bytes = buffer.byteOffset === 0 && buffer.buffer.byteLength === buffer.byteLength ? buffer : new Uint8Array(buffer);
 		if (bytes.byteLength > 0 && bytes.byteLength <= MAX_BLOB_BYTES) {
 			let dims: { widthPx: number; heightPx: number } | null = null;
@@ -160,7 +135,6 @@ function decodeImage(data: string, mime: string): DecodedImage | null {
 	return entry;
 }
 
-/** `image` nodes for the `{type: "image", data, mimeType}` blocks of `content` (keys `img<n>`). */
 function imageNodes(content: readonly unknown[], widthCells: number | undefined, role: string): NativeNode[] {
 	const out: NativeNode[] = [];
 	for (const item of content) {
@@ -195,15 +169,8 @@ interface ImageMemo {
 	readonly nodes: NativeNode[];
 }
 
-/** The image nodes last built per tool result object. */
 const toolImages = new WeakMap<object, ImageMemo>();
 
-/**
- * The image blocks of a ToolExecutionComponent's result (`tool.result.content`
- * items `{type: "image", data, mimeType}`) as `image` nodes (keys `img<n>`),
- * only where the terminal draws blobs and pi shows images. The same array
- * while the result is unchanged (each payload decoded once).
- */
 export function toolResultImages(tool: Record<string, any>, cx: DescribeContext): NativeNode[] {
 	if (!imagesSupported(cx) || tool.showImages === false) return NO_IMAGES;
 	const result: unknown = tool.result;
@@ -218,20 +185,14 @@ export function toolResultImages(tool: Record<string, any>, cx: DescribeContext)
 	return nodes;
 }
 
-// ── User bash (`!cmd`, `!!cmd`) ─────────────────────────────────────────
-
 type ExecutionStatus = "running" | "complete" | "cancelled" | "error";
 
-/** pi's PREVIEW_LINES for a user run (bash-execution.ts). */
 const BASH_PREVIEW_LINES = 20;
-/** omp's RUN_INPUT_PREVIEW_LINES: drawn lines of the command before its "N more lines". */
 const RUN_INPUT_PREVIEW_LINES = 6;
 
 const CARD_STATUS: Record<ExecutionStatus, TspCardStatus> = { running: "running", complete: "done", cancelled: "cancelled", error: "error" };
 
-/** When a run was first seen running, and first seen settled (a run restored from the session has no clock). */
 const bashClocks = new WeakMap<Component, { start: number; end?: number }>();
-/** pi's Loader timers stopped while a run is native (the terminal clocks its spinner), restarted on release. */
 const stoppedLoaders = new Map<Any, Any>();
 
 function bashStatus(a: Any): ExecutionStatus {
@@ -253,11 +214,11 @@ function tickBashClock(c: Component, status: ExecutionStatus): { start: number; 
 function stopBashLoader(a: Any): void {
 	const loader: Any | undefined = a.loader;
 	if (!loader?.intervalId || typeof loader.stop !== "function") return;
+	// The terminal animates this spinner without pi's repaint timer.
 	loader.stop();
 	stoppedLoaders.set(loader, a);
 }
 
-/** The run's output as pi keeps it for display (its context-limit tail), and whether anything was cut. */
 function bashOutput(a: Any): { output: string; truncated: boolean } {
 	const lines: unknown = a.outputLines;
 	const full = Array.isArray(lines) ? lines.join("\n") : typeof a.getOutput === "function" ? String(a.getOutput()) : "";
@@ -268,7 +229,6 @@ function bashOutput(a: Any): { output: string; truncated: boolean } {
 		output = cut.content;
 		if (cut.truncated) truncated = true;
 	} catch {
-		// keep the full output
 	}
 	return { output: output.trimEnd(), truncated };
 }
@@ -281,7 +241,6 @@ function cancelKey(): string {
 	}
 }
 
-/** The truncation notice of a run's foot (pi: `Output truncated. Full output: <path>`). */
 function truncationNotice(a: Any, truncated: boolean): string | undefined {
 	if (!truncated) return undefined;
 	const path = typeof a.fullOutputPath === "string" && a.fullOutputPath ? a.fullOutputPath : undefined;
@@ -295,7 +254,6 @@ const RUN_STATE: Record<ExecutionStatus, { word: string; tone: TspTone }> = {
 	cancelled: { word: "Cancelled", tone: "muted" },
 };
 
-/** omp's `runFoot`: the state word in its tone, the run time (live while running) and the notice. */
 function runFoot(status: ExecutionStatus, exitCode: unknown, ms: number | undefined, notice: string | undefined): NativeNode {
 	const failed = status === "error" && typeof exitCode === "number" && exitCode !== 0;
 	const state = failed ? { word: `exit ${exitCode}`, tone: RUN_STATE.error.tone } : RUN_STATE[status];
@@ -314,12 +272,6 @@ function runFoot(status: ExecutionStatus, exitCode: unknown, ms: number | undefi
 	);
 }
 
-/**
- * omp's `describeExecutionTool`: the user's run as the agent's bash frame
- * with a `you` badge (`not sent` when excluded from context) and the command
- * for Copy command; one run box (command, output, foot); timer, exit chip and
- * cancelled note as head data.
- */
 function describeBashTool(a: Any, status: ExecutionStatus, ms: number | undefined): NativeNode {
 	const command = String(a.command ?? "");
 	const running = status === "running";
@@ -358,7 +310,6 @@ function describeBashTool(a: Any, status: ExecutionStatus, ms: number | undefine
 	);
 }
 
-/** omp's `describeExecutionCard` (terminals without `tool`): the `$ cmd` head, the output, a cancel spinner, then the notes. */
 function describeBashCard(a: Any, status: ExecutionStatus, ms: number | undefined): NativeNode {
 	const command = String(a.command ?? "");
 	const running = status === "running";
@@ -431,14 +382,11 @@ const bashExecution: Describer = {
 	},
 };
 
-// ── Summaries and skills ────────────────────────────────────────────────
-
 function toggleExpanded(c: Component, event: NativeUiEvent, keys: readonly string[] = [""]): void {
 	if (event.type !== "toggle" || !keys.includes(event.key)) return;
 	(c as Any).setExpanded?.(!event.collapsed);
 }
 
-/** omp's compaction divider: `Compacted from 19K tokens`, the summary behind the fold. */
 const compactionSummary: Describer = {
 	name: "CompactionSummary",
 	matches: (c) => is(c, CompactionSummaryMessageComponent, "CompactionSummaryMessageComponent"),
@@ -464,7 +412,6 @@ const compactionSummary: Describer = {
 	handleEvent: (c, event) => toggleExpanded(c, event),
 };
 
-/** omp's branch divider: `Branch summarized`, the summary behind the fold. */
 const branchSummary: Describer = {
 	name: "BranchSummary",
 	matches: (c) => is(c, BranchSummaryMessageComponent, "BranchSummaryMessageComponent"),
@@ -490,7 +437,6 @@ function fileHref(path: unknown): { href: string } | undefined {
 	}
 }
 
-/** omp's skill card: a user-toned card headed by the skill (linked to its file) and its size, the loaded prompt behind a fold. */
 const skillInvocation: Describer = {
 	name: "SkillInvocation",
 	matches: (c) => is(c, SkillInvocationMessageComponent, "SkillInvocationMessageComponent"),
@@ -513,8 +459,6 @@ const skillInvocation: Describer = {
 	handleEvent: (c, event) => toggleExpanded(c, event, ["", "prompt"]),
 };
 
-// ── Extension messages and entries ──────────────────────────────────────
-
 interface CustomImages {
 	readonly content: unknown;
 	readonly nodes: NativeNode[];
@@ -531,11 +475,6 @@ function customMessageImages(c: Component, content: unknown, cx: DescribeContext
 	return nodes;
 }
 
-/**
- * An extension's custom message: its renderer's component stays a describe
- * boundary (its own describe wins) under an `omp.custom` col; pi's default
- * look is omp's framed card, the custom type as its head, the text as markdown.
- */
 const customMessage: Describer = {
 	name: "CustomMessage",
 	matches: (c) => is(c, CustomMessageComponent, "CustomMessageComponent"),
@@ -559,7 +498,6 @@ const customMessage: Describer = {
 	},
 };
 
-/** An extension's session entry: the renderer's component as a describe boundary; nothing rendered, nothing shown. */
 const customEntry: Describer = {
 	name: "CustomEntry",
 	matches: (c) => is(c, undefined, "CustomEntryComponent"),
@@ -570,9 +508,6 @@ const customEntry: Describer = {
 	},
 };
 
-// ── Startup header ──────────────────────────────────────────────────────
-
-/** pi's logo (pi-logo.ts): four cells of two square pixels each, in its brand colours, as a tile. */
 const PI_LOGO_SVG =
 	'<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="-0.5 -0.5 5 5" shape-rendering="crispEdges">' +
 	'<path fill="#e48a7a" d="M0 0h3v1H0zM2 1h1v1H2z"/>' +
@@ -587,10 +522,8 @@ function piLogo(): string {
 	return piLogoBlob;
 }
 
-/** The logo's half-block glyphs leading the header's hint line. */
 const LOGO_GLYPHS = /^[\s\u2580-\u259f]+/;
 
-/** Single-word key names that read as keys (pi-tui key ids). */
 const KEY_NAMES: ReadonlySet<string> = new Set([
 	"esc",
 	"escape",
@@ -625,12 +558,13 @@ function isKeyWord(word: string): boolean {
 	return chars.length === 1 || (chars.length <= 2 && /^[^\p{L}\p{N}\s]+$/u.test(word));
 }
 
-/** A key id for rsttyd's `key` spans (macOS pi writes `option` for alt). */
+/**
+ * pi's rendered hints can spell Alt as `option`.
+ */
 function keyId(word: string): string {
 	return word.replace(/\boption\b/gi, "alt");
 }
 
-/** A hint's key text as keycap spans: `ctrl+c/ctrl+d` two caps, `ctrl+c twice` a cap and a word. */
 function keySpans(keys: string): TspSpan[] {
 	const out: TspSpan[] = [];
 	keys.split(" ").forEach((word, i) => {
@@ -652,7 +586,6 @@ function keySpans(keys: string): TspSpan[] {
 	return out;
 }
 
-/** One hint (`esc to interrupt`, `ctrl+o more`) as its keys and its words. */
 function parseHint(item: string): { keys: string; desc: string } {
 	const m = /^(.+?) ((?:to|for) .+)$/.exec(item);
 	if (m) return { keys: m[1]!, desc: m[2]! };
@@ -660,21 +593,12 @@ function parseHint(item: string): { keys: string; desc: string } {
 	return sp === -1 ? { keys: item, desc: "" } : { keys: item.slice(0, sp), desc: item.slice(sp + 1) };
 }
 
-/** `Press ctrl+o to show …` with the key as a keycap. */
 function pressSpans(line: string): TspSpan[] {
 	const m = /^(Press )(\S+)( .*)$/.exec(line);
 	if (!m || !isKeyWord(m[2]!)) return [span(line, "dim")];
 	return [span(m[1]!, "dim"), ...keySpans(m[2]!), span(m[3]!, "dim")];
 }
 
-/**
- * pi's built-in header (BuiltInHeader: the logo and version, the key hints,
- * the onboarding lines) as omp's `omp.welcome` splash: the lockup (pi's logo
- * tile where blobs draw, the `pi` wordmark over the version), the hints as
- * keycap pairs (inline while folded, a grid expanded), the "Press … for more"
- * line, then the onboarding sentence as omp's tip. The text is pi's own
- * (parsed from what it renders), so hints follow the keybindings.
- */
 function describeHeader(a: Any, cx: DescribeContext): NativeNode {
 	const lines = plain(String(a.text ?? "")).split("\n");
 	if (lines.every((line) => line.trim() === "")) return EMPTY_NODE;
@@ -747,11 +671,6 @@ const builtInHeader: Describer = {
 	build: (c, cx) => describeHeader(c as Any, cx),
 };
 
-/**
- * A loaded-resources listing (ExpandableText `[Context]`, `[Skills]`, …): a
- * quiet section headed by the name, pi's compact list (folded) or its scope
- * groups (expanded) as themed lines.
- */
 const loadedResources: Describer = {
 	name: "LoadedResources",
 	matches: (c) => exactly(c, "ExpandableText"),
@@ -765,14 +684,13 @@ const loadedResources: Describer = {
 		const lines = raw.split("\n");
 		const name = /^\[(.+)\]$/.exec(plain(lines[0] ?? "").trim())?.[1];
 		const rest = (name === undefined ? lines : lines.slice(1)).filter((line) => plain(line).trim() !== "");
-		// pi indents every listing line two cells under its head; the section body does that.
+		// pi already indents each listing entry by two cells.
 		const body = rest.map((line, i) => styledLine(line.replace(/^((?:\x1b\[[0-9;]*m)*) {2}/, "$1"), "pi.resources.item", `l${i}`));
 		if (name === undefined) return body.length > 0 ? col(body, { role: "pi.resources" }) : EMPTY_NODE;
 		return node("section", { role: "pi.resources", head: [span(name, "strong")] }, body);
 	},
 };
 
-/** pi's Earendil announcement: a card with the title, the blog link and the picture (pi-tui's Image, a describe boundary). */
 const earendilAnnouncement: Describer = {
 	name: "EarendilAnnouncement",
 	matches: (c) => is(c, undefined, "EarendilAnnouncementComponent"),
@@ -802,9 +720,6 @@ const earendilAnnouncement: Describer = {
 	},
 };
 
-// ── Easter eggs and previews ────────────────────────────────────────────
-
-/** Opacity of the top and bottom pixel of a half-block cell. */
 function cellPixels(ch: string | undefined): readonly [number, number] {
 	switch (ch) {
 		case "█":
@@ -824,7 +739,6 @@ function cellPixels(ch: string | undefined): readonly [number, number] {
 	}
 }
 
-/** A half-block grid as an SVG (one path per opacity, horizontal runs merged), 4px per pixel. */
 function gridSvg(grid: readonly (readonly string[])[], color: string): string {
 	const width = grid.reduce((n, r) => Math.max(n, r.length), 0);
 	const height = grid.length * 2;
@@ -848,7 +762,6 @@ function gridSvg(grid: readonly (readonly string[])[], color: string): string {
 	return `<svg xmlns="http://www.w3.org/2000/svg" width="${width * 4}" height="${height * 4}" viewBox="0 0 ${width} ${height}" shape-rendering="crispEdges">${body}</svg>`;
 }
 
-/** The truecolor foreground of a pi-rendered line, as `#rrggbb`. */
 function lineColor(lines: readonly string[]): string | undefined {
 	for (const line of lines) {
 		const m = /\x1b\[38;2;(\d+);(\d+);(\d+)m/.exec(line);
@@ -857,14 +770,8 @@ function lineColor(lines: readonly string[]): string | undefined {
 	return undefined;
 }
 
-/** The last animation frame's blob per Armin, released when the next frame replaces it. */
 const arminFrames = new WeakMap<Component, string>();
 
-/**
- * Armin (`/armin`): his picture in the theme's accent as an SVG where blobs
- * draw (the effect animating at 10 fps), else his half-block art as `ansi`;
- * then "ARMIN SAYS HI".
- */
 const armin: Describer = {
 	name: "Armin",
 	matches: (c) => is(c, ArminComponent, "ArminComponent"),
@@ -891,21 +798,17 @@ const armin: Describer = {
 	},
 };
 
-/**
- * The 3D easter egg (fullscreen overlay): its frames as an `ansi` screen at
- * 8 fps (describing keeps it alive; it ends on its own once no longer drawn).
- */
 const easterEgg3d: Describer = {
 	name: "EasterEgg3d",
 	matches: (c) => is(c, undefined, "EasterEgg3dAnimation"),
 	fingerprint: (_c, cx) => [Math.floor(Date.now() / 125), cx.cols],
 	build: (c, cx) => {
 		const cols = Math.max(1, cx.cols);
+		// Repeated renders keep pi's animation alive.
 		return ansi(c.render(cols).join("\n"), { role: "pi.egg", cols }, "screen");
 	},
 };
 
-/** pi's collapsed tool output preview: the whole text as `ansi`, clamped to its head or tail lines by the terminal. */
 const visualLinePreview: Describer = {
 	name: "VisualLinePreview",
 	matches: (c) => is(c, undefined, "VisualLinePreview"),
@@ -922,22 +825,16 @@ const visualLinePreview: Describer = {
 	},
 };
 
-/**
- * Leaving native rendering: restart the spinner timers of runs still going
- * (the describer stopped them; the terminal clocked the native spinner).
- */
 export function releaseBlockSideEffects(): void {
 	for (const [loader, run] of stoppedLoaders) {
 		try {
 			if (run.status === "running") loader.start?.();
 		} catch {
-			// ignore
 		}
 	}
 	stoppedLoaders.clear();
 }
 
-/** Registered before the transcript's and the generic describers (exact classes only). */
 export const BLOCK_DESCRIBERS: readonly Describer[] = [
 	bashExecution,
 	compactionSummary,

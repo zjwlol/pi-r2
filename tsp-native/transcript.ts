@@ -1,23 +1,3 @@
-/**
- * The transcript as oh-my-pi's blocks. pi mounts its whole document (header,
- * loaded resources, chat) as one component; Tern's transcript features (the
- * "Worked for …" fold, block parking, per-block styling) look at `main`'s
- * direct children, so {@link transcriptBlocks} flattens pi's plain layout
- * containers into one block per chat entry, and the describers here make the
- * blocks classify as omp's do (tsp-fold.js `blockKind`):
- *
- * - a user message is omp's `omp.user` bubble (a break);
- * - an assistant message is an `omp.assistant` col of `md` parts keyed by
- *   content index, its thoughts omp's `omp.thinking` sections with a "Thought
- *   for 12s" head (`took` feeds the fold's sum), its turn-ending error or
- *   abort in omp's roles, and the turn's usage as omp's hover footer;
- * - a transcript Spacer draws nothing (the block gap spaces the blocks, as in
- *   omp), a dim status line is an `omp.notice.status` text and a warning line
- *   omp's `omp.notice.warning` row (the tone's icon beside the message): all
- *   quiet, so they fold with the run around them.
- *
- * Runtime imports stay off describers.ts (it registers these first).
- */
 import { AssistantMessageComponent, copyToClipboard, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, ScrollView, Spacer, Text } from "@earendil-works/pi-tui";
 import type { Describer } from "./describers.ts";
@@ -25,7 +5,6 @@ import { card, col, type DescribeContext, EMPTY_NODE, md, type NativeChild, type
 import { hasStyle, lineToSpans, spansThemeId } from "./spans.ts";
 import type { TspSpan } from "./wire.ts";
 
-/** Loose view of private component state. */
 type Any = Record<string, any>;
 
 function is(component: Component, ctor: Function | undefined, name: string): boolean {
@@ -36,18 +15,13 @@ function is(component: Component, ctor: Function | undefined, name: string): boo
 	return false;
 }
 
-// ── Flattening ──────────────────────────────────────────────────────────
-
-/** Levels of plain containers opened: pi's document, then its header/loaded-resources/chat containers. */
 const LAYOUT_DEPTH = 2;
 
-/** An exact pi-tui `Container` (UserMessageComponent, ToolExecutionComponent, … extend it: those are blocks). */
 function isPlainContainer(c: Component): boolean {
 	const ctor = (c as Any).constructor;
 	return (ctor === Container || ctor?.name === "Container") && Array.isArray((c as Any).children);
 }
 
-/** A fullscreen transcript viewport mounted in pi's place: its content is the document. */
 function scrolledContent(c: Component): Component | undefined {
 	if (!is(c, ScrollView, "ScrollView")) return undefined;
 	const child = (c as Any).child;
@@ -55,11 +29,7 @@ function scrolledContent(c: Component): Component | undefined {
 }
 
 /**
- * The transcript blocks under pi's document root (`tui.children[0]` in both
- * TUI modes: the fullscreen layout root only wraps the same components): the
- * root and its plain layout containers opened, every other component a block
- * (the same objects each frame, so their wire ids stay). Anything else at the
- * root stays one block, as before.
+ * The terminal expects each transcript block to be a direct child of main.
  */
 export function transcriptBlocks(root: Component): Component[] {
 	const out: Component[] = [];
@@ -83,7 +53,6 @@ export function transcriptBlocks(root: Component): Component[] {
 type BlockKind = "user" | "assistant" | "text" | "spacer" | "other";
 
 const kinds = new WeakMap<Component, BlockKind>();
-/** Components that are transcript blocks (a Text or Spacer elsewhere keeps its ordinary describer). */
 const blocks = new WeakSet<Component>();
 
 function kindOf(c: Component): BlockKind {
@@ -98,12 +67,8 @@ function kindOf(c: Component): BlockKind {
 	return kind;
 }
 
-// ── Turn usage ──────────────────────────────────────────────────────────
-
-/** A finished turn's totals (omp `TurnUsageSummary`), shown under its last answer. */
 interface TurnUsage {
 	readonly elapsedMs: number | undefined;
-	/** Input and cache writes (cache reads re-read the context each request: left out, as in omp). */
 	readonly input: number;
 	readonly output: number;
 	readonly cost: number;
@@ -117,11 +82,6 @@ function num(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-/**
- * Mark the blocks and sum each turn's requests onto the message that ends it
- * (any stop but `toolUse`); a user message starts a new tally. The same
- * summary object stays while its numbers do.
- */
 function noteTranscript(list: readonly Component[]): void {
 	let input = 0;
 	let output = 0;
@@ -146,6 +106,7 @@ function noteTranscript(list: readonly Component[]): void {
 			continue;
 		}
 		const usage: Any = message.usage ?? {};
+		// Cache reads can count the same context again on each request.
 		input += num(usage.input) + num(usage.cacheWrite);
 		output += num(usage.output);
 		cost += num(usage.cost?.total);
@@ -167,7 +128,6 @@ function noteTranscript(list: readonly Component[]): void {
 	}
 }
 
-/** omp `formatTurnUsage`: `12.4s · 19K tok · $0.02 this turn`, exact counts in the tooltip. */
 function formatTurnUsage(elapsedMs: number | undefined, input: number, output: number, cost: number): { text: string; title: string } {
 	const tokens = input + output;
 	const money = cost > 0 ? (cost < 0.005 ? "<$0.01" : `$${cost.toFixed(2)}`) : undefined;
@@ -178,7 +138,6 @@ function formatTurnUsage(elapsedMs: number | undefined, input: number, output: n
 	return { text: `${line} this turn`, title: `This turn: ${title}` };
 }
 
-/** omp's `formatDuration`. */
 function formatDuration(ms: number): string {
 	if (!Number.isFinite(ms) || ms <= 0) return "0ms";
 	if (ms < 1000) return `${Math.floor(ms)}ms`;
@@ -201,7 +160,6 @@ function formatDuration(ms: number): string {
 	return hours > 0 ? `${days}d${hours}h` : `${days}d`;
 }
 
-/** omp's `formatNumber`: 999, 1.2K, 19K, 1.5M. */
 function formatNumber(n: number): string {
 	const trim1 = (v: number) => {
 		const s = v.toFixed(1);
@@ -218,15 +176,12 @@ function formatNumber(n: number): string {
 function copy(value: string): void {
 	if (!value) return;
 	copyToClipboard(value).catch(() => {
-		// no clipboard reachable: nothing to report in the transcript
+		// The clipboard may be unavailable.
 	});
 }
 
-// ── User message ────────────────────────────────────────────────────────
-
 const IMAGE_TOKEN = /\[Image #\d+\]/g;
 
-/** paste-images' `[Image #N]` tokens as `md` marks, styled as omp's composer chips. */
 function imageMarks(value: string): TspSpan[] {
 	if (!value.includes("[Image #")) return [];
 	const seen = new Set<string>();
@@ -234,11 +189,6 @@ function imageMarks(value: string): TspSpan[] {
 	return [...seen].map((t) => ({ t, s: "accent strong" }));
 }
 
-/**
- * omp's `UserMessageComponent.describe`: a head-less user-toned card (Tern
- * draws the right-hand bubble) with the prompt as markdown, and the hover
- * toolbar's Copy (omp's `copy-message`, run here through pi's clipboard).
- */
 const userMessage: Describer = {
 	name: "TranscriptUserMessage",
 	matches: (c) => kindOf(c) === "user",
@@ -267,16 +217,14 @@ const userMessage: Describer = {
 	},
 };
 
-// ── Assistant message ───────────────────────────────────────────────────
-
-/** A visible text part, or a run of consecutive thinking parts (pi joins them into one block). */
 interface Part {
 	readonly kind: "text" | "thinking";
-	/** First and last content index. */
 	readonly start: number;
 	readonly end: number;
 	readonly text: string;
-	/** pi's thinking run index (its `thinkingVisibilityOverrides` key); -1 for text. */
+	/**
+	 * Thinking run indexes must match pi's visibility overrides.
+	 */
 	readonly run: number;
 }
 
@@ -322,7 +270,6 @@ interface ThoughtClock {
 	end?: number;
 }
 
-/** When each thought was first seen streaming and first seen finished, per message and run start; kept across reloads (the components are pi's). */
 const CLOCKS = Symbol.for("pi-extended.tsp-native.thought-clocks");
 const clocks: WeakMap<Component, Map<number, ThoughtClock>> = (() => {
 	const holder = globalThis as unknown as { [CLOCKS]?: WeakMap<Component, Map<number, ThoughtClock>> };
@@ -334,7 +281,6 @@ const clocks: WeakMap<Component, Map<number, ThoughtClock>> = (() => {
 	return current;
 })();
 
-/** The start index of the thinking run that is the streaming message's last part, else -1. */
 function liveThinkingStart(content: readonly Any[]): number {
 	let i = content.length - 1;
 	if (i < 0 || content[i]?.type !== "thinking") return -1;
@@ -343,7 +289,6 @@ function liveThinkingStart(content: readonly Any[]): number {
 	return visible ? i + 1 : -1;
 }
 
-/** Start the live thought's clock, stop every other; the returned signature changes when any clock does. */
 function tickClocks(c: Component, content: readonly Any[], streaming: boolean): string {
 	let map = clocks.get(c);
 	const live = streaming ? liveThinkingStart(content) : -1;
@@ -364,11 +309,6 @@ function tickClocks(c: Component, content: readonly Any[], streaming: boolean): 
 	return sig;
 }
 
-/**
- * A finished thought's time: its clock when it was seen streaming; else (a
- * resumed session) a message whose only prose is this thought spent its
- * response on it.
- */
 function thoughtTook(clock: ThoughtClock | undefined, message: Any, parts: readonly Part[]): number | undefined {
 	if (clock?.end !== undefined) return Math.max(0, Math.round(clock.end - clock.start));
 	if (clock) return undefined;
@@ -377,15 +317,13 @@ function thoughtTook(clock: ThoughtClock | undefined, message: Any, parts: reado
 	return Math.round(duration);
 }
 
-/** omp's "Thought for 12s" (whole seconds under a minute, then `2m5s`, `1h3m`). */
 function thoughtLabel(took: number | undefined): string {
 	if (took === undefined) return "Thought";
 	return `Thought for ${took < 60_000 ? `${Math.max(1, Math.round(took / 1000))}s` : formatDuration(took)}`;
 }
 
 /**
- * A streaming table's last row waits for its line end (omp
- * `holdPartialTableRow`): the terminal sizes the columns by every row it gets.
+ * The terminal sizes table columns from incomplete rows too.
  */
 function holdPartialTableRow(value: string): string {
 	const lastBreak = value.lastIndexOf("\n");
@@ -410,7 +348,6 @@ interface SectionEntry {
 	readonly node: NativeNode;
 }
 
-/** The nodes one build made, reused by the next while their inputs are equal (unchanged parts skip the diff). */
 interface PartCache {
 	readonly md: Map<string, MdEntry>;
 	readonly heads: Map<number, { readonly label: string | null; readonly node: NativeNode }>;
@@ -431,7 +368,9 @@ function mdPart(prev: PartCache, next: PartCache, slot: string, key: string, sou
 	return entry.node;
 }
 
-/** Live: starburst · "Thinking…" · a ticking timer (omp). One node while live, so the terminal's clock keeps running. */
+/**
+ * Keep the live node stable to avoid resetting the terminal's timer.
+ */
 function liveHead(prev: PartCache, next: PartCache, start: number, clock: ThoughtClock | undefined, cx: DescribeContext): NativeNode {
 	const cached = prev.heads.get(start);
 	if (cached && cached.label === null) {
@@ -457,7 +396,6 @@ function doneHead(prev: PartCache, next: PartCache, start: number, took: number 
 
 const MAX_ERROR_ROWS = 8;
 
-/** omp `#describeError`: the truncation note, the abort label, or the failed request's error frame. */
 function describeError(message: Any, hasToolCalls: boolean): NativeNode | undefined {
 	if (message.stopReason === "length") return text([span("Response was truncated before completion.", "error")], { wrap: "word", role: "omp.assistant.abort" }, "error");
 	if (hasToolCalls) return undefined;
@@ -470,7 +408,6 @@ function describeError(message: Any, hasToolCalls: boolean): NativeNode | undefi
 		.split("\n")
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0);
-	// "500 upstream overloaded" → chip "500", then the message once: a line the next one repeats with more detail is dropped.
 	const status = /^(\d{3})\s+/.exec(lines[0] ?? "");
 	if (status) lines[0] = lines[0]!.slice(status[0].length);
 	const detail = lines.filter((line, index) => !lines.slice(index + 1).some((later) => later.startsWith(line)));
@@ -503,7 +440,6 @@ function answerText(message: Any | undefined): string {
 		.join("\n\n");
 }
 
-/** omp's turn footer: `⧉ · 12.4s · 19K tok · $0.02 this turn`, Copy only under an answer. */
 function usageRow(prev: PartCache, next: PartCache, summary: TurnUsage, answered: boolean): NativeNode {
 	if (prev.usage && prev.usage.summary === summary && prev.usage.answered === answered) {
 		next.usage = prev.usage;
@@ -529,14 +465,6 @@ function overridesSignature(a: Any): string {
 	return sig;
 }
 
-/**
- * omp's `AssistantMessageComponent.describe`: md parts keyed `t<index>` (the
- * streaming tail carries `stream`), each thinking run a quiet collapsible
- * section keyed `k<index>` (live: `omp.thinking.live` with a starburst and a
- * timer; done: "Thought for 12s" and `took`), folded per pi's
- * hideThinkingBlock and its per-run overrides, then the turn-ending error and
- * the turn's usage footer. A message without visible parts draws nothing.
- */
 const assistantMessage: Describer = {
 	name: "TranscriptAssistantMessage",
 	matches: (c) => kindOf(c) === "assistant",
@@ -597,11 +525,11 @@ const assistantMessage: Describer = {
 							node: node(
 								"section",
 								{
-									// `.live` while streaming: the body clamps to its tail under a fade.
+									// The terminal uses the live role to clip the body to its tail.
 									role: live ? "omp.thinking.live" : "omp.thinking",
 									collapsible: true,
 									collapsed,
-									// Tern's fold head sums it into "Worked for 12s".
+									// The terminal sums these milliseconds in the fold heading.
 									took,
 								},
 								[head, body],
@@ -626,7 +554,6 @@ const assistantMessage: Describer = {
 			else if (event.act === "copy-error") copy(errorText(a.lastMessage));
 			return;
 		}
-		// A thought folded or opened in the terminal: pi's own per-run override, so a rebuild (and the ANSI view) agree.
 		if (event.type !== "toggle" || !/^k\d+$/.test(event.key)) return;
 		const start = Number(event.key.slice(1));
 		const part = messageParts(contentOf(a.lastMessage)).find((p) => p.kind === "thinking" && p.start === start);
@@ -636,9 +563,6 @@ const assistantMessage: Describer = {
 	},
 };
 
-// ── Spacers and status lines ────────────────────────────────────────────
-
-/** A transcript Spacer: main's block gap already spaces the blocks (omp's rhythm); hidden, it is quiet. */
 const transcriptSpacer: Describer = {
 	name: "TranscriptSpacer",
 	matches: (c) => kindOf(c) === "spacer" && blocks.has(c),
@@ -646,21 +570,23 @@ const transcriptSpacer: Describer = {
 	build: () => EMPTY_NODE,
 };
 
-/** The colours pi paints its status lines in (showStatus dim, showWarning and the cache/billing notices warning). */
+/**
+ * pi distinguishes status lines by colour.
+ */
 const QUIET_TOKENS: ReadonlySet<string> = new Set(["dim", "muted", "warning"]);
-/** A quiet role (tsp-fold.js `blockKind`) that no rsttyd rule styles on a text or col. */
+/**
+ * The terminal folds this role with surrounding blocks.
+ */
 const NOTICE_ROLE = "omp.notice.status";
 
 function plain(s: string): string {
 	return stripAnsi(s).replaceAll("\x1b_pi:c\x07", "");
 }
 
-/** Every visible span in a quiet colour. */
 function quietLine(spans: readonly TspSpan[]): boolean {
 	return spans.every((sp) => sp.t.trim() === "" || (sp.s !== undefined && QUIET_TOKENS.has(sp.s.split(" ")[0]!)));
 }
 
-/** Every visible span in the warning colour (showWarning, `notify(…, "warning")`, the cache/billing notices). */
 function warningLines(lines: readonly (readonly TspSpan[])[]): boolean {
 	let seen = false;
 	for (const spans of lines) {
@@ -673,14 +599,8 @@ function warningLines(lines: readonly (readonly TspSpan[])[]): boolean {
 	return seen;
 }
 
-/** The word pi leads a warning with: the row's icon carries it (its `aria`). */
 const WARNING_LABEL = /^\s*Warning:\s*/;
 
-/**
- * omp's notice row (`noticeRow`, transcript-notice.ts) for warning lines: the
- * tone colours the icon, so the message keeps its emphasis only (the warning
- * token leaves every span) and loses pi's "Warning:" label.
- */
 function warningRow(lines: readonly (readonly TspSpan[])[], key: string): NativeNode {
 	let message: TspSpan[] = [];
 	lines.forEach((spans, i) => {
@@ -690,14 +610,12 @@ function warningRow(lines: readonly (readonly TspSpan[])[], key: string): Native
 			message.push(rest.length > 0 ? { ...sp, s: rest.join(" ") } : { t: sp.t });
 		}
 	});
-	// The blank edges go (pi's padding, a trailing empty line): the icon sits on the message's first line.
 	const visible = (sp: TspSpan) => sp.t.trim() !== "";
 	const first = message.findIndex(visible);
 	let end = message.length;
 	while (end > first + 1 && !visible(message[end - 1]!)) end--;
 	message = message.slice(first, end);
 	const unlabelled = message[0]!.t.replace(WARNING_LABEL, "");
-	// A bare "Warning:" keeps its word: the row would otherwise be an icon alone.
 	if (unlabelled !== "") message[0] = { ...message[0]!, t: unlabelled };
 	else if (message.slice(1).some(visible)) message = message.slice(message.findIndex((sp, i) => i > 0 && visible(sp)));
 	return row(
@@ -716,21 +634,12 @@ function lineNode(spans: readonly TspSpan[], role: string, key: string): NativeN
 	return text(spans, { role, wrap: "word" }, key);
 }
 
-/**
- * A Text block in the transcript, drawn as the plain Text describer draws it
- * (theme colours as span tokens) without its vertical padding (the block gap
- * spaces it); a line wholly in a status colour carries a quiet notice role,
- * so pi's status, warning and cache notices fold with the run around them:
- * dim ones as `omp.notice.status` text, warning ones as omp's notice row
- * (rows where the terminal has no `icon`: then they stay the quiet text).
- * Errors and anything else stay breaks.
- */
 const transcriptText: Describer = {
 	name: "TranscriptText",
 	matches: (c) => kindOf(c) === "text" && blocks.has(c),
 	fingerprint: (c, cx) => {
 		const a = c as Any;
-		// ThemedText rebuilds its string lazily in render(): ask for it once so `text` is current.
+		// pi rebuilds themed text lazily during render.
 		if (a.stale === true && typeof a.build === "function") {
 			a.stale = false;
 			a.setText?.(a.build());
@@ -752,5 +661,7 @@ const transcriptText: Describer = {
 	},
 };
 
-/** Registered first (describers.ts): they win over the generic user/assistant/Text/Spacer describers. */
+/**
+ * Match these before the generic component describers.
+ */
 export const TRANSCRIPT_DESCRIBERS: readonly Describer[] = [userMessage, assistantMessage, transcriptText, transcriptSpacer];

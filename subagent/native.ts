@@ -1,18 +1,3 @@
-/**
- * Native (TSP) descriptions of the subagent UI, for tsp-native (../tsp-native) — oh-my-pi style
- * (tui/src/tools/task.ts, chat/tool-execution.ts):
- *   - `task` / parent `irc` tools: describe hooks returning data-first tool views (head data plus a
- *     body of `agent`, `md` and `text` nodes) instead of pre-rendered rows;
- *   - one `agent` node per subagent (status, name, agent type, task, model, stats, live tool; its
- *     `hovercard` is the full assignment; its children are the expanded content: assignment, error,
- *     output / data, merge note, nested agents);
- *   - `describe(cx)` bodies for the bottom widget and delivered `task-result` / `irc` messages.
- * The contract types are declared here (no imports from tsp-native). Everything returns undefined /
- * null unless the terminal draws `agent` nodes, which keeps tsp-native's own rendering.
- * Memo contract: the same view / node object while nothing shown changed (hub change version,
- * result/args identity, expand state), a new one otherwise.
- */
-
 import type { Component } from "@earendil-works/pi-tui";
 import { DEFAULT_AGENT } from "./agents.ts";
 import type { AgentHub, Child, ParentEvent } from "./hub.ts";
@@ -32,9 +17,6 @@ import {
 	widgetAgents,
 } from "./render.ts";
 import { formatStructuredData } from "./structured.ts";
-
-// ---------------------------------------------------------------------------------------------
-// Contract (mirrors tsp-native's NativeToolView / NativeNode; plain JSON)
 
 export interface TspSpan {
 	t: string;
@@ -57,9 +39,7 @@ export interface NativeDescribeOptions {
 	executionStarted: boolean;
 	argsComplete: boolean;
 	cols: number;
-	/** Date.now() at describe time. */
 	nowMs: number;
-	/** The terminal advertises this TSP node kind. */
 	supports(kind: string): boolean;
 }
 
@@ -71,16 +51,16 @@ export interface NativeToolView {
 		meta?: readonly TspText[];
 		badges?: readonly { text: string; tone?: TspTone; title?: string }[];
 		note?: TspText;
-		/** number = use it (age: live timer, took: stopped); null = no timer; undefined = tsp-native's default. */
+		/**
+		 * Both timers use milliseconds and accept null to suppress the default.
+		 */
 		age?: number | null;
 		took?: number | null;
 	};
 	body?: readonly NativeNode[];
 	tone?: TspTone;
 	preview?: { lines: number } | { tail: number } | "none" | "children";
-	/** Never start collapsed. */
 	open?: boolean;
-	/** frame:"inline" (head line + disclosed body, no ring). */
 	inline?: boolean;
 }
 
@@ -93,40 +73,31 @@ export interface NativeToolResult {
 export interface NativeToolHooks {
 	describeCall?(args: unknown, options: NativeDescribeOptions): NativeToolView | undefined;
 	describeResult?(result: NativeToolResult, options: NativeDescribeOptions, args: unknown): NativeToolView | undefined;
-	/** true: once a result exists only describeResult's view is used (describeCall's when it returns undefined). */
+	/**
+	 * When true a defined result view replaces the call view.
+	 */
 	mergeCallAndResult?: boolean;
 }
 
-/** What a component's own `describe(cx)` receives (the part of tsp-native's DescribeContext used here). */
 export interface NativeComponentContext {
 	readonly cols: number;
 	supports(kind: string): boolean;
 }
 
-/** Persisted `details` of parent `irc` results (JSON; no live objects). Absent in older sessions. */
 export type IrcDetails =
 	| { op: "list"; agents: RowSnapshot[] }
 	| { op: "read"; agent: RowSnapshot }
 	| {
 			op: "wait";
-			/** The delivered event (copy). */
 			event?: ParentEvent;
 			timedOut?: boolean;
-			/** Agents still running when it timed out. */
 			running?: string[];
 			runningLabels?: string[];
-			/** The user's prompt ended the wait ("steer" | "followUp"). */
 			interrupted?: string;
-			/** Not waiting: a user prompt was already queued. */
 			pending?: string;
-			/** Not waiting: no running subagents. */
 			idle?: boolean;
-			/** Not waiting: results/messages already queued for the main session (labels, e.g. "result of B", "message from C"). */
 			queued?: string[];
 	  };
-
-// ---------------------------------------------------------------------------------------------
-// Builders
 
 type Props = Record<string, unknown>;
 type AgentStatus = "pending" | "running" | "done" | "failed" | "aborted" | "idle" | "parked";
@@ -173,16 +144,12 @@ function errorText(message: string, key?: string): NativeNode {
 	return text([span(message.trim(), "error")], { wrap: "word", role: "omp.tool.error" }, key);
 }
 
-/** The shared batch context as one quiet line above the agents (raw call arguments: a double-encoded value is decoded). */
 function contextNode(raw: unknown): NativeNode | undefined {
 	const line = typeof raw === "string" ? flat(repairDoubleEncodedJsonString(raw)) : "";
 	return line ? text([span(line, "muted")], { wrap: "word", lines: 2, role: "omp.tool.context" }, "context") : undefined;
 }
 
 const HIDDEN: NativeNode = { k: "col", p: { hidden: true } };
-
-// ---------------------------------------------------------------------------------------------
-// Small helpers
 
 function isRecord(v: unknown): v is Record<string, any> {
 	return !!v && typeof v === "object" && !Array.isArray(v);
@@ -212,7 +179,6 @@ function plural(n: number, word: string): string {
 	return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-/** `950`, `1.2K`, `19K`, `1.5M` (omp formatNumber). */
 function fmtCount(n: number): string {
 	if (n < 1000) return `${Math.round(n)}`;
 	if (n < 10_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}K`;
@@ -228,12 +194,12 @@ function resultText(result: NativeToolResult): string {
 	return parts.join("\n");
 }
 
-/** JSON copy (persisted details must not share live objects); undefined when not serialisable. */
 export function jsonCopy<T>(value: T): T | undefined {
 	try {
 		const s = JSON.stringify(value);
 		return s === undefined ? undefined : (JSON.parse(s) as T);
 	} catch {
+		// The result text remains usable without serialized details.
 		return undefined;
 	}
 }
@@ -244,7 +210,6 @@ function sameDeps(a: readonly unknown[], b: readonly unknown[]): boolean {
 	return true;
 }
 
-/** One memo slot per owner object (a result's details / content, a call's args), keyed by deps. */
 class OwnerMemo<T> {
 	private readonly slots = new WeakMap<object, { deps: readonly unknown[]; value: T }>();
 	private loose?: { deps: readonly unknown[]; value: T };
@@ -261,10 +226,6 @@ class OwnerMemo<T> {
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// Agent nodes
-
-/** Theme token for a thinking level's model-chip dot. */
 function thinkingToken(level: string | undefined): string | undefined {
 	switch (level) {
 		case "minimal":
@@ -296,11 +257,10 @@ function agentStatus(status: RowStatus): AgentStatus {
 		case "aborted":
 			return "aborted";
 		default:
-			return "idle"; // detached: outcome unknown (session ended)
+			return "idle";
 	}
 }
 
-/** Context-window stats: the fill fraction and its `19K / 200K` label (or the token count). */
 function contextStats(tokens: number, window: number | undefined): { context?: number; contextLabel?: string; tokens?: number } {
 	if (!(tokens > 0)) return {};
 	if (!window || !(window > 0)) return { tokens };
@@ -337,28 +297,20 @@ interface AgentOptions {
 	nowMs: number;
 	expanded: boolean;
 	depth?: number;
-	/** Point-in-time data (irc list / read): no ticking timers. */
 	frozen?: boolean;
-	/** Full assignment, the first expanded child (default: the row's task). null = none. */
 	assignment?: string | null;
-	/** Children after the assignment (e.g. the read report's activity and output). */
 	extra?: readonly (NativeNode | undefined)[];
-	/** Settled output / structured data as a child (default true). */
 	output?: boolean;
-	/** Never collapsed. */
 	open?: boolean;
-	/** No children at all (one-line rows). */
 	bare?: boolean;
 	role?: string;
 }
 
-/** An agent row's hover card: the whole assignment the row only summarizes (a plain `md` node, no key). */
 function assignmentCard(full: unknown): NativeNode | undefined {
 	const source = typeof full === "string" ? full.trim() : "";
 	return source ? { k: "md", p: { text: source, role: "omp.task.assignment" } } : undefined;
 }
 
-/** One subagent as an `agent` node (omp TspAgentProps); children are its expanded content, `hovercard` its full assignment. */
 export function agentNode(row: RowSnapshot, o: AgentOptions): NativeNode {
 	const status = agentStatus(row.status);
 	const active = row.status === "running" || row.status === "pending";
@@ -441,7 +393,6 @@ export function agentNode(row: RowSnapshot, o: AgentOptions): NativeNode {
 
 type DoneLike = Partial<DoneInfo> & { childId?: string; stats?: string };
 
-/** Row of a delivered result (current DoneInfo, or the legacy `subagent-result` shape). */
 export function rowFromDone(d: DoneLike): RowSnapshot {
 	const status: RowStatus = d.status === "completed" ? "idle" : d.status === "failed" ? "failed" : d.status === "aborted" ? "aborted" : "detached";
 	const subagents = Array.isArray(d.subagents) ? d.subagents.filter((s) => isRecord(s)) : [];
@@ -469,7 +420,6 @@ export function rowFromDone(d: DoneLike): RowSnapshot {
 	};
 }
 
-/** JSON-safe row of a live agent for persisted details (one-line tasks below the top row). */
 export function persistRow(c: Child, now: number, fullTask = false): RowSnapshot {
 	const strip = (r: RowSnapshot, top: boolean): RowSnapshot => {
 		const out: RowSnapshot = { ...r, task: top && fullTask ? r.task : firstLine(r.task, 200) };
@@ -481,9 +431,6 @@ export function persistRow(c: Child, now: number, fullTask = false): RowSnapshot
 	};
 	return strip(snapshotChild(c, 0, now, false), true);
 }
-
-// ---------------------------------------------------------------------------------------------
-// Older sessions: the `<task-result>` / `<irc>` envelopes of a wait's text
 
 const ENVELOPE_TAGS = /&lt;(\/?)(task-result|output|preview|error|irc|data|merge-summary)\b/g;
 
@@ -503,7 +450,6 @@ function tagBody(source: string, tag: string): string | undefined {
 	return m ? unescapeEnvelope(m[1] ?? "") : undefined;
 }
 
-/** A task result parsed from its `<task-result>` envelope (text of older sessions). */
 function parseTaskResult(source: string): RowSnapshot | undefined {
 	const head = /<task-result id="([^"]*)" agent="([^"]*)" status="([^"]*)" duration="([^"]*)">/.exec(source);
 	if (!head) return undefined;
@@ -517,7 +463,6 @@ function parseTaskResult(source: string): RowSnapshot | undefined {
 		output: data ?? tagBody(source, "output") ?? tagBody(source, "preview") ?? "",
 	});
 	if (data !== undefined) {
-		// Already pretty-printed JSON: show it as such.
 		row.output = undefined;
 		try {
 			row.data = JSON.parse(data);
@@ -531,16 +476,11 @@ function parseTaskResult(source: string): RowSnapshot | undefined {
 	return row;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Hooks
-
 export const WIDGET_TOGGLE_ACTION = "toggle";
 
 export interface NativeDeps {
 	hub: AgentHub;
-	/** Bumped on every hub change. */
 	version(): number;
-	/** Rows of the bottom widget (as in its ANSI rendering). */
 	widgetRows: number;
 }
 
@@ -548,11 +488,9 @@ export interface NativeSubagentUI {
 	task: NativeToolHooks;
 	irc: NativeToolHooks;
 	describeWidget(cx: NativeComponentContext, collapsed: boolean): NativeNode | null;
-	/** A delivered `task-result` / `irc` message. */
 	describeEvent(message: { customType?: string; content?: unknown; details?: unknown }, expanded: boolean, cx: NativeComponentContext): NativeNode | null;
 }
 
-/** Add a native `describe(cx)` to a component (built once per component; null unless agents are drawn). */
 export function withNativeDescribe<T extends object>(
 	component: T,
 	describe: (cx: NativeComponentContext) => NativeNode | null,
@@ -572,13 +510,11 @@ type IrcArgs = { op?: string; to?: string; message?: string; from?: string; id?:
 export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 	const { hub } = deps;
 
-	// ---------- task ----------
 	const taskItems = (a: Record<string, any>): Record<string, any>[] =>
 		Array.isArray(a.tasks) ? a.tasks.filter(isRecord) : typeof a.task === "string" || typeof a.name === "string" ? [a] : [];
 
 	const itemName = (item: Record<string, any>, i: number) => (typeof item.name === "string" && item.name.trim() ? item.name.trim() : `#${i + 1}`);
 
-	/** `N agents`, or the single item's name. */
 	const callTarget = (a: Record<string, any>): string | undefined => {
 		const items = taskItems(a);
 		if (items.length === 1) return itemName(items[0]!, 0);
@@ -594,7 +530,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 			if (item.isolated === true || item.isolated === "true") badges.push({ text: "isolated" });
 			if (schema !== undefined && schema !== null && schema !== false && schema !== "") badges.push({ text: "schema" });
 			const agent = typeof item.agent === "string" ? item.agent.trim() : "";
-			// Raw (possibly still streaming) arguments: a double-encoded assignment is shown decoded.
 			const brief = typeof item.task === "string" ? repairDoubleEncodedJsonString(item.task) : undefined;
 			return node(
 				"agent",
@@ -619,7 +554,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		};
 	};
 
-	/** Full assignments from the call's raw args, repaired (persisted rows only carry the first line). */
 	const argAssignments = (a: Record<string, any>, items: SpawnedItem[]): (string | undefined)[] => {
 		const tasks = taskItems(a);
 		const byName = new Map<string, string>();
@@ -708,7 +642,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 				...timer,
 			},
 			tone: failed + aborted + errors.length > 0 || result.isError ? "error" : undefined,
-			// Collapsed, the card still shows every agent row (each folds its own content); larger batches clamp.
 			preview: { lines: Math.min(60, Math.max(10, (context ? 2 : 0) + 3 * rows.length + errors.length + 1)) },
 			body: compact([
 				context,
@@ -729,7 +662,7 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 			const a = asRecord(args);
 			const items = taskItems(a);
 			const last = items[items.length - 1];
-			// Streaming args are re-parsed into new objects; the stamp also covers in-place growth.
+			// Streaming arguments can grow in place.
 			const stamp = [items.length, str(last?.task).length, str(last?.name), str(a.context).length];
 			return taskCallMemo.get(args, [args, options.argsComplete, ...stamp], () => describeTaskCall(args));
 		},
@@ -746,7 +679,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		},
 	};
 
-	// ---------- irc ----------
 	const ircTitle = (op: string) => (op === "wait" ? "Wait" : "IRC");
 
 	const ircTarget = (a: IrcArgs): TspText | undefined => {
@@ -781,7 +713,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		return { tool: ircHead(a), inline: true };
 	};
 
-	/** A delivered event's body: a task result as an agent, a message as `from → to` + markdown. */
 	const eventBody = (ev: ParentEvent, expanded: boolean, nowMs: number): NativeNode[] => {
 		if (ev.kind === "done") {
 			return [agentNode(rowFromDone(asRecord(ev.done) as DoneLike), { nowMs, expanded, open: true, role: "omp.task.result" })];
@@ -796,7 +727,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		return compact([head, body ? md(body, { role: "omp.irc.message" }, "body") : undefined]);
 	};
 
-	/** Body of a wait result from its text alone (sessions before `details` carried the event). */
 	const waitTextBody = (source: string, expanded: boolean, nowMs: number): { body: NativeNode[]; note?: string } => {
 		const row = parseTaskResult(source);
 		if (row) {
@@ -826,7 +756,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		const source = resultText(result);
 		const nowMs = options.nowMs;
 		if (d.op !== "wait") {
-			// Older session: the text is all there is.
 			const { body, note } = waitTextBody(source, options.expanded, nowMs);
 			return body.length > 0 && body[0]!.k === "agent"
 				? { tool: ircHead(a), body, preview: { lines: 12 } }
@@ -846,7 +775,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		}
 		if (typeof d.pending === "string") return { tool: ircHead(a, { note: "not waiting" }), body: [userNote("Not waiting")], inline: true };
 		if (Array.isArray(d.queued)) {
-			// Returned at once: what it would wait for is already queued for delivery.
 			const queued = d.queued.filter((x: unknown): x is string => typeof x === "string" && !!x.trim());
 			const line = queued.length ? `Already arrived: ${queued.join(", ")}; delivered right after this call.` : source.trim();
 			return { tool: ircHead(a, { note: "already arrived" }), body: line ? [noteText(line, "muted")] : undefined, inline: true };
@@ -865,7 +793,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		return { tool: ircHead(a), body: source.trim() ? [noteText(source.trim(), "muted")] : [], inline: true };
 	};
 
-	/** Agent rows as a flat tree (depth per level). */
 	const listNodes = (rows: RowSnapshot[], nowMs: number, expanded: boolean): NativeNode[] => {
 		const out: NativeNode[] = [];
 		const walk = (r: RowSnapshot, depth: number) => {
@@ -899,7 +826,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		};
 	};
 
-	/** `readReport` sections: recent activity and latest output. */
 	const readSections = (source: string): { activity?: string; output?: string } => {
 		const act = source.indexOf("\n\nRecent activity:\n");
 		if (act < 0) return {};
@@ -920,7 +846,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		const out = output?.trim();
 		const outputNode = out && out !== "(none yet)" ? md(out, { role: "omp.task.output" }, "output") : undefined;
 		if (d.op !== "read" || !isRecord(d.agent)) {
-			// Older session: the report's head line, then its sections.
 			const head = source.split("\n")[0] ?? "";
 			const body = compact([head ? noteText(head, "muted", "head") : undefined, activityNode, outputNode]);
 			return { tool: ircHead(a), body: body.length > 0 ? body : [noteText(source.trim(), "muted")], preview: { lines: 12 } };
@@ -942,7 +867,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		}
 		switch (op) {
 			case "send": {
-				// "delivered; it will read it at its next step" → "delivered"; "Broadcast to 3 agent(s):\n- …" → receipts below.
 				const lines = source.split("\n");
 				const receipt = (lines[0] ?? "").split(";")[0]!.replace(/:$/, "").trim();
 				const receipts = lines.slice(1).filter((l) => l.trim());
@@ -993,7 +917,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		},
 	};
 
-	// ---------- bottom widget ----------
 	let widgetMemo: { version: number; collapsed: boolean; node: NativeNode } | undefined;
 	const describeWidget = (cx: NativeComponentContext, collapsed: boolean): NativeNode | null => {
 		if (!cx.supports("agent")) return null;
@@ -1017,7 +940,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		return out;
 	};
 
-	// ---------- delivered messages ----------
 	const describeEvent = (
 		message: { customType?: string; content?: unknown; details?: unknown },
 		expanded: boolean,
@@ -1048,23 +970,22 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 	return { task, irc, describeWidget, describeEvent };
 }
 
-// ---------------------------------------------------------------------------------------------
-// Agent hub (inspector.ts): oh-my-pi overlays/agent-hub.ts #describePicker / #describePreview and
-// agent-transcript-viewer.ts #describe, as plain data for the inspector's own describe(cx).
-
-/** A node whose children may also be components (describe boundaries), as tsp-native's NativeNode. */
 export interface NativeUiNode {
 	k: string;
 	p?: Props;
 	c?: readonly NativeUiChild[];
 	key?: string;
-	/** Scroll the node into view when it is added. */
+	/**
+	 * Reveal is sent only when the node is added.
+	 */
 	reveal?: "start" | "end" | "nearest";
 }
 
 export type NativeUiChild = NativeUiNode | Component;
 
-/** tsp-native's NativeUiEvent: a pointer or host-edit event on a described node; `key` is its keypath in the component. */
+/**
+ * Event keys are paths relative to the component root.
+ */
 export type NativeUiEvent =
 	| { readonly type: "toggle"; readonly key: string; readonly collapsed: boolean }
 	| { readonly type: "select" | "activate"; readonly key: string; readonly item: string }
@@ -1082,7 +1003,6 @@ export function uiNode(k: string, p?: Props, c?: readonly NativeUiChild[], key?:
 	return out;
 }
 
-/** `ctrl+x` → `["ctrl", "x"]`, `escape` → `["esc"]` (omp pickerKeys). */
 export function keyCaps(key: string): string[] {
 	return key
 		.split("+")
@@ -1090,7 +1010,6 @@ export function keyCaps(key: string): string[] {
 		.map((part) => (part === "escape" ? "esc" : part));
 }
 
-/** A native button (omp actionButton, role `omp.btn`): label plus keycap; a click sends `act` as an `action`. */
 export function hubButton(label: string, act: string, opts: { key?: string; keys?: string; tone?: "accent" | "error"; title?: string } = {}): NativeUiNode {
 	const children: NativeUiNode[] = [text(label)];
 	if (opts.keys) children.push(node("kbd", { keys: keyCaps(opts.keys) }));
@@ -1109,12 +1028,10 @@ export function hubButton(label: string, act: string, opts: { key?: string; keys
 	);
 }
 
-/** A bare `esc` keycap button for a view's top-right corner (omp escCloseButton). */
 export function hubEscButton(act: string, title: string): NativeUiNode {
 	return uiNode("row", { role: "omp.btn", align: "center", actions: { click: act }, title: `${title}  esc` }, [node("kbd", { keys: ["esc"] })], "esc");
 }
 
-/** Picker dot per status (omp STATUS_DOT): a running agent pulses. */
 export function hubStatusDot(status: string): TspTone {
 	switch (status) {
 		case "running":
@@ -1129,7 +1046,6 @@ export function hubStatusDot(status: string): TspTone {
 	}
 }
 
-/** Badge / text tone per status (omp STATUS_TONE). */
 export function hubStatusTone(status: string): TspTone {
 	switch (status) {
 		case "running":
@@ -1144,7 +1060,6 @@ export function hubStatusTone(status: string): TspTone {
 	}
 }
 
-/** The agent's state in a word: `running`, `waiting`, `queued`, `starting`, `idle`, `failed`, `killed`. */
 export function hubStatusLabel(c: Child): string {
 	if (c.status === "pending") return c.queued ? "queued" : "starting";
 	if (c.status === "running") return c.blocked ? "waiting" : c.queued ? "queued" : "running";
@@ -1152,7 +1067,6 @@ export function hubStatusLabel(c: Child): string {
 	return c.status;
 }
 
-/** Duration of the current (running) or latest run (render.ts snapshotChild). */
 export function hubRunDuration(c: Child, now: number): number | undefined {
 	if (c.status === "running" && c.runStartedAt) return Math.max(0, now - c.runStartedAt);
 	if (c.status === "pending") return undefined;
@@ -1176,12 +1090,10 @@ function ownerName(c: Child): string {
 	return c.ownerId === PARENT_ID ? "main" : c.ownerId;
 }
 
-/** One-line task summary. */
 function taskSummary(task: string): string {
 	return firstLine(task, 300);
 }
 
-/** Fuzzy `hits` of `query` in `label` (omp pickerFuzzyHits): each token's substring, else its characters in order. */
 function fuzzyHits(label: string, query: string): [number, number][] | undefined {
 	const lower = label.toLowerCase();
 	const ranges: [number, number][] = [];
@@ -1209,7 +1121,9 @@ function fuzzyHits(label: string, query: string): [number, number][] | undefined
 	return merged.length > 0 ? merged : undefined;
 }
 
-/** Roster fact columns (omp AGENT_COLUMNS); lower priorities hide first on narrow sheets. */
+/**
+ * Narrow pickers hide lower priority columns first.
+ */
 export const HUB_COLUMNS: readonly Props[] = [
 	{ id: "cost", head: "Cost", format: "price", priority: 6 },
 	{ id: "time", head: "Time", format: "elapsed", priority: 5 },
@@ -1221,15 +1135,11 @@ export const HUB_COLUMNS: readonly Props[] = [
 
 export interface HubItemOptions {
 	now: number;
-	/** Tree layout: nesting depth (0 = spawned by the main agent). Undefined = flat rows. */
 	depth?: number;
-	/** Name the spawning agent (flat and filtered views). */
 	showOwner?: boolean;
-	/** Filter text to mark in the label. */
 	query?: string;
 }
 
-/** One roster row as a picker item (omp #pickerAgentItem): status dot, id, task, model chip, badges, usage facts. */
 export function hubPickerItem(c: Child, o: HubItemOptions): Props {
 	const badges: { text: string; tone?: TspTone; title?: string }[] = [];
 	const agent = c.agent.name?.trim();
@@ -1275,7 +1185,6 @@ export function hubPickerItem(c: Child, o: HubItemOptions): Props {
 	return item;
 }
 
-/** Roster totals for the picker head: status counts, then spend (`2 running · 1 idle · $0.12 · 14 req · 33 tools`). */
 export function hubSubtitle(all: readonly Child[]): TspText {
 	if (all.length === 0) return [span("No agents yet", "muted")];
 	const out: TspSpan[] = [];
@@ -1339,7 +1248,6 @@ function contentText(content: unknown): string {
 		.join(" ");
 }
 
-/** The agent's latest steps from its session (omp's activity rows): prompts, tool calls with their outcome, replies. */
 function sessionActivity(c: Child, limit: number): HubActivityRow[] | undefined {
 	const msgs = (c.session as { messages?: unknown } | undefined)?.messages;
 	if (!Array.isArray(msgs)) return undefined;
@@ -1390,7 +1298,6 @@ function sessionActivity(c: Child, limit: number): HubActivityRow[] | undefined 
 	return out.reverse();
 }
 
-/** The hub's own activity log (no session yet): `→ tool args`, `✗ tool failed`, reply text. */
 function logActivity(c: Child, limit: number): HubActivityRow[] {
 	return c.activity.slice(-limit).map((line) => {
 		if (line.startsWith("→ ")) {
@@ -1410,17 +1317,14 @@ function clock(at: number | undefined): string {
 	return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
 }
 
-/** Rows shown in the preview's "Recent activity". */
 export const HUB_RECENT_ACTIVITY = 20;
 
-/** The tool the agent runs right now (the latest of parallel calls). */
 export function hubRunningTool(c: Child): { name: string; args: string; startedAt: number } | undefined {
 	let latest: { name: string; args: string; startedAt: number } | undefined;
 	for (const t of c.runningTools.values()) if (!latest || t.startedAt >= latest.startedAt) latest = t;
 	return latest;
 }
 
-/** The agent's current step in words (render.ts activityText, plain); `timer`: a long tool call's run time. */
 export function hubCurrent(c: Child, now: number, timer = true): TspText | undefined {
 	if (c.status === "failed" && c.error) return [span(flat(c.error), "error")];
 	if (c.status !== "running") return undefined;
@@ -1443,7 +1347,6 @@ export function hubCurrent(c: Child, now: number, timer = true): TspText | undef
 	return [span("starting…", "dim")];
 }
 
-/** `3 tools · 2 req · 19K / 200K ctx · $0.02 (+0.01 nested)`. */
 function usageSpans(c: Child): TspText {
 	const u = c.usage;
 	const parts: string[] = [];
@@ -1465,12 +1368,10 @@ function usageSpans(c: Child): TspText {
 export interface HubPreviewOptions {
 	now: number;
 	notice?: { text: string; tone: string };
-	/** The terminal draws `meter` (else `progress`, when it draws that). */
 	meter: boolean;
 	progress: boolean;
 }
 
-/** The selected agent's preview pane (omp #describePreview): title + status, state, facts, context meter, recent activity. */
 export function hubPreview(c: Child | undefined, o: HubPreviewOptions): NativeUiNode[] {
 	if (!c) return [];
 	const now = o.now;
@@ -1484,7 +1385,6 @@ export function hubPreview(c: Child | undefined, o: HubPreviewOptions): NativeUi
 	];
 	if (o.notice) out.push(text([span(flat(o.notice.text), o.notice.tone)], { wrap: "word" }, "notice"));
 
-	// State: spinner / status, run time, last active.
 	const label = hubStatusLabel(c);
 	const tone = hubStatusTone(c.status);
 	const state: NativeUiNode[] = [
@@ -1497,7 +1397,6 @@ export function hubPreview(c: Child | undefined, o: HubPreviewOptions): NativeUi
 	else state.push(text([span("last active", "dim")]), node("elapsed", { age: Math.max(0, now - hubLastActivity(c)), format: "short" }), text([span("ago", "dim")]));
 	out.push(uiNode("row", { gap: "sm", wrap: true, align: "baseline" }, state, "state"));
 
-	// Facts.
 	const facts: { k: string; v: TspText }[] = [];
 	const task = taskSummary(c.task);
 	if (task) facts.push({ k: "Task", v: task });
@@ -1560,7 +1459,6 @@ export function hubPreview(c: Child | undefined, o: HubPreviewOptions): NativeUi
 	return out;
 }
 
-/** Cheap change signature of everything the hub shows for `c` (roster row + preview). */
 export function hubSignature(c: Child): string {
 	const u = c.usage;
 	const msgs = (c.session as { messages?: unknown[] } | undefined)?.messages;
@@ -1598,29 +1496,19 @@ export interface HubTranscriptView {
 	id: string;
 	child: Child | undefined;
 	now: number;
-	/** The agent's message components (describe boundaries), else a placeholder line. */
 	body: { kind: "entries"; children: readonly NativeUiChild[] } | { kind: "note"; text: string; tone: string };
-	/** Key of the end marker: a new key (entries added) scrolls the view to the end. */
 	endKey: string;
 	notice?: { text: string; tone: string };
-	/** The message field; absent = read-only (killed). */
 	input?: { text: string; cursor: number; multiline: boolean };
 	expanded: boolean;
 	hideThinking: boolean;
-	/** ctrl+x was pressed (or Kill clicked) once: the next one kills. */
 	killArmed: boolean;
 	keys: { expand: string; thinking: string };
-	/** The terminal draws these kinds. */
 	progress: boolean;
 	elapsed: boolean;
 	editor: boolean;
 }
 
-/**
- * The transcript view (omp agent-transcript-viewer.ts #describe): the agent's meta with a top-right `esc`, its
- * usage and current step, the transcript (pi's own message components), the message field and the actions.
- * Scrolling is the terminal's; a new end marker brings the latest entry into view.
- */
 export function hubTranscript(v: HubTranscriptView): NativeUiNode {
 	const c = v.child;
 	const children: NativeUiChild[] = [];

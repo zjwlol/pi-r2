@@ -1,35 +1,3 @@
-/**
- * Completion: prefix-constrained ranking with the prompt-local and session
- * caches and the finished-word-aware posterior.
- *
- * Port of oh-my-pi `crates/pi-predict/src/ngram/query.rs` (MIT).
- *
- * For prefix `p` after context `(u, v)`, with `s(w) = p3(w|u,v)·P(case|w)`
- * and `M = Σ s(x)` over every word `x` under the prefix, **including the
- * prefix itself** when it is a word:
- *
- *   post(w)  = s(w) / M
- *   final(w) = (post(w) + λ·cache(w) + σ·session(w)) / (1 + λ·C + σ·S)
- *
- * `cache(w)` sums `exp(−distance/D)` over occurrences of `w` earlier in the
- * prompt (×(1 + b) after the same previous word) and `session(w)` counts `w`
- * in the last prompts; `C` / `S` are their totals under the prefix. The
- * confidence of the best word is `final(best)`.
- *
- * Every score is a ratio over the words under the prefix, so typing another
- * letter of the shown word (in the same case) removes competitors but never
- * reorders the ones that remain: a ghost stays put while the user types
- * through it.
- *
- * Units: string offsets are UTF-16 code units where upstream has UTF-8
- * bytes; the cache distance and the cache window are UTF-8 bytes as
- * upstream (they are observable), prefix lengths are code points. Arithmetic
- * is written in upstream's order; the candidates' `c2` / `pw` / `c3` are
- * `f32` as upstream stores them. Candidate enumeration order decides exact
- * ties and is upstream's.
- *
- * Loaded by Node's type stripping (worker and CLI): erasable syntax only.
- */
 import type { Model } from "./model.ts";
 import { plainSuffix } from "./model.ts";
 import { isWordChar } from "./prose.ts";
@@ -39,29 +7,23 @@ import type { Context } from "./text.ts";
 import { caseTail, codePoints, contextBefore, lowercase, lowercaseAligned, SLOT_NONE, SLOT_WORD } from "./text.ts";
 import { NO_SLOT } from "./web.ts";
 
-/** One row of the candidate table of a query (`QueryState.explain`), in enumeration order. */
 export interface CandidateRow {
 	word: string;
-	/** `final(w)`, also for candidates that cannot be offered. */
 	value: number;
 	c2: number;
 	pw: number;
 	c3: number;
 	cache: number;
 	session: number;
-	/** False for the prefix itself and for ineligible words without cache weight. */
 	offered: boolean;
-	/** The candidate `complete` picks. */
 	picked: boolean;
 }
 
 const U32_MAX = 0xffff_ffff;
 const NON_ASCII = /[^\x00-\x7f]/;
 
-/** `P_web(id | slot)` for vocabulary id `id`, 0 when the slot has no such follower. */
 function webProb(model: Model, slot: number, id: number): number {
-	// Web ids and the base ids they map to are both in word order, so the
-	// rows of a slot are ascending in vocabulary id as well.
+	// Each slot must stay sorted after mapping to vocabulary IDs.
 	const web = model.web;
 	const toId = model.webToId;
 	const follower = web.follower;
@@ -78,12 +40,11 @@ function webProb(model: Model, slot: number, id: number): number {
 }
 
 /**
- * Start (UTF-16 offset) of the longest suffix of `text` that is at most
- * `maxBytes` UTF-8 bytes and starts on a character boundary.
+ * Returns the window start as a UTF-16 offset.
  */
 function windowStart(text: string, maxBytes: number): number {
 	const n = text.length;
-	// A UTF-16 unit is at most 3 UTF-8 bytes.
+	// A UTF-16 string needs at most three UTF-8 bytes per code unit.
 	if (n * 3 <= maxBytes) return 0;
 	let at = n;
 	let bytes = 0;
@@ -105,7 +66,9 @@ function windowStart(text: string, maxBytes: number): number {
 	return at;
 }
 
-/** Code point ending at UTF-16 offset `end` (> 0) of `text`. */
+/**
+ * Pass a positive UTF-16 end offset.
+ */
 function codePointBefore(text: string, end: number): number {
 	const low = text.charCodeAt(end - 1);
 	if (low >= 0xdc00 && low <= 0xdfff && end >= 2) {
@@ -115,40 +78,34 @@ function codePointBefore(text: string, end: number): number {
 	return low;
 }
 
-/** `text` without its first `k` code points. */
 function skipCodePoints(text: string, k: number): string {
 	let at = 0;
 	for (let i = 0; i < k && at < text.length; i++) at += text.codePointAt(at)! > 0xffff ? 2 : 1;
 	return text.slice(at);
 }
 
-/** `next` (larger, zeroed) with the contents of `old` copied in. */
 function grown<A extends Uint32Array | Float32Array | Float64Array>(old: A, next: A): A {
 	next.set(old);
 	return next;
 }
 
-/** Query-local state reused across the prefixes of one word. */
 export class QueryState {
-	// Memo: the model, its version and the `before` the fields below were built for.
 	private model: Model | undefined = undefined;
 	private version = -1;
 	private before = "";
-	/** Left context of the word being completed. */
 	private readonly context: Context = { u: SLOT_NONE, v: SLOT_NONE, uWord: "", vWord: "" };
 	/**
-	 * Lowercased tail of `before` scanned by the prompt-local cache; offsets
-	 * match `before.slice(windowAt)`.
+	 * Window offsets must match `before.slice(windowAt)`.
 	 */
 	private window = "";
 	private windowAt = 0;
-	/** UTF-8 length of `window`. */
 	private windowBytes = 0;
-	/** UTF-8 offset of every unit index of `window`; unused while the window is ASCII. */
+	/**
+	 * Maps UTF-16 offsets in `window` to UTF-8 byte offsets.
+	 */
 	private bytePos: Uint32Array = new Uint32Array(0);
 	private windowAscii = true;
 
-	// Context statistics of the current query (upstream `Ctx`).
 	private followers: Followers | undefined = undefined;
 	private cv = 0;
 	private tv = 0;
@@ -158,8 +115,6 @@ export class QueryState {
 	private webSlot = NO_SLOT;
 	private webS = 0;
 
-	// Candidates, struct of arrays. `id` is a vocabulary id, or NONE for a word
-	// seen only earlier in this prompt, which is identified by its window span.
 	private count = 0;
 	private id: Uint32Array = new Uint32Array(64);
 	private spanStart: Uint32Array = new Uint32Array(64);
@@ -169,25 +124,19 @@ export class QueryState {
 	private c3: Float32Array = new Float32Array(64);
 	private cache: Float64Array = new Float64Array(64);
 	private session: Float64Array = new Float64Array(64);
-	/** Case-weighted chain score `s(w)`. */
 	private score: Float64Array = new Float64Array(64);
 
-	// Scratch.
-	/** `stamp[id] === epoch` marks a vocabulary word that is a candidate; `slot[id]` is its index. */
 	private stamp: Uint32Array = new Uint32Array(0);
 	private slot: Uint32Array = new Uint32Array(0);
 	private epoch = 0;
 	private readonly top: number[] = [];
 	private readonly seen: Context = { u: SLOT_NONE, v: SLOT_NONE, uWord: "", vWord: "" };
-	/** Case tail of the typed prefix. */
 	private tail = "";
 
-	// Results of the last `rank`.
 	private bestValue = 0;
 	private caseMass = 0;
 	private norm = 1;
 
-	// Arguments of the session visitor (kept in fields so `rank` allocates no closure).
 	private rankModel: Model | undefined = undefined;
 	private rankKey = "";
 	private sessionMass = 0;
@@ -196,13 +145,12 @@ export class QueryState {
 		this.sessionMass += count;
 		const known = this.stamp[id] === this.epoch;
 		if (known || (model.eligible(id) && model.vocab.word(id) !== this.rankKey)) {
-			// Index first: `lookup` may reallocate the candidate arrays.
+			// Call `lookup` before writing because it can replace `session`.
 			const at = this.lookup(model, id);
 			this.session[at] = count;
 		}
 	};
 
-	/** Best completion and its ungated f64 confidence, or null. Never changes `model`. */
 	complete(model: Model, before: string, prefix: string): { suffix: string; confidence: number } | null {
 		const key = lowercase(prefix);
 		const k = codePoints(prefix);
@@ -214,11 +162,6 @@ export class QueryState {
 		return suffix.length === 0 ? null : { suffix, confidence: this.bestValue };
 	}
 
-	/**
-	 * The candidate table `complete` ranks for this query, in enumeration
-	 * order (diagnostics for the replay CLI). Empty when the prefix is not
-	 * answered at all.
-	 */
 	explain(model: Model, before: string, prefix: string): CandidateRow[] {
 		const rows: CandidateRow[] = [];
 		const key = lowercase(prefix);
@@ -248,10 +191,6 @@ export class QueryState {
 		return rows;
 	}
 
-	/**
-	 * Prepare the per-`before` state (context, cache window) unless the memo
-	 * already holds it.
-	 */
 	private load(model: Model, before: string): void {
 		if (this.model === model && this.version === model.version && this.before === before) return;
 		this.model = model;
@@ -264,15 +203,12 @@ export class QueryState {
 		this.measureWindow();
 		const words = model.vocab.length;
 		if (this.stamp.length < words) {
-			// Headroom: the vocabulary grows by a few words per learned prompt.
-			// Fresh zeroes are fine, stamps never outlive a query.
 			const size = words + 8192;
 			this.stamp = new Uint32Array(size);
 			this.slot = new Uint32Array(size);
 		}
 	}
 
-	/** UTF-8 offsets of the window: the cache decays with byte distance. */
 	private measureWindow(): void {
 		const window = this.window;
 		const n = window.length;
@@ -290,7 +226,6 @@ export class QueryState {
 			if (c < 0x80) bytes += 1;
 			else if (c < 0x800) bytes += 2;
 			else if (c >= 0xd800 && c <= 0xdbff && i + 1 < n && (window.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
-				// A surrogate pair is 4 bytes, attributed to the high surrogate.
 				bytes += 4;
 				i++;
 				pos[i] = bytes;
@@ -303,7 +238,6 @@ export class QueryState {
 	private suffix(model: Model, best: number, typed: string, key: string, k: number): string {
 		const id = this.id[best];
 		if (id !== NONE) return model.suffix(id, typed, this.tail);
-		// A word seen only earlier in this prompt: prefer the casing it had where it was typed.
 		const start = this.spanStart[best];
 		const end = this.spanEnd[best];
 		const form = caseTail(this.before.slice(start + this.windowAt, end + this.windowAt));
@@ -333,7 +267,6 @@ export class QueryState {
 		this.webS = webSlot === NO_SLOT ? 0 : model.web.covered[webSlot] * p.webBigram;
 	}
 
-	/** Index of a new, zeroed candidate. */
 	private push(id: number): number {
 		const at = this.count;
 		if (at === this.id.length) this.grow();
@@ -363,20 +296,17 @@ export class QueryState {
 		this.score = grown(this.score, new Float64Array(size));
 	}
 
-	/** Push (or find) the candidate for vocabulary word `id` with known bigram evidence. */
 	private candidate(model: Model, id: number, c2: number, pw: number): number {
 		if (this.stamp[id] === this.epoch) return this.slot[id];
 		const at = this.push(id);
 		this.c2[at] = c2;
 		this.pw[at] = pw;
-		// The trigram count matters only on top of a bigram count.
 		this.c3[at] = this.pair !== NONE && c2 > 0 ? model.triCount(this.pair, id) : 0;
 		this.stamp[id] = this.epoch;
 		this.slot[id] = at;
 		return at;
 	}
 
-	/** Push (or find) the candidate for vocabulary word `id`, looking its bigram evidence up. */
 	private lookup(model: Model, id: number): number {
 		if (this.stamp[id] === this.epoch) return this.slot[id];
 		const c2 = this.followers ? this.followers.count(id) : 0;
@@ -393,10 +323,6 @@ export class QueryState {
 		this.count = 0;
 	}
 
-	/**
-	 * Rank the completions of lowercase `key` (typed as `typed`). Returns the
-	 * index of the picked candidate (its confidence in `bestValue`), or -1.
-	 */
 	private rank(model: Model, key: string, typed: string): number {
 		const p = model.params;
 		const vocab = model.vocab;
@@ -406,7 +332,6 @@ export class QueryState {
 		const [lo, hi] = vocab.baseRange(key);
 		const [wlo, whi] = web.words.range(key);
 
-		// Merge-join the history and web followers of `v` inside the prefix range.
 		let disc2 = 0;
 		let sumPw = 0;
 		let disc3 = 0;
@@ -437,7 +362,7 @@ export class QueryState {
 			sumPw += pw;
 			disc3 += Math.max(this.c3[at] - p.d3, 0);
 		}
-		// Overflow followers are not in lexicographic id order: filter by text.
+		// Overflow IDs follow insertion order rather than word order.
 		if (followers) {
 			const ids = followers.ids;
 			for (let at = followers.lowerBound(vocab.baseLength); at < ids.length; at++) {
@@ -449,7 +374,6 @@ export class QueryState {
 				disc3 += Math.max(this.c3[slot] - p.d3, 0);
 			}
 		}
-		// Unigram candidates: range top-k over base ids plus every overflow match.
 		const top = this.top;
 		top.length = 0;
 		model.topK(lo, hi, p.topK, top);
@@ -464,7 +388,6 @@ export class QueryState {
 		const sumP0 = web.p0Cum[whi] - web.p0Cum[wlo];
 		const mass = this.interp(model, sumC1, sumP0, sumPw, disc2, disc3);
 
-		// Prompt-local cache and session cache.
 		const cacheMass = p.cacheWeight > 0 ? this.scanCache(model, key) : 0;
 		this.sessionMass = 0;
 		if (p.sessionWeight > 0) {
@@ -475,7 +398,6 @@ export class QueryState {
 		}
 		const sessionMass = this.sessionMass;
 
-		// Score with the case channel; adjust the mass for it.
 		const tail = caseTail(typed);
 		this.tail = tail;
 		const plain = tail === key;
@@ -511,12 +433,10 @@ export class QueryState {
 			const value = (post + p.cacheWeight * this.cache[i] + p.sessionWeight * this.session[i]) / norm;
 			const id = this.id[i];
 			const length = id === NONE ? this.spanEnd[i] - this.spanStart[i] : vocab.word(id).length;
-			// The prefix itself holds mass but is never offered.
+			// Apply the prefix filter only after computing mass.
 			if (length === key.length) continue;
-			// Hygiene: misspellings and one-off junk are never offered unless
-			// they were typed earlier in this prompt.
 			if (id !== NONE && this.cache[i] === 0 && !model.eligible(id)) continue;
-			// Strictly greater: the first candidate in enumeration order wins a tie.
+			// Ties must follow candidate enumeration order.
 			if (value > bestValue) {
 				best = i;
 				bestValue = value;
@@ -526,29 +446,21 @@ export class QueryState {
 		return best;
 	}
 
-	/**
-	 * Prompt-local cache: words in the window that extend `key` (or equal
-	 * it), weighted `exp(−distance / D)`, ×(1 + boost) after the same
-	 * previous word as the query. Returns the total weight.
-	 */
 	private scanCache(model: Model, key: string): number {
 		const p = model.params;
 		const window = this.window;
 		const n = window.length;
 		const keyLength = key.length;
-		// Units of the last character of `key`.
 		const lastUnits = keyLength >= 2 && codePointBefore(key, keyLength) > 0xffff ? 2 : 1;
 		const context = this.context;
 		const seen = this.seen;
 		let mass = 0;
 		let limit = n;
 		while (limit >= keyLength) {
-			// Last occurrence of `key` inside `window[0, limit)`.
 			const idx = window.lastIndexOf(key, limit - keyLength);
 			if (idx < 0) break;
 			const boundary = idx === 0 || !isWordChar(codePointBefore(window, idx));
 			if (boundary) {
-				// The word runs to the next non-word character (a space past the end).
 				let end = idx + keyLength;
 				let next = 0x20;
 				while (end < n) {
@@ -559,7 +471,6 @@ export class QueryState {
 					}
 					end += c > 0xffff ? 2 : 1;
 				}
-				// Skip identifiers (`foo_bar`, `v2`).
 				const identifier = next === 0x5f || (next >= 0x30 && next <= 0x39);
 				while (end > idx + keyLength && window.charCodeAt(end - 1) === 0x27) end--;
 				if (!identifier) {
@@ -591,13 +502,12 @@ export class QueryState {
 				}
 			}
 			if (idx === 0) break;
-			// Up to the last character of this occurrence, so overlapping occurrences are found.
+			// Allow the next match to overlap this one.
 			limit = idx + keyLength - lastUnits;
 		}
 		return mass;
 	}
 
-	/** Index of the cache-only candidate spelled like `window[start, end)`, or -1. */
 	private findLocal(start: number, end: number): number {
 		const window = this.window;
 		const length = end - start;
@@ -616,14 +526,6 @@ export class QueryState {
 		return -1;
 	}
 
-	/**
-	 * The probability chain, fed either one word's counts or prefix sums of them:
-	 *
-	 *   p1 = (c1 + mu1·p0) / (total + mu1)
-	 *   q2 = no web slot ? p1 : webBigram·pw + (1 − webS)·p1
-	 *   p2 = cv  > 0 ? (disc2 + (d2·tv  + mu2)·q2) / (cv  + mu2) : q2
-	 *   p3 = cuv > 0 ? (disc3 + (d3·tuv + mu3)·p2) / (cuv + mu3) : p2
-	 */
 	private interp(model: Model, c1: number, p0: number, pw: number, disc2: number, disc3: number): number {
 		const p = model.params;
 		const p1 = (c1 + p.mu1 * p0) / (model.total + p.mu1);

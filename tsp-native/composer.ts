@@ -1,28 +1,3 @@
-/**
- * The native composer: pi's prompt editor as oh-my-pi's chat bar (omp
- * `CustomEditor.describeLayout` + `#describeComposerControls`, the status
- * line's `describeComposerFacts`). A `col` with role `omp.editor`
- * (`omp.editor.bash` for a `!` draft; tone `pending` while a turn runs) over
- *
- * - the context meter (`omp.composer.context`) along its top edge,
- * - the attachment chips other extensions register (shared/composer-slots.ts),
- * - the `omp.composer.line` row: the bash mode chip and the `editor` input,
- * - the autocomplete list while it is open: omp's caret-anchored overlay in
- *   `layer` (see Autocomplete below), else inline under the line,
- * - the `omp.composer.bar`: the model and effort dropdowns (`omp.composer.model`
- *   and `omp.composer.effort`), the facts (`omp.composer.extras`:
- *   cwd, session name, extension statuses), the session cost
- *   (`omp.composer.usage`, token totals in its tooltip), then send
- *   (`omp.composer.send`) or Stop (`omp.composer.stop`) while a turn runs.
- *
- * The facts come from pi's FooterComponent (its `session`, `footerData` and
- * `getSessionStats()`); while the composer carries them the footer itself
- * describes as hidden. Clicks come back as `status.model`, `thinking.select`,
- * `thinking.set` (a level picked from the terminal's effort menu, as the
- * action's `value`), `submit` and `interrupt` actions.
- *
- * No runtime imports from describers.ts (it imports this module).
- */
 import * as fs from "node:fs";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
@@ -33,12 +8,8 @@ import { col, compact, type DescribeContext, type NativeChild, type NativeNode, 
 import { hasStyle, lineToSpans } from "./spans.ts";
 import type { TspProps, TspSpan } from "./wire.ts";
 
-/** Loose view of private component state. */
 type Any = Record<string, any>;
 
-// ── Formatting ──────────────────────────────────────────────────────────
-
-/** pi's footer `formatTokens`. */
 export function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -47,7 +18,6 @@ export function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
-/** pi's footer `formatCwdForFooter`: the home directory as `~`. */
 function shortCwd(cwd: string): string {
 	const home = process.env.HOME || process.env.USERPROFILE;
 	if (!home) return cwd;
@@ -57,9 +27,6 @@ function shortCwd(cwd: string): string {
 	return cwd;
 }
 
-/**
- * The shell's name for the working directory when it got there through a symlink.
- */
 function shellCwd(cwd: string): string {
 	const pwd = process.env.PWD;
 	if (!pwd || pwd === cwd) return cwd;
@@ -67,12 +34,11 @@ function shellCwd(cwd: string): string {
 	try {
 		return fs.realpathSync(pwd) === cwd ? pwd : cwd;
 	} catch {
-		// PWD can name a directory that is gone
+		// PWD can point to a path that no longer exists.
 		return cwd;
 	}
 }
 
-// The composer measures the natural width of its facts before shrinking them.
 const MAX_PATH_COLUMNS = 32;
 
 function pathLabel(cwd: string): string {
@@ -88,7 +54,6 @@ function pathLabel(cwd: string): string {
 	return `${prefix}…${separator > 0 ? tail.slice(separator) : tail}`;
 }
 
-/** The model id without its region/vendor prefixes and Bedrock version tail (`us.anthropic.claude-opus-5-5` → `claude-opus-5-5`). */
 export function shortModelId(id: string): string {
 	let out = id.slice(id.lastIndexOf("/") + 1);
 	const parts = out.split(".");
@@ -118,7 +83,6 @@ const KEY_NAMES: Readonly<Record<string, string>> = {
 	right: "→",
 };
 
-/** A key id (`shift+tab`, `ctrl+l`) as a tooltip hint (`Shift+Tab`, `Ctrl+L`). */
 export function keyLabel(key: string): string {
 	return key
 		.split("+")
@@ -138,27 +102,26 @@ function finite(value: unknown, fallback = 0): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-// ── Facts ───────────────────────────────────────────────────────────────
-
-/** What the composer shows of pi's footer, as primitives (the same object while none changed). */
 export interface ComposerFacts {
 	readonly modelId: string | undefined;
 	readonly modelName: string | undefined;
 	readonly provider: string | undefined;
 	readonly routedId: string | undefined;
 	readonly routedThinking: string | undefined;
-	/** The thinking level; undefined when the model doesn't reason. */
 	readonly thinking: ModelThinkingLevel | undefined;
-	/** Context share used (0–100); null when unknown (right after a compaction). */
+	/**
+	 * Context usage as a percentage from 0 to 100.
+	 */
 	readonly percent: number | null;
 	readonly tokens: number | null;
 	readonly window: number;
 	readonly autoCompact: boolean;
-	/** Tokens kept free before auto-compaction fires (pi's `compaction.reserveTokens`). */
+	/**
+	 * Tokens kept free before auto-compaction fires.
+	 */
 	readonly reserve: number | undefined;
 	readonly cwd: string;
 	readonly sessionName: string | undefined;
-	/** Extension statuses (`ctx.ui.setStatus`), sorted by key. */
 	readonly statuses: readonly (readonly [key: string, text: string])[];
 	readonly cost: number;
 	readonly subscription: boolean;
@@ -181,7 +144,6 @@ function sameSig(a: readonly unknown[], b: readonly unknown[]): boolean {
 	return true;
 }
 
-/** The facts of a pi FooterComponent (`session`, `footerData`, `getSessionStats()`); undefined without a session. */
 export function composerFacts(footer: Any): ComposerFacts | undefined {
 	const session: Any | undefined = footer.session;
 	const data: Any | undefined = footer.footerData;
@@ -193,7 +155,6 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 	const context: Any | undefined = stats.contextUsage;
 	const routed: Any | undefined = session.routedModel;
 	const window = finite(context?.contextWindow ?? model?.contextWindow);
-	// As pi's footer: no usage yet reads 0%, a known-unknown (after compaction) reads "?".
 	const percent = context === undefined || context === null ? 0 : typeof context.percent === "number" ? context.percent : null;
 	const tokens = typeof context?.tokens === "number" ? context.tokens : null;
 	const autoCompact = footer.autoCompactEnabled !== false;
@@ -203,7 +164,7 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 			const value = session.settingsManager?.getCompactionReserveTokens?.(routed?.model ?? model);
 			if (typeof value === "number" && Number.isFinite(value)) reserve = value;
 		} catch {
-			// an invalid setting: no compaction mark
+			// pi can throw when reading an invalid reserve setting.
 		}
 	}
 	const sessionManager: Any | undefined = session.sessionManager;
@@ -281,18 +242,13 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 	return facts;
 }
 
-/** A turn, compaction, retry or `!` command is running in the footer's session (Stop can cancel it). */
 export function sessionRunning(footer: Any | undefined): boolean {
 	const session: Any | undefined = footer?.session;
 	if (!session) return false;
 	return session.isStreaming === true || session.isCompacting === true || session.isBashRunning === true || session.isRetrying === true;
 }
 
-// ── Locating the footer ─────────────────────────────────────────────────
-
-/** Per TUI: the containers from a TUI child down to the footer, the footer last. */
 const footerPaths = new WeakMap<object, readonly Any[]>();
-/** How deep below the TUI's children the footer is looked for; containers wider than this aren't searched (the transcript). */
 const SEARCH_DEPTH = 4;
 const SEARCH_WIDTH = 16;
 
@@ -305,7 +261,6 @@ function mounted(tui: Any, path: readonly Any[]): boolean {
 	return true;
 }
 
-/** The FooterComponent mounted in `tui` (a shallow search, cached while it stays mounted), else undefined. */
 export function findFooter(tui: Any | undefined, isFooter: (component: Any) => boolean): Any | undefined {
 	if (!tui || !Array.isArray(tui.children)) return undefined;
 	const cached = footerPaths.get(tui);
@@ -326,23 +281,16 @@ export function findFooter(tui: Any | undefined, isFooter: (component: Any) => b
 	return undefined;
 }
 
-// ── Footer handoff ──────────────────────────────────────────────────────
-//
-// Every mounted component is described once per frame, the editor before the
-// footer. The editor bumps the footer's tick when its composer carries the
-// footer's facts; the footer hides while the tick moved since its own last
-// describe, so it comes back by itself once the composer stops (an unmounted
-// editor, a fallback, ANSI).
-
 const factsTicks = new WeakMap<object, number>();
 const footerSeen = new WeakMap<object, number | undefined>();
 
-/** The composer carried `footer`'s facts in this frame. */
 export function noteFactsCarried(footer: object): void {
 	factsTicks.set(footer, (factsTicks.get(footer) ?? 0) + 1);
 }
 
-/** Call once per footer describe: whether a composer carried its facts since the previous one. */
+/**
+ * Check this once per frame after the editor is described.
+ */
 export function footerCarried(footer: object): boolean {
 	const tick = factsTicks.get(footer);
 	const seen = footerSeen.get(footer);
@@ -350,24 +298,19 @@ export function footerCarried(footer: object): boolean {
 	return tick !== undefined && tick !== seen;
 }
 
-// ── Hosting ─────────────────────────────────────────────────────────────
-
-/** Tell other extensions whether the native composer hosts the editor; a flip repaints (their bands read it while describing). */
 export function hostComposer(editor: Any, hosted: boolean): void {
 	if (isComposerHosted() === hosted) return;
 	setComposerHosted(hosted);
 	try {
 		editor.tui?.requestRender?.();
 	} catch {
-		// the next frame picks it up
+		// The hosted state is read again on the next frame.
 	}
 }
 
 export function releaseComposer(): void {
 	setComposerHosted(false);
 }
-
-// ── Attachments ─────────────────────────────────────────────────────────
 
 const keyedChips = new WeakMap<object, NativeNode>();
 const chipsMemo = new WeakMap<object, readonly NativeNode[]>();
@@ -377,7 +320,6 @@ function isNode(value: unknown): value is NativeNode {
 	return value !== null && typeof value === "object" && typeof (value as Any).k === "string";
 }
 
-/** A provider's node with a stable sibling key (the same object while the provider's node is). */
 function keyedChip(chip: NativeNode, index: number): NativeNode {
 	if (chip.key !== undefined) return chip;
 	let keyed = keyedChips.get(chip);
@@ -388,7 +330,6 @@ function keyedChip(chip: NativeNode, index: number): NativeNode {
 	return keyed;
 }
 
-/** The registered providers' non-null nodes, in key order; the same array for `owner` while every node is unchanged. */
 export function composerChips(owner: object, cx: DescribeContext): readonly NativeNode[] {
 	const providers = composerAttachments();
 	const out: NativeNode[] = [];
@@ -408,13 +349,10 @@ export function composerChips(owner: object, cx: DescribeContext): readonly Nati
 	return next;
 }
 
-// ── Keys ────────────────────────────────────────────────────────────────
-
 export interface ComposerKeys {
 	readonly model: string | undefined;
 	readonly thinking: string | undefined;
 	readonly interrupt: string;
-	/** All of the above, joined (for fingerprints). */
 	readonly sig: string;
 }
 
@@ -429,7 +367,6 @@ function firstKey(keybindings: Any | undefined, action: string): string | undefi
 	}
 }
 
-/** The first key of the model selector, thinking cycle and interrupt actions (tooltip hints). */
 export function composerKeys(editor: Any): ComposerKeys {
 	const kb: Any | undefined = editor.keybindings;
 	const model = firstKey(kb, "app.model.select");
@@ -443,24 +380,12 @@ export function composerKeys(editor: Any): ComposerKeys {
 	return keys;
 }
 
-// ── Actions ─────────────────────────────────────────────────────────────
-
 function call(handler: unknown): boolean {
 	if (typeof handler !== "function") return false;
 	handler();
 	return true;
 }
 
-/**
- * A click on a composer control, routed the way pi's keys go: the model chip
- * opens the model selector (`app.model.select`), the effort chip opens the
- * thinking level selector, Stop interrupts like Esc (the
- * editor's `onEscape`, else `app.interrupt`) while something runs.
- * `thinking.set` carries a level picked by pointer as `value`: it is set on
- * the footer's session when the model offers it, else ignored (no value, no
- * footer, a level pi doesn't have such as omp's `auto`). `submit` is the
- * describer's (it owns the draft). Unknown actions are ignored.
- */
 export function runComposerAction(editor: Any, act: string, running: boolean, value?: string, footer?: Any): boolean {
 	const handlers: Any | undefined = editor.actionHandlers instanceof Map ? editor.actionHandlers : undefined;
 	switch (act) {
@@ -481,10 +406,10 @@ export function runComposerAction(editor: Any, act: string, running: boolean, va
 			const session: Any | undefined = footer?.session;
 			if (typeof value !== "string" || !value || typeof session?.setThinkingLevel !== "function") return false;
 			const levels: unknown = session.getAvailableThinkingLevels?.();
-			// Not offered: ignored rather than left to `setThinkingLevel` to clamp.
+			// pi clamps unsupported effort levels.
 			if (!Array.isArray(levels) || !levels.includes(value)) return false;
 			session.setThinkingLevel(value);
-			// pi refreshes the footer and the editor border on the change, without asking for a frame.
+			// pi updates the footer and editor border without requesting a frame.
 			editor.tui?.requestRender?.();
 			return true;
 		}
@@ -496,16 +421,10 @@ export function runComposerAction(editor: Any, act: string, running: boolean, va
 	}
 }
 
-// ── Layout ──────────────────────────────────────────────────────────────
-
 export interface ComposerParts {
-	/** The `editor` node (key `input`). */
 	readonly input: NativeNode;
-	/** A `!` draft (`!!`: excluded from the model's context). */
 	readonly shell: { readonly excluded: boolean } | undefined;
-	/** The working row, when the editor's container doesn't place it above the composer. */
 	readonly working: NativeChild | undefined;
-	/** The open autocomplete list. */
 	readonly complete: NativeNode | undefined;
 	readonly chips: readonly NativeNode[];
 	readonly facts: ComposerFacts | undefined;
@@ -514,10 +433,8 @@ export interface ComposerParts {
 	readonly keys: ComposerKeys;
 }
 
-/** Filled steps (of four) of the effort chip's fallback meter (terminals without `effort`), as omp's. */
 const EFFORT_STEPS: Readonly<Record<ModelThinkingLevel, number>> = { off: 0, minimal: 1, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
-/** Context share where the meter turns warning and error: pi's footer colours past 70% and 90%. */
 const CONTEXT_THRESHOLDS = { warn: 0.7, bad: 0.9 } as const;
 
 interface FactsView {
@@ -527,47 +444,30 @@ interface FactsView {
 
 const factsViews = new WeakMap<ComposerFacts, FactsView>();
 
-// ── Context line ────────────────────────────────────────────────────────
-//
-// rsttyd draws the meter as a hairline along the composer's top edge, 22px in
-// from each end (tsp.css `omp.composer.context`), and hangs three things in
-// the one 11px band just over it without arranging them: the share (`label`,
-// 10px mono, centred on the fill's end), the window (`total`, 10px mono, at
-// the line's end) and each icon mark (10px wide, centred on its point). omp's
-// compaction point sits near 85% of the window, well clear of the total; pi
-// compacts at the window less its reserve tokens (98.4% of a 1M window, 92%
-// of 200k), right under the total, and the share passes over the mark as it
-// nears it. So the meter only carries what fits: the share always, the mark
-// unless the share covers it, the total while neither reaches it — what's left
-// out stays in the tooltip.
-
-/** rsttyd's composer and context line, in CSS px (tsp.css). */
+/**
+ * The context line dimensions are in CSS pixels.
+ */
 const CONTEXT_LINE = {
-	/** A terminal column at rsttyd's 14px grid font, for an estimate of the pane's width. */
 	cell: 8,
-	/** The composer's widest, and its margin inside the pane (a phone's below `phone`). */
 	composer: 736,
 	margin: 24,
 	phone: 640,
 	phoneMargin: 16,
-	/** The line runs 22px in from each end of the composer. */
 	inset: 44,
-	/** The advance of the 10px mono share and window. */
 	glyph: 6.2,
-	/** Half an icon mark. */
 	mark: 5,
-	/** The least room kept between two of them. */
 	gap: 4,
 } as const;
 
-/** The context line's length on a pane of `cols` columns. */
 function contextLinePx(cols: number): number {
 	const pane = Math.max(1, cols) * CONTEXT_LINE.cell;
 	const composer = pane <= CONTEXT_LINE.phone ? pane - CONTEXT_LINE.phoneMargin : Math.min(CONTEXT_LINE.composer, pane - CONTEXT_LINE.margin);
 	return Math.max(60, composer - CONTEXT_LINE.inset);
 }
 
-/** Which of the mark and the total the line has room for beside the share. */
+/**
+ * The terminal draws context labels and marks without resolving overlaps.
+ */
 function contextFit(used: number | null, label: string | undefined, total: string | undefined, compactAt: number | undefined, cols: number): { mark: boolean; total: boolean } {
 	const line = contextLinePx(cols);
 	const { glyph, mark: half, gap } = CONTEXT_LINE;
@@ -625,7 +525,6 @@ function fact(key: string, spans: readonly TspSpan[], priority: number, extra?: 
 	return node("seg", { role: "omp.composer.fact", spans, priority, ...extra }, undefined, key);
 }
 
-/** The bar's flexible facts (omp's `omp.composer.extras` status): cwd, session name, then extension statuses. */
 function describeExtras(facts: ComposerFacts): NativeNode {
 	const segs: NativeNode[] = [];
 	if (facts.cwd) segs.push(fact("path", [span(pathLabel(facts.cwd))], 1, { icon: "folder", title: facts.cwd, min: { w: "12ch" } }));
@@ -634,7 +533,6 @@ function describeExtras(facts: ComposerFacts): NativeNode {
 	return node("status", { role: "omp.composer.extras", transparent: true, grow: 1 }, segs, "extras");
 }
 
-/** The session cost (pi's `$0.000`, `(sub)` on a subscription); the token totals ride its tooltip. */
 function describeUsage(facts: ComposerFacts): NativeNode {
 	const cost = facts.cost > 0 || facts.subscription ? `$${facts.cost.toFixed(3)}${facts.subscription ? " (sub)" : ""}` : "";
 	const lines: string[] = [];
@@ -647,7 +545,6 @@ function describeUsage(facts: ComposerFacts): NativeNode {
 		(facts.cacheRead > 0 || facts.cacheWrite > 0) && facts.cacheHit !== undefined && `CH${facts.cacheHit.toFixed(1)}% hit`,
 	]);
 	if (cache.length > 0) lines.push(`Cache ${cache.join(" · ")}`);
-	// Without a cost the token totals are the usage.
 	const shown = cost || compact([facts.input > 0 && `↑${formatTokens(facts.input)}`, facts.output > 0 && `↓${formatTokens(facts.output)}`]).join(" ");
 	const props: TspProps = { role: "omp.composer.usage", text: shown, wrap: "none" };
 	if (lines.length > 0) props.title = lines.join("\n");
@@ -749,7 +646,6 @@ function describeBar(owner: object, parts: ComposerParts, cx: DescribeContext): 
 		compact([
 			facts && describeModel(facts, parts.keys, cx),
 			facts?.thinking !== undefined && describeEffort(facts.thinking, parts.keys, cx),
-			// The facts are the bar's flexible space; without them a spacer keeps send at the end.
 			view ? view.extras : node("row", { grow: 1 }, [], "gap"),
 			view?.usage,
 			describeSubmit(parts, cx),
@@ -763,7 +659,6 @@ function describeBar(owner: object, parts: ComposerParts, cx: DescribeContext): 
 
 const modeMemo = new Map<boolean, NativeNode>();
 
-/** The bash mode chip before the input (omp's `omp.composer.mode`); `!!` drafts stay out of the model's context. */
 function describeMode(excluded: boolean, cx: DescribeContext): NativeNode {
 	let chip = modeMemo.get(excluded);
 	if (!chip) {
@@ -780,7 +675,6 @@ function describeMode(excluded: boolean, cx: DescribeContext): NativeNode {
 	return chip;
 }
 
-/** omp's composer root around the editor node: `col` role `omp.editor[.bash]`, caret at `line/input` ({@link COMPOSER_CARET}). */
 export function describeComposer(owner: object, parts: ComposerParts, cx: DescribeContext): NativeNode {
 	const context = parts.facts && cx.supports("meter") ? describeContext(parts.facts, cx.cols) : undefined;
 	const line = row(compact([parts.shell && describeMode(parts.shell.excluded, cx), parts.input]), { role: "omp.composer.line", align: "start", gap: "sm" }, "line");
@@ -790,7 +684,6 @@ export function describeComposer(owner: object, parts: ComposerParts, cx: Descri
 	return col(children, props);
 }
 
-/** The placeholder for a named session: its name, quoted in italics, in the placeholder's own ink (omp's titled composer). */
 const titlePlaceholders = new Map<string, readonly TspSpan[]>();
 
 export function sessionPlaceholder(name: string): readonly TspSpan[] {
@@ -803,30 +696,9 @@ export function sessionPlaceholder(name: string): readonly TspSpan[] {
 	return spans;
 }
 
-// ── Autocomplete ────────────────────────────────────────────────────────
-//
-// omp's composer shows its open completion list (`/` commands, `@` files,
-// pi-extended's `^` model mentions) as an `overlay` anchored to the caret,
-// role `omp.autocomplete`, around the list component itself; its reconciler
-// hoists that overlay into `layer` (rsttyd places a caret card from there:
-// beside the caret, a sheet over the composer on a narrow pane). Ours doesn't
-// hoist, so the session puts the overlay into `layer` (describers.ts
-// `editorAutocompleteOverlay`) with the anchor already the editor node's wire
-// id. While an overlay is anchored at its caret rsttyd leaves ↑/↓ to the
-// program, so pi-tui's Editor keeps the keys (↑/↓, Tab, Enter, Esc); a click
-// on an item is the list's own `select`/`activate` (its onSelect: the
-// completion applied, as Tab).
-
-/** The keypath of the `editor` node in the composer (`line` row, `input` node), and in the plain `omp.field`. */
 export const COMPOSER_CARET = "line/input";
 export const FIELD_CARET = "input";
 
-/**
- * The typed text the open list matches item labels against (omp's
- * `#autocompleteMark`, for the item `mark` spans): the completion prefix
- * without its sigil, from its last path segment on. Labels that keep the
- * sigil (pi-extended's `^model` mentions) are marked with it.
- */
 export function autocompleteMark(prefix: string, label: string): string {
 	const sigil = /^[/@:#$^]"?/.exec(prefix)?.[0] ?? "";
 	const typed = prefix.slice(sigil.length);
@@ -838,7 +710,6 @@ export function autocompleteMark(prefix: string, label: string): string {
 const overlayMemo = new WeakMap<object, { readonly list: Component; readonly anchor: string; readonly node: NativeNode }>();
 const inlineMemo = new WeakMap<object, { readonly list: Component; readonly node: NativeNode }>();
 
-/** omp's command icons for pi's built-in slash commands (names rsttyd's icon set resolves). */
 const COMMAND_ICONS: Readonly<Record<string, string>> = {
 	settings: "settings",
 	model: "model",
@@ -866,7 +737,6 @@ const COMMAND_ICONS: Readonly<Record<string, string>> = {
 	quit: "exit",
 };
 
-/** An item's icon name, from the pi SelectItem it shows. */
 export type ItemIcon = (item: { readonly value?: unknown; readonly label?: unknown }) => string | undefined;
 
 const commandIcon: ItemIcon = (item) => {
@@ -876,13 +746,6 @@ const commandIcon: ItemIcon = (item) => {
 const pathIcon: ItemIcon = (item) => (/\/"?$/.test(String(item.label || item.value || "")) ? "folder" : "file");
 const modelIcon: ItemIcon = () => "model";
 
-/**
- * The icon each item of an open list leads with (omp's autocomplete items:
- * the command's icon, `file`/`folder` for paths, `model` for `^` mentions);
- * undefined for lists whose items have none (command arguments). `commands`:
- * the list completes a `/` command's name. Stable functions, so a list's
- * items keep their nodes.
- */
 export function autocompleteIcons(prefix: string, state: unknown, commands: boolean): ItemIcon | undefined {
 	if (commands) return commandIcon;
 	if (prefix.startsWith("^")) return modelIcon;
@@ -890,7 +753,9 @@ export function autocompleteIcons(prefix: string, state: unknown, commands: bool
 	return undefined;
 }
 
-/** omp's caret menu: `overlay` (role `omp.autocomplete`, key `complete`) anchored at wire id `anchor`, around `list`. */
+/**
+ * The terminal leaves arrow keys to pi when the overlay is anchored to the caret.
+ */
 export function autocompleteOverlay(owner: object, list: Component, anchor: string): NativeNode {
 	const last = overlayMemo.get(owner);
 	if (last && last.list === list && last.anchor === anchor) return last.node;
@@ -899,7 +764,6 @@ export function autocompleteOverlay(owner: object, list: Component, anchor: stri
 	return overlay;
 }
 
-/** The list inside the composer, under the input line, for a frame no session put the overlay into `layer`. */
 export function autocompleteInline(owner: object, list: Component): NativeNode {
 	const last = inlineMemo.get(owner);
 	if (last && last.list === list) return last.node;

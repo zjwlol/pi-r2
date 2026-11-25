@@ -1,28 +1,13 @@
-/**
- * Shared by the pi-extended extensions (this directory has no index.ts, so pi
- * doesn't load it as an extension).
- */
-
-// Markdown fenced-code opener: captures its indentation and marker.
 const FENCE_RE = /^( {0,3})([`~]{3,})/;
 
-// Tag/element name: HTML5/XML start char + name chars. Sticky so we can probe at
-// a precise offset without slicing.
 const TAG_NAME = /[A-Za-z][A-Za-z0-9-]*/y;
 
-/** Index just past the run of backticks beginning at `i`. */
 function backtickRunEnd(text: string, i: number, n: number): number {
 	let j = i;
 	while (j < n && text[j] === "`") j++;
 	return j;
 }
 
-/**
- * Find the closing backtick run that matches an opening run of `runLen`
- * backticks, scanning from `from`. Returns the index just past the closing run,
- * or -1 when no run of the exact length exists (an unmatched run is literal text,
- * not a code span). Already-masked positions (fenced code) are skipped.
- */
 function findBacktickClose(text: string, from: number, n: number, runLen: number, masked: Uint8Array): number {
 	let k = from;
 	while (k < n) {
@@ -41,11 +26,6 @@ function findBacktickClose(text: string, from: number, n: number, runLen: number
 	return -1;
 }
 
-/**
- * Index of the `>` that closes a tag whose attributes begin at `j`, honoring
- * quoted attribute values. Returns -1 when the tag is malformed (a new `<`
- * appears first, or there is no `>`), so callers can treat the `<` as literal.
- */
 function findTagEnd(text: string, j: number, n: number): number {
 	let quote = "";
 	for (let k = j; k < n; k++) {
@@ -64,11 +44,6 @@ function findTagEnd(text: string, j: number, n: number): number {
 	return -1;
 }
 
-/**
- * Whether a `</name` (ASCII case-insensitive, `lname` lowercase) starts at or
- * after `from`. A cheap necessary condition for {@link findMatchingClose} to
- * find anything; it may over-match (longer names, masked regions), never under.
- */
 function hasCloseTagPrefix(text: string, from: number, lname: string): boolean {
 	const len = lname.length;
 	for (let k = text.indexOf("</", from); k >= 0; k = text.indexOf("</", k + 2)) {
@@ -77,16 +52,6 @@ function hasCloseTagPrefix(text: string, from: number, lname: string): boolean {
 	return false;
 }
 
-/**
- * Locate the `</name>` that balances an opening `<name>` at `start`, counting
- * nested same-name tags. Returns the index just past the matching close tag's
- * `>`, or -1 when the section is never closed (so callers mask only the opening
- * tag rather than swallowing the rest of the document).
- *
- * `unclosed` is a per-call memo, lowercase name -> index from which the text
- * holds no `</name` at all, so prose with many unclosed tags (`Promise<Result>`,
- * `<br>`) is not rescanned to the end once per tag.
- */
 function findMatchingClose(
 	text: string,
 	start: number,
@@ -139,12 +104,6 @@ function findMatchingClose(
 	return -1;
 }
 
-/**
- * Mask the HTML/XML construct beginning at `<` (index `i`): an HTML comment, a
- * self-closing/closing tag (the tag alone), or an opening tag together with the
- * content through its matching close tag. Returns the index just past the masked
- * region, or `i` when the `<` does not begin a tag (e.g. a stray less-than).
- */
 function maskTagAt(text: string, i: number, n: number, masked: Uint8Array, unclosed: Map<string, number>): number {
 	if (text.startsWith("<!--", i)) {
 		const end = text.indexOf("-->", i + 4);
@@ -174,17 +133,7 @@ function maskTagAt(text: string, i: number, n: number, masked: Uint8Array, unclo
 }
 
 /**
- * Length-preserving copy of `text` with fenced code blocks, inline code spans,
- * and XML/HTML sections blanked to spaces, so word matches only land on prose
- * while their indices still address the original text. Newlines are kept.
- *
- * Port of oh-my-pi's two-phase scanner (tui/src/prompt/markdown-prose.ts):
- * fences line by line per CommonMark (an unterminated fence runs to the end),
- * then inline code spans (an unmatched backtick run is literal) and tags over
- * what is left: comments (unterminated ones run to the end), lone closing and
- * self-closing tags, and opening tags through their matching close tag, with
- * same-name nesting counted, names compared case-insensitively and quoted
- * attribute values honoured. An unclosed opening tag masks only itself.
+ * The mask must preserve UTF-16 offsets into the original text.
  */
 export function maskNonProse(text: string): string {
 	if (!text.includes("`") && !text.includes("<") && !text.includes("~~~")) {
@@ -194,7 +143,7 @@ export function maskNonProse(text: string): string {
 	const masked = new Uint8Array(n);
 	const unclosed = new Map<string, number>();
 
-	// Phase 1: fenced code blocks, line by line.
+	// Markdown fences take precedence over inline backticks.
 	let fenceChar = "";
 	let fenceLen = 0;
 	let lineStart = 0;
@@ -205,7 +154,6 @@ export function maskNonProse(text: string): string {
 		const open = FENCE_RE.exec(line);
 		if (fenceChar) {
 			for (let p = lineStart; p < nl; p++) masked[p] = 1;
-			// A closing fence is the same char, at least as long, with nothing else on the line.
 			if (
 				open &&
 				open[2]![0] === fenceChar &&
@@ -218,7 +166,7 @@ export function maskNonProse(text: string): string {
 		} else if (open) {
 			const marker = open[2]!;
 			const ch = marker[0]!;
-			// A backtick fence's info string may not contain a backtick.
+			// Markdown forbids backticks in the info string of a backtick fence.
 			if (!(ch === "`" && line.slice(open[1]!.length + marker.length).includes("`"))) {
 				fenceChar = ch;
 				fenceLen = marker.length;
@@ -229,7 +177,6 @@ export function maskNonProse(text: string): string {
 		lineStart = nl + 1;
 	}
 
-	// Phase 2: inline code spans and HTML/XML, over not-yet-masked regions.
 	let i = 0;
 	while (i < n) {
 		if (masked[i]) {

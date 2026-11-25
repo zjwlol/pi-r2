@@ -1,9 +1,3 @@
-/**
- * hashline/recovery.ts: apply an edit written against an older snapshot (a stale tag) to the current file,
- * when the anchored lines can be proven unchanged.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/recovery.rs` (MIT), without the tree-sitter
- * checks (`context_preserved`, the parse-regression refusal).
- */
 import { applyEdits, replacementGroup } from "./apply.ts";
 import { buildLineMap, similarity } from "./diff.ts";
 import { RECOVERY_EXTERNAL_WARNING, RECOVERY_LINE_REMAP_WARNING, RECOVERY_SESSION_CHAIN_WARNING } from "./messages.ts";
@@ -12,22 +6,16 @@ import type { EditStore } from "./store.ts";
 import { type Clipboard, type Cursor, type Edit, forkClipboard } from "./types.ts";
 
 export interface RecoveryArgs {
-	/** Canonical target path (store key). */
 	path: string;
-	/** Current LF-normalized file text. */
 	currentText: string;
-	/** The stale tag the section carried. */
 	fileHash: string;
-	/** Edits anchored against the stale snapshot (block and clipboard edits allowed). */
 	edits: readonly Edit[];
-	/** The call's clipboard; replaced by the recovered state on success. */
 	clipboard: Clipboard | undefined;
 }
 
 export interface RecoveryResult {
 	text: string;
 	firstChangedLine: number | undefined;
-	/** The recovery banner, then apply-time warnings. */
 	warnings: string[];
 }
 
@@ -61,7 +49,6 @@ function duplicatedValues(lines: readonly string[]): Set<string> {
 	return duplicated;
 }
 
-/** For each anchor: the line just before and just after its run of consecutive anchors (undefined at the file's ends). */
 function anchorNeighbors(anchorLines: Set<number>, lineCount: number): Map<number, { before: number | undefined; after: number | undefined }> {
 	const sorted = [...anchorLines].sort((a, b) => a - b);
 	const neighbors = new Map<number, { before: number | undefined; after: number | undefined }>();
@@ -78,7 +65,6 @@ function anchorNeighbors(anchorLines: Set<number>, lineCount: number): Map<numbe
 	return neighbors;
 }
 
-/** Every anchor maps, and a neighbour of its run maps with the same offset. */
 function validateContext(previous: string, current: string, lineMap: Map<number, number>, edits: readonly Edit[]): boolean {
 	const previousLines = previous.split("\n");
 	const currentLines = current.split("\n");
@@ -112,7 +98,6 @@ function validateContext(previous: string, current: string, lineMap: Map<number,
 	return true;
 }
 
-/** The edits with every anchor moved to its current line, and the (uniform) offset; undefined when that is not possible. */
 function remapEdits(previous: string, current: string, edits: readonly Edit[]): { edits: Edit[]; offset: number } | undefined {
 	const lineMap = buildLineMap(previous, current);
 	if (!validateContext(previous, current, lineMap, edits)) return undefined;
@@ -172,7 +157,6 @@ function identifies(line: string): boolean {
 	return charCount(line.trim()) >= KEPT_SHARE_MIN_CHARS;
 }
 
-/** How much of `window` the replacement `body` keeps (0..1); undefined when the comparison costs more than `budget.left`. */
 function keptShare(window: readonly string[], body: readonly string[], verbatim: Set<string>, budget: { left: number }): number | undefined {
 	const windowChars = window.reduce((sum, line) => sum + charCount(line.trim()), 0);
 	const bodyChars = body.reduce((sum, row) => sum + charCount(row), 0);
@@ -189,10 +173,6 @@ function keptShare(window: readonly string[], body: readonly string[], verbatim:
 	return total / window.length;
 }
 
-/**
- * Whether a shifted replacement reads as written for the CURRENT lines at its authored numbers
- * (numbers taken from an untagged view of the current file) rather than for the lines the remap moves it onto.
- */
 function aimedAtAuthoredLines(current: string, authored: readonly Edit[], offset: number): boolean {
 	const groups: { payload: string[]; start: number; end: number }[] = [];
 	let start = 0;
@@ -228,7 +208,6 @@ function aimedAtAuthoredLines(current: string, authored: readonly Edit[], offset
 	return false;
 }
 
-/** Rebase stale anchors from the retained snapshot `args.fileHash` onto the current text; undefined when that is not provably safe. */
 export function tryRecover(store: EditStore, args: RecoveryArgs): RecoveryResult | undefined {
 	const snapshot = store.byHash(args.path, args.fileHash);
 	if (!snapshot) return undefined;
@@ -236,7 +215,7 @@ export function tryRecover(store: EditStore, args: RecoveryArgs): RecoveryResult
 	const remapped = remapEdits(snapshot.text, args.currentText, args.edits);
 	if (!remapped) return undefined;
 	if (remapped.offset !== 0 && aimedAtAuthoredLines(args.currentText, args.edits, remapped.offset)) return undefined;
-	// Clipboard edits run on a copy, published only when recovery stands.
+	// Keep clipboard changes private until recovery succeeds.
 	const clipboard = args.clipboard && hasClipboardEdit(remapped.edits) ? forkClipboard(args.clipboard) : undefined;
 	let applied: ReturnType<typeof applyEdits>;
 	try {

@@ -1,9 +1,3 @@
-/**
- * Reference document applier, ported from oh-my-pi `native/apply.ts`: applies
- * TSP frames to a node tree the way the spec says the terminal does. Ops are
- * validated and applied one by one; a rejected op is reported and skipped.
- * Used by the `/tsp status` mirror and the test harness validator.
- */
 import { TSP_KINDS, TSP_TEXT_KINDS, type TspFrame, type TspKind, type TspNode, type TspOp } from "./wire.ts";
 
 export interface TspApplyError {
@@ -53,7 +47,6 @@ export class TspDocument {
 		return this.#index.has(id);
 	}
 
-	/** `x keep:true`: drop the live-only regions (`dock`, `layer`) and focus; `main` stays. */
 	close(): void {
 		for (const region of ["dock", "layer"]) {
 			const node = this.#index.get(region);
@@ -86,7 +79,6 @@ export class TspDocument {
 		return found ? this.#export(found) : undefined;
 	}
 
-	/** Every node id → kind, for validators. */
 	kinds(): Map<string, string> {
 		const out = new Map<string, string>();
 		for (const [id, node] of this.#index) out.set(id, node.k);

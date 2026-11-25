@@ -1,21 +1,3 @@
-/**
- * Native (TSP) backend: owns the inline surface, sends reconciled frames under
- * credit-based flow control, uploads image blobs, and routes terminal events
- * back to components. Ported (trimmed: no screen surfaces, no `q blobs`
- * query) from oh-my-pi `native/backend.ts`.
- *
- * Flow control: at most `credits` frames per surface are unacknowledged. A
- * render while blocked only marks the surface dirty; the next `ack` reconciles
- * once against the last sent state, so intermediate changes coalesce.
- *
- * Blobs: the bytes of every `image` node's `p.blob` (registered in
- * `shared/tsp-blobs.ts`) reach the terminal once per connection, as a `b`
- * message written right before the first frame that references the id. A new
- * connection (a new backend, `start`, `resume`, `takeOver`) resends instead of
- * asking which blobs the terminal kept; rsttyd ignores a `b` for an id it
- * already holds. Blobs are not frames: they take no credit and are never held
- * back by flow control (only sent alongside a frame that is).
- */
 import * as fs from "node:fs";
 import type { Component } from "@earendil-works/pi-tui";
 import { getTspBlob, type TspBlob } from "../shared/tsp-blobs.ts";
@@ -28,32 +10,23 @@ import { TSP_DEFAULT_APC_LIMIT, TSP_DEFAULT_CREDITS, type TspEvent, type TspFram
 
 export interface BackendHost {
 	write(data: string): void;
-	/** `main`/`dock`/`layer` content for this frame. */
 	regions(cx: DescribeContext): NativeRegions;
 	focused(): Component | null;
 	requestRender(): void;
-	/** The user clicked into a node described by `owners[0]` (then its containers): move keyboard focus. */
 	focusFromPointer(owners: readonly Component[]): void;
-	/** Current theme palette (without `sf`), or undefined when unknown. */
 	palette(): Omit<TspPalette, "sf"> | undefined;
-	/** Width in cells when the terminal didn't say. */
 	columns(): number;
-	/** Terminal-level events the backend doesn't route (theme, motion, visible, gone, unknown). */
 	onTerminalEvent?(event: TspEvent): void;
 	warn(message: string, data?: Record<string, unknown>): void;
-	/** Route a UI event to the component that described the node. */
 	dispatch(component: Component, event: NativeUiEvent, cx: DescribeContext): void;
 	resolver: Resolver;
 }
 
 export interface BackendOptions {
-	/** Keep a reference document and recent frames (debug). */
 	mirror?: boolean;
-	/** Append every TSP message to this JSONL file (defaults to `PI_TSP_RECORD`). */
 	recordPath?: string;
 	title?: string;
 	role?: string;
-	/** Throw inside render after this many frames (test hook: `PI_TSP_FAIL_BACKEND=<n>`). */
 	failAfterFrames?: number;
 }
 
@@ -101,8 +74,10 @@ export interface BackendStats {
 	mounted: number;
 	terminalErrors: string[];
 	bytesOut: number;
-	/** `b` messages written on this connection, and their decoded size. */
 	blobsSent: number;
+	/**
+	 * Blob size is measured before base64 encoding.
+	 */
 	blobBytes: number;
 	eventsIn: number;
 	lastEvent?: string;
@@ -137,9 +112,7 @@ export class NativeBackend {
 	#terminalErrors: string[] = [];
 	#recent: TspFrame[] = [];
 	#paletteSent: string | undefined;
-	/** Blob ids delivered on this connection; cleared whenever the terminal may no longer hold them. */
 	#blobsSent = new Set<string>();
-	/** Blob ids already warned about (unregistered or too large), so each warns once per backend. */
 	#blobsWarned = new Set<string>();
 	#blobCount = 0;
 	#blobBytes = 0;
@@ -201,7 +174,6 @@ export class NativeBackend {
 		};
 	}
 
-	/** Open the inline surface, send the palette (to a `program-palette` terminal only) and the first frame. */
 	start(): void {
 		if (this.#live) return;
 		this.#live = true;
@@ -212,27 +184,19 @@ export class NativeBackend {
 	}
 
 	/**
-	 * Adopt the surface another backend (an earlier extension instance) left
-	 * open: no `o`, the sequence continues from `seq`, and the first frame
-	 * rebuilds the regions in place.
+	 * The terminal expects the frame sequence to continue on an open surface.
 	 */
 	takeOver(seq: number): void {
 		if (this.#live) return;
 		this.#live = true;
 		this.#seq = seq;
 		this.#acked = seq;
-		// What the previous instance delivered is unknown here: the rebuilt regions resend their blobs.
 		this.#blobsSent.clear();
 		this.#reconciler.resetRegions();
 		this.#sendPalette(true);
 		this.render();
 	}
 
-	/**
-	 * Re-open a surface closed with `keep:true` (adopt): the terminal kept
-	 * `main`; the next frame re-adds `dock`/`layer`. A `gone` reply opens a
-	 * fresh surface instead.
-	 */
 	resume(hello: TspHello): void {
 		if (this.#live) return;
 		this.#hello = hello;
@@ -253,7 +217,6 @@ export class NativeBackend {
 		this.render();
 	}
 
-	/** Close the surface. `keep` leaves `main` in scrollback. */
 	stop(keep = true): void {
 		if (!this.#live) return;
 		this.#live = false;
@@ -263,7 +226,6 @@ export class NativeBackend {
 		this.#clearStallTimer();
 	}
 
-	/** Forget the surface without closing it (another backend takes it over). */
 	detach(): number {
 		this.#live = false;
 		this.#clearStallTimer();
@@ -276,7 +238,6 @@ export class NativeBackend {
 		this.#host.requestRender();
 	}
 
-	/** Reconcile and send a frame, unless the surface is out of credits. */
 	render(): void {
 		if (!this.#live) return;
 		this.#sendPalette(false);
@@ -298,11 +259,11 @@ export class NativeBackend {
 		if (this.#options.failAfterFrames !== undefined && this.#framesSent >= this.#options.failAfterFrames) {
 			throw new Error(`forced backend failure after ${this.#framesSent} frames (PI_TSP_FAIL_BACKEND)`);
 		}
+		// The terminal needs each blob before the first frame that references it.
 		this.#deliverBlobs(ops);
 		this.#sendFrame(ops);
 	}
 
-	/** Handle one complete `ESC _ tsp;…` input string. Returns false when it isn't TSP. */
 	handleInput(sequence: string): boolean {
 		const raw = splitTspMessage(sequence);
 		if (!raw) return false;
@@ -324,13 +285,8 @@ export class NativeBackend {
 		return this.#recent.slice(-count);
 	}
 
-	/**
-	 * The theme palette, verb `t`: a local extension (omp retired the verb in 1513e856d5), sent only to a terminal
-	 * whose hello lists the feature `program-palette` (rsttyd). Elsewhere span tokens resolve against the
-	 * terminal's own theme.
-	 */
 	#sendPalette(force: boolean): void {
-		// Asked for either way: building the palette also refreshes the span token map (session `#palette`).
+		// Refresh span tokens even when the terminal does not accept palettes.
 		const palette = this.#host.palette();
 		if (!this.#cx.feature("program-palette")) return;
 		if (!palette || (!palette.dark && !palette.light)) return;
@@ -384,12 +340,6 @@ export class NativeBackend {
 		this.#write("f", frame);
 	}
 
-	/**
-	 * Write a `b` for every blob `ops` reference that this connection hasn't
-	 * delivered yet, ahead of their frame. Nothing when the terminal doesn't
-	 * draw `image` nodes. An id missing from the registry is skipped (warned
-	 * once) and retried the next time an op references it.
-	 */
 	#deliverBlobs(ops: readonly TspOp[]): void {
 		if (!this.#cx.supports("image")) return;
 		let ids: Set<string> | undefined;
@@ -406,7 +356,6 @@ export class NativeBackend {
 				continue;
 			}
 			if (blob.bytes.byteLength > MAX_BLOB_BYTES) {
-				// The terminal would reject it after the whole body crossed the pty.
 				this.#blobsSent.add(id);
 				this.#warnBlob(id, "image blob too large for the terminal; not sent", { bytes: blob.bytes.byteLength, max: MAX_BLOB_BYTES });
 				continue;
@@ -418,7 +367,6 @@ export class NativeBackend {
 	#sendBlob(blob: TspBlob): void {
 		this.#blobsSent.add(blob.id);
 		const { params, body, encoded } = encodeTspBlob(blob, this.#limit);
-		// The full body, so a replay of the recording shows the image.
 		this.#record("out", "b", params, body);
 		this.#blobCount++;
 		this.#blobBytes += blob.bytes.byteLength;
@@ -496,7 +444,6 @@ export class NativeBackend {
 			}
 			case "error": {
 				const e = event as Extract<TspEvent, { ev: "error" }>;
-				// Errors for a surface this backend doesn't own (one we replaced after `gone`) are noise.
 				if (e.sf !== undefined && e.sf !== this.#surfaceId) return;
 				this.#terminalErrors.push(`s=${e.s ?? "?"} op=${e.op ?? "?"}: ${e.msg}`);
 				if (this.#terminalErrors.length > 20) this.#terminalErrors.splice(0, this.#terminalErrors.length - 20);

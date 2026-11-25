@@ -1,8 +1,3 @@
-/**
- * hashline/input.ts: split an edit tool `input` into `[path#TAG]` sections.
- * Port of oh-my-pi `crates/pi-edit/src/modes/hashline/input.rs` (MIT), without the headerless
- * streaming fallback.
- */
 import * as nodePath from "node:path";
 import { HL_FILE_HASH_EXAMPLES } from "./format.ts";
 import { ABORT_MARKER, BEGIN_PATCH_MARKER, CLIPBOARD_INTERLEAVED_SECTIONS, END_PATCH_MARKER, jsonQuote } from "./messages.ts";
@@ -13,17 +8,12 @@ import { HashlineError, type Parsed } from "./types.ts";
 const ENVELOPE_MARKERS = [BEGIN_PATCH_MARKER, END_PATCH_MARKER, ABORT_MARKER];
 const APPLY_PATCH_PATH_NOISE_RE = /^\*{0,3}\s*(?:(?:update|add|delete|move)[^A-Za-z0-9]*(?:file|to)?[^A-Za-z0-9]*:)?\s*\*{0,3}\s*/i;
 const RECOVERY_TAG_RE = /#([0-9A-Fa-f]{4})\s*$/;
-/** A stand-in where the tag belongs (`#AUTO`, `#????`, `#0`, a bare `#`). */
 const PLACEHOLDER_TAG_RE = /#[^\s#./\\:[\]]{0,16}\s*$/;
 
-/** One target file's section: the header's path and tag, and the rows under it. */
 export interface PatchSection {
 	path: string;
-	/** Uppercase 4-hex tag; undefined when the header had none (or a placeholder). */
 	fileHash: string | undefined;
-	/** The body rows joined with `\n`. */
 	diff: string;
-	/** Same-path sections were separated by another file's section. */
 	interleaved: boolean;
 }
 
@@ -38,7 +28,6 @@ function unquote(path: string): string {
 	return path;
 }
 
-/** Clean a header / MV path: quotes and apply_patch noise removed; an absolute path under `cwd` becomes relative. */
 export function normalizeHashlinePath(raw: string, cwd: string | undefined): string {
 	const cleaned = unquote(raw.trim()).replace(APPLY_PATCH_PATH_NOISE_RE, "");
 	if (cwd === undefined || !nodePath.isAbsolute(cleaned)) return cleaned;
@@ -48,10 +37,6 @@ export function normalizeHashlinePath(raw: string, cwd: string | undefined): str
 	return relative.split(nodePath.sep).join("/");
 }
 
-/**
- * Unwrap leading bracketed envelope markers: `[*** Begin Patch] [a.ts#1A2B]` gives `[a.ts#1A2B]`,
- * `[*** End Patch]` gives `*** End Patch`. Other rows come back unchanged.
- */
 function unbracketEnvelopeMarkers(line: string): string {
 	let rest = line;
 	for (;;) {
@@ -90,7 +75,6 @@ function recoverHeader(line: string, cwd: string | undefined): RawSection | unde
 	return path === "" ? undefined : { path, fileHash, diff: "", interleaved: false, placeholder };
 }
 
-/** A row starting with `[` as a section header; undefined for other rows; throws for a malformed header. */
 function parseHeaderLine(line: string, cwd: string | undefined): RawSection | undefined {
 	const trimmed = unbracketEnvelopeMarkers(line.trimEnd());
 	if (!trimmed.startsWith("[")) return undefined;
@@ -194,15 +178,10 @@ function mergeSamePathSections(sections: RawSection[]): RawSection[] {
 	return result;
 }
 
-/**
- * Split `input` into sections, one per target path (same-path sections are merged into the first).
- * A header with no ops under it yields no section. Throws HashlineError("parse").
- */
 export function splitSections(input: string, cwd?: string): PatchSection[] {
 	return mergeSamePathSections(splitRawSections(input, cwd)).map(({ path, fileHash, diff, interleaved }) => ({ path, fileHash, diff, interleaved }));
 }
 
-/** Parse a section's body. Throws HashlineError("parse"). */
 export function parseSection(section: PatchSection): Parsed {
 	const parsed = parsePatch(section.diff);
 	if (section.interleaved && hasClipboardEdit(parsed.edits)) throw new HashlineError("parse", CLIPBOARD_INTERLEAVED_SECTIONS);
@@ -210,7 +189,6 @@ export function parseSection(section: PatchSection): Parsed {
 	return parsed;
 }
 
-/** The path of the first header row, for input whose headers carry no ops. */
 export function firstHeaderPath(input: string, cwd?: string): string | undefined {
 	const text = input.startsWith("\uFEFF") ? input.slice(1) : input;
 	for (const line of text.split("\n")) {
@@ -218,7 +196,7 @@ export function firstHeaderPath(input: string, cwd?: string): string | undefined
 			const header = parseHeaderLine(unbracketEnvelopeMarkers(line.replace(/\r$/, "").trimEnd()), cwd);
 			if (header) return header.path;
 		} catch {
-			// A malformed header row names no path.
+			// Patch validation handles malformed headers.
 		}
 	}
 	return undefined;

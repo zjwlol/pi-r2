@@ -1,22 +1,3 @@
-/**
- * TUI rendering in the style of oh-my-pi's task card (tui/src/tools/task.ts + agent-tree.ts):
- *   ⇶ Task · 3 agents
- *   ⠹ SwiftFalcon ⟨scout⟩ claude-opus-4-5:medium · 3 tools · 2 req · 1.2%/200k · $0.02 · 5.2s
- *     ↳ read: src/foo.ts
- *   ✓ CalmPanda [isolated] {} claude-opus-4-5 · 12 tools · 8 req · 3.4%/200k · $0.10 · 42.1s
- *     ↳ merged 3 files
- *     ↳ waiting for 1 subagent
- *     ├─ ✓ BoldOtter ⟨scout⟩ claude-opus-4-5 · 4 tools · 2 req · 8.0s
- *     └─ ⠹ KeenLynx ⟨scout⟩ claude-opus-4-5 · 1 tool · 1 req · 3.0s
- *          ↳ grep: TODO
- *   [1 succeeded · 1 running · 2 nested · 13 req · 42.1s]
- * A succeeded agent whose worktree merge failed draws `⚠` (row and card header) and counts as `N merge failed`.
- *
- * Everything here renders from immutable snapshots, so a component never changes its output unless
- * the owner rebuilds it (important for pi's main-screen TUI, where changing lines that scrolled
- * above the viewport forces a full redraw).
- */
-
 import * as os from "node:os";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
@@ -33,7 +14,6 @@ import {
 import { formatStructuredData } from "./structured.ts";
 
 export const COLLAPSED_AGENT_LIMIT = 4;
-/** Nested subagents shown per level when collapsed (the rest fold into "… N more"). */
 export const COLLAPSED_NESTED_LIMIT = 3;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SEP = " · ";
@@ -44,7 +24,6 @@ export interface RowSnapshot {
 	id: string;
 	agent: string;
 	status: RowStatus;
-	/** pending + waiting for a run permit (vs. still starting up). */
 	queued?: boolean;
 	index: number;
 	model?: string;
@@ -60,26 +39,18 @@ export interface RowSnapshot {
 	task: string;
 	output?: string;
 	error?: string;
-	/** Nested subagents (spawned by this agent), in spawn order. */
 	children?: RowSnapshot[];
-	/** Turn ended while subagents run: number of active subagents it is waiting for. */
 	waiting?: number;
-	/** Runs in its own worktree. */
 	isolated?: boolean;
-	/** Has an output schema (result via `yield`). */
 	structured?: boolean;
-	/** Worktree merge outcome of its latest settled run. */
 	merge?: MergeInfo;
-	/** Latest validated structured result (expanded rows); `hasData` distinguishes a null payload. */
 	data?: unknown;
 	hasData?: boolean;
-	/** Hub-side work in progress (e.g. merging worktree changes). */
 	phase?: string;
 	completionPercent?: number;
 	stage?: string;
 }
 
-/** Persisted per-item spawn info (tool result details), used when live state is gone (reload/resume). */
 export interface SpawnedItem {
 	id: string;
 	agent: string;
@@ -98,10 +69,8 @@ export interface TaskDetails {
 	startedAt: number;
 }
 
-/** Fixed-content component: lines are built once per width and never change on their own. */
 export class LinesComponent implements Component {
 	private cache?: { width: number; lines: string[] };
-	/** Called with every rendered frame's lines (used for on-screen probing). */
 	onRender?: (lines: string[]) => void;
 
 	constructor(private readonly build: (width: number) => string[]) {}
@@ -119,9 +88,6 @@ export class LinesComponent implements Component {
 
 export const EMPTY_COMPONENT: Component = { render: () => [], invalidate: () => {} };
 
-// ---------------------------------------------------------------------------------------------
-// Formatting helpers
-
 export function fmtTokens(n: number): string {
 	if (n < 1000) return `${n}`;
 	if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
@@ -131,7 +97,6 @@ export function fmtTokens(n: number): string {
 export function shortModel(label: string | undefined): string {
 	if (!label) return "";
 	let id = label.split("/").pop() ?? label;
-	// Bedrock-style ids: "us.anthropic.claude-opus-4-5" -> "claude-opus-4-5"
 	id = id.replace(/^(?:(?:us|eu|apac|global|jp|au|ca)\.)?(?:anthropic|amazon|meta|mistral|cohere|deepseek|openai|qwen|google|writer)\./, "");
 	return id.length > 28 ? `${id.slice(0, 27)}…` : id;
 }
@@ -143,14 +108,12 @@ function modelBadge(row: Pick<RowSnapshot, "model" | "thinking">, theme: Theme):
 	return ` ${theme.fg("muted", `${m}${t}`)}`;
 }
 
-/** Dim `⟨agent⟩` badge for a non-default agent type; empty for the generic `task` worker. */
 export function agentBadge(agent: string | undefined, theme: Theme): string {
 	const a = agent?.trim();
 	if (!a || a === DEFAULT_AGENT) return "";
 	return ` ${theme.fg("dim", `⟨${a}⟩`)}`;
 }
 
-/** ` [isolated]` / ` {}` badges (worktree isolation, structured output). */
 export function featureBadges(row: { isolated?: boolean; structured?: boolean }, theme: Theme): string {
 	let out = "";
 	if (row.isolated) out += ` ${theme.fg("muted", "[isolated]")}`;
@@ -163,7 +126,6 @@ function tildify(p: string): string {
 	return home && p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p;
 }
 
-/** Parts of the merge line of a settled isolated row: `merged 3 files` / `⚠ merge conflict — patch: <path>` / … */
 export function mergeParts(merge: MergeInfo | undefined): { color: "success" | "dim" | "warning" | "error"; label: string; path?: string } | undefined {
 	if (!merge) return undefined;
 	const n = merge.files.length;
@@ -186,12 +148,10 @@ export function mergeParts(merge: MergeInfo | undefined): { color: "success" | "
 	}
 }
 
-/** A merge failure is a warning: the agent's work succeeded, only folding its worktree back did not. */
 export function mergeFailed(row: Pick<RowSnapshot, "status" | "merge">): boolean {
 	return row.status === "idle" && (row.merge?.status === "conflict" || row.merge?.status === "error" || row.merge?.status === "unapplied");
 }
 
-/** Merge line (+ the path on a continuation line, tail kept, when it does not fit). */
 function mergeLine(row: RowSnapshot, indent: string, theme: Theme, width: number): string[] {
 	if (row.status === "running" || row.status === "pending") return [];
 	const p = mergeParts(row.merge);
@@ -206,7 +166,6 @@ function mergeLine(row: RowSnapshot, indent: string, theme: Theme, width: number
 	return [clip(head, width), clip(`${cont}${theme.fg("dim", shown)}`, width)];
 }
 
-/** Expanded "Data" (pretty JSON, capped) or "Output" section of a row. */
 function resultSection(row: RowSnapshot, indent: string, width: number, theme: Theme, max: number): string[] {
 	if (row.hasData) return sectionLines("Data", formatStructuredData(row.data, 4000), indent, width, theme, max);
 	if (row.output === undefined) return [];
@@ -233,18 +192,12 @@ export function statusIcon(status: RowStatus, theme: Theme, frame = 0): string {
 	}
 }
 
-/** Spend of the nested subagents below `row` (all depths), excluding the row itself. */
 export function nestedCostOf(row: Pick<RowSnapshot, "children">): number {
 	let sum = 0;
 	for (const c of row.children ?? []) sum += c.cost + nestedCostOf(c);
 	return sum;
 }
 
-/**
- * `N tools · N req · ctx · $cost` (agent-tree.ts formatAgentStatRun). `$cost` is the agent's own spend; an
- * agent with nested subagents shows theirs as `(+x.xx)` (OMP status-line style), so a row never hides
- * what its subtree cost.
- */
 export function statRun(
 	s: Pick<RowSnapshot, "toolCount" | "requests" | "contextTokens" | "contextWindow" | "cost"> & Partial<Pick<RowSnapshot, "children">>,
 	theme: Theme,
@@ -290,7 +243,6 @@ function flat(text: string): string {
 	return text.replace(/\t/g, "  ").replace(/\s+/g, " ").trim();
 }
 
-/** One agent row: icon (`⚠` for a succeeded agent whose merge failed), bold Name, ⟨agent⟩, model badge, status badge, stats, duration. */
 export function formatRow(row: RowSnapshot, theme: Theme, width: number, frame: number, opts: { model?: boolean } = {}): string {
 	const live = row.status === "running" || row.status === "pending";
 	const warn = mergeFailed(row);
@@ -310,13 +262,11 @@ export function formatRow(row: RowSnapshot, theme: Theme, width: number, frame: 
 	return clip(line, width);
 }
 
-/** `↳ tool: args` (current tool, else most recent tool / text) for running rows; error for failed rows. */
 export function activityText(row: RowSnapshot, theme: Theme): string | undefined {
 	if (row.status === "failed" && row.error) return theme.fg("error", flat(row.error));
 	if (row.status !== "running") return undefined;
 	if (row.phase) return theme.fg("muted", row.phase);
 	if (row.waiting) return theme.fg("muted", `waiting for ${row.waiting} subagent${row.waiting === 1 ? "" : "s"}`);
-	// Resuming after its subagents reported back, but every run slot at its level is taken.
 	if (row.queued) return theme.fg("muted", "queued for a run slot");
 	if (row.tool) {
 		let t = theme.fg(row.tool.running ? "muted" : "dim", row.tool.name);
@@ -344,16 +294,12 @@ function sectionLines(label: string, text: string, indent: string, width: number
 	return out;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Snapshots
-
 function countActive(c: Child): number {
 	let n = 0;
 	for (const o of c.owned) n += (o.status === "running" || o.status === "pending" ? 1 : 0) + countActive(o);
 	return n;
 }
 
-/** Live row of `c`, including its nested subagents (recursively). */
 export function snapshotChild(c: Child, index: number, now: number, withOutput: boolean): RowSnapshot {
 	const percent = completionPercent(c);
 	let tool: RowSnapshot["tool"];
@@ -395,7 +341,6 @@ export function snapshotChild(c: Child, index: number, now: number, withOutput: 
 	};
 }
 
-/** Row of a persisted subagent summary (delivered result cards). */
 export function snapshotSummary(s: SubagentSummary, index: number): RowSnapshot {
 	return {
 		id: s.id,
@@ -418,7 +363,6 @@ export function snapshotSummary(s: SubagentSummary, index: number): RowSnapshot 
 	};
 }
 
-/** Every row below `row`. */
 export function nestedRows(row: RowSnapshot, out: RowSnapshot[] = []): RowSnapshot[] {
 	for (const c of row.children ?? []) {
 		out.push(c);
@@ -429,11 +373,6 @@ export function nestedRows(row: RowSnapshot, out: RowSnapshot[] = []): RowSnapsh
 
 const TREE = { branch: "├─ ", last: "└─ ", vertical: "│  ", blank: "   " };
 
-/**
- * Nested subagents of a row as a tree (OMP renderNestedTaskTree): `indent` is the parent row's
- * continuation prefix. Same row format as top-level rows; collapsed shows the last
- * COLLAPSED_NESTED_LIMIT per level (live rows last) with a "… N more" line.
- */
 export function nestedTreeLines(
 	children: RowSnapshot[] | undefined,
 	indent: string,
@@ -523,7 +462,6 @@ export interface CardSnapshot {
 	fallbackText?: string;
 }
 
-/** Finished rows first (by runtime), then live rows in dispatch order — rows never reshuffle once settled. */
 function orderRows(rows: RowSnapshot[]): RowSnapshot[] {
 	const finished = rows.filter((r) => r.status !== "running" && r.status !== "pending" && r.status !== "detached");
 	const rest = rows.filter((r) => !finished.includes(r));
@@ -548,7 +486,6 @@ export function headerLine(count: number, state: "running" | "success" | "warnin
 }
 
 function contextLines(context: string | undefined, width: number, expanded: boolean, theme: Theme): string[] {
-	// Raw call arguments: a double-encoded context is shown decoded (as the agents receive it).
 	const text = typeof context === "string" ? repairDoubleEncodedJsonString(context).trim() : undefined;
 	if (!text) return [];
 	const lines = text.split("\n");
@@ -632,7 +569,6 @@ export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, exp
 		if (nested.length) parts.push(theme.fg("dim", `${nested.length} nested`));
 		const req = [...s.rows, ...nested].reduce((n, r) => n + r.requests, 0);
 		if (req) parts.push(theme.fg("dim", `${req} req`));
-		// Everything the call spent (top-level agents + their subtrees); the same amount pi adds to the footer total.
 		const total = [...s.rows, ...nested].reduce((n, r) => n + r.cost, 0);
 		if (total > 0 && s.rows.length + nested.length > 1) parts.push(theme.fg("warning", `$${total.toFixed(2)} total`));
 		if (!detached) parts.push(theme.fg("dim", fmtDuration(s.wallMs)));
@@ -641,7 +577,6 @@ export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, exp
 	return lines;
 }
 
-/** Streaming call preview: header, context, one `• Name: first line ⟨agent⟩` per item (cap 4). */
 export function buildCallLines(args: any, theme: Theme, width: number, expanded: boolean): string[] {
 	const items: any[] = Array.isArray(args?.tasks)
 		? args.tasks.filter((t: unknown) => t && typeof t === "object")
@@ -670,10 +605,6 @@ export function buildCallLines(args: any, theme: Theme, width: number, expanded:
 	return lines;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Delivered result message
-
-/** Accepts current DoneInfo and the legacy `subagent-result` shape ({ childId, stats }). */
 export function buildResultMessageLines(d: Partial<DoneInfo> & { childId?: string; stats?: string }, theme: Theme, width: number, expanded: boolean, hint: string): string[] {
 	const status: RowStatus = d.status === "completed" ? "idle" : d.status === "failed" ? "failed" : d.status === "aborted" ? "aborted" : "detached";
 	const row: RowSnapshot = {
@@ -693,7 +624,6 @@ export function buildResultMessageLines(d: Partial<DoneInfo> & { childId?: strin
 		isolated: d.isolated,
 		structured: d.structured,
 		merge: d.merge,
-		// Its subagents as they were when it settled (all settled by then); also makes the row's `(+nested)` cost visible.
 		children: d.subagents?.length ? d.subagents.map(snapshotSummary) : undefined,
 	};
 	let head = formatRow(row, theme, Number.POSITIVE_INFINITY, 0);
@@ -703,7 +633,7 @@ export function buildResultMessageLines(d: Partial<DoneInfo> & { childId?: strin
 	if (d.status === "failed" && d.error && d.output?.trim()) lines.push(clip(`  ${theme.fg("error", flat(d.error))}`, width));
 	lines.push(...mergeLine(row, "  ", theme, width));
 	lines.push(...nestedTreeLines(row.children, "  ", theme, width, 0, expanded, { activity: false }));
-	if (expanded) return lines; // caller renders the full body as Markdown
+	if (expanded) return lines;
 	const body =
 		d.data !== undefined
 			? formatStructuredData(d.data, 2000)

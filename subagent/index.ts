@@ -26,7 +26,7 @@
  * UI:
  *   live task card (updates while its agents run and the card is on screen; nested subagents as a
  *   tree under their owner), delivered-result cards, and a bottom widget for running agents whose
- *   card is off screen.
+ *   row is not visible in ANSI. The native dock lists running agents regardless of scrolling.
  *   Native (TSP) terminals (tsp-native): the same cards, messages and widget as data-first `tool` /
  *   `agent` nodes via describe hooks (native.ts).
  */
@@ -35,24 +35,27 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
+	getAgentDir,
 	getMarkdownTheme,
 	keyHint,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Box, type Component, Markdown, stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, type Component, Markdown, stripTerminalSequences, truncateToWidth, type TuiAltScreen, type TuiMainScreen } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { registerEditorChipProvider } from "../shared/editor-chips.ts";
 import { DEFAULT_AGENT, discoverAgents, unrestrictedPolicy } from "./agents.ts";
+import { readConfig, writeConfig } from "./config.ts";
 import { createFeatureHooks } from "./features.ts";
 import {
 	AgentHub,
-	descendants,
+	type Child,
+	completionPercent,
 	describeChild,
 	describeProgress,
 	describeTree,
 	firstLine,
 	formatParentEvent,
 	IRC_MESSAGE_TYPE,
-	isActive,
 	latestOutput,
 	MAX_DEPTH,
 	PARENT_ID,
@@ -65,6 +68,7 @@ import {
 import { removeAllWorktrees } from "./isolation.ts";
 import {
 	createMentionAutocomplete,
+	createMentionChipProvider,
 	findMentions,
 	MENTION_NOTICE_TYPE,
 	type MentionSource,
@@ -94,6 +98,7 @@ import {
 	snapshotChild,
 	snapshotDetached,
 	type TaskDetails,
+	widgetAgents,
 } from "./render.ts";
 import { formatStructuredData } from "./structured.ts";
 import { createHubKeyHandler, type InspectorOpenOptions, openInspector } from "./inspector.ts";
@@ -103,7 +108,9 @@ import {
 	jsonCopy,
 	type NativeComponentContext,
 	type NativeNode,
+	type NativeUiEvent,
 	persistRow,
+	WIDGET_TOGGLE_ACTION,
 	withNativeDescribe,
 } from "./native.ts";
 
@@ -137,17 +144,19 @@ interface ScreenView {
 	free: boolean;
 }
 
-function readScreen(tui: any): ScreenView | undefined {
+type ScreenTui = TuiMainScreen | TuiAltScreen;
+
+function readScreen(tui: ScreenTui | undefined): ScreenView | undefined {
 	try {
 		if (tui?.mode === "fullscreen" && typeof tui.getScreenLines === "function") {
-			return { lines: (tui.getScreenLines() as string[]).map(stripTerminalSequences), free: true };
+			return { lines: tui.getScreenLines().map(stripTerminalSequences), free: true };
 		}
 		if (tui?.mode === "regular" && typeof tui.captureRenderState === "function") {
 			const s = tui.captureRenderState();
 			if (Array.isArray(s?.previousLines)) {
 				const rows = tui.terminal?.rows ?? 24;
 				const top = typeof s.previousViewportTop === "number" ? s.previousViewportTop : Math.max(0, s.previousLines.length - rows);
-				return { lines: (s.previousLines as string[]).slice(top).map(stripTerminalSequences), free: false };
+				return { lines: s.previousLines.slice(top).map(stripTerminalSequences), free: false };
 			}
 		}
 	} catch {}
@@ -172,14 +181,19 @@ interface LiveCard {
 	invalidate: () => void;
 	sig?: string[];
 	visible: boolean;
+	foldedIds?: ReadonlySet<string>;
 }
 
 export default function (pi: ExtensionAPI) {
 	const hub = new AgentHub(pi);
 	hub.hooks = createFeatureHooks(hub);
-	let tuiRef: any;
+	let tuiRef: ScreenTui | undefined;
+	let inNativeView = false;
 	let uiActive = false;
 	let mentionSource: MentionSource | undefined;
+	/** Resolved `^model` tags show as chips in the prompt editor (drawn by magic-keywords' editor, if loaded). */
+	const mentionChipProvider = createMentionChipProvider(() => mentionSource);
+	let offMentionChips: (() => void) | undefined;
 	let frame = 0;
 	const cards = new Map<string, LiveCard>();
 	let ticker: NodeJS.Timeout | undefined;
@@ -189,6 +203,8 @@ export default function (pi: ExtensionAPI) {
 	/** Bumped on every hub change: native (TSP) views of live agents rebuild when it moves (native.ts). */
 	let hubVersion = 0;
 	const native = createNativeUI({ hub, version: () => hubVersion, widgetRows: WIDGET_MAX_ROWS });
+	const agentDir = getAgentDir();
+	let widgetCollapsed = false;
 
 	/** Show the agent inspector (one at a time). */
 	const showInspector = async (ui: ExtensionContext["ui"], opts: InspectorOpenOptions = {}) => {
@@ -255,25 +271,30 @@ export default function (pi: ExtensionAPI) {
 
 	/** Agents drawn by a visible live card: its agents and their nested subagents. */
 	const coveredByVisibleCard = (): Set<string> => {
-		const s = new Set<string>();
-		for (const c of cards.values()) {
-			if (!c.visible) continue;
-			for (const id of c.ids) {
-				s.add(id);
-				const child = hub.children.get(id);
-				if (child) for (const d of descendants(child)) s.add(d.id);
+		const covered = new Set<string>();
+		const visit = (c: Child, foldedIds?: ReadonlySet<string>) => {
+			if (foldedIds?.has(c.id)) return;
+			covered.add(c.id);
+			for (const child of c.owned) visit(child, foldedIds);
+		};
+		for (const card of cards.values()) {
+			if (!card.visible) continue;
+			for (const id of card.ids) {
+				const c = hub.children.get(id);
+				if (c) visit(c, card.foldedIds);
 			}
 		}
-		return s;
+
+		return covered;
 	};
 
 	const tick = () => {
 		frame++;
-		const view = readScreen(tuiRef);
+		const view = cards.size && !inNativeView ? readScreen(tuiRef) : undefined;
 		for (const [key, card] of cards) {
 			const live = card.ids.some((id) => subtreeActive(hub.children.get(id)));
 			// No signature yet = registered but not drawn yet (it is at the bottom): keep the optimistic default.
-			if (card.sig) card.visible = view ? onScreen(view.lines, card.sig) : false;
+			if (card.sig && !inNativeView) card.visible = view ? onScreen(view.lines, card.sig) : false;
 			if (!view || view.free || card.visible) {
 				try {
 					card.invalidate(); // re-runs renderResult, which re-registers (or drops) the card
@@ -281,16 +302,13 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!live) cards.delete(key);
 		}
-		if (hub.hasActive()) {
-			try {
-				tuiRef?.requestRender?.(); // keep the widget's spinner/durations fresh
-			} catch {}
-		} else if (cards.size === 0) {
-			stopTicker();
-		}
+		try {
+			tuiRef?.requestRender?.(); // keep the widget's spinner/durations fresh
+		} catch {}
+		if (!hub.hasActive() && cards.size === 0) stopTicker();
 	};
 	const startTicker = () => {
-		if (!uiActive || ticker) return;
+		if (!uiActive || ticker || inNativeView) return;
 		ticker = setInterval(tick, TICK_MS);
 		ticker.unref?.();
 	};
@@ -306,32 +324,54 @@ export default function (pi: ExtensionAPI) {
 			soon = setTimeout(() => {
 				soon = undefined;
 				tick();
-				// Native (TSP) rendering re-describes on every render (the hooks read live hub state), but tick only
-				// repaints while agents are active or ANSI cards are live: also paint the settled state.
-				if (native.used()) {
-					try {
-						tuiRef?.requestRender?.();
-					} catch {}
-				}
 			}, 40);
 			soon.unref?.();
 		}
 	});
 
-	// ---------- bottom widget: running agents whose card is not on screen ----------
-	const widget = (theme: Theme): Component & { describe(cx: NativeComponentContext): NativeNode | null } => ({
+	// ---------- bottom widget: running agents not visible in ANSI, all running agents in native mode ----------
+	const setWidgetCollapsed = (collapsed: boolean, ui: ExtensionContext["ui"]) => {
+		try {
+			writeConfig(agentDir, { widgetCollapsed: collapsed });
+		} catch (error) {
+			ui.notify(`Could not save the subagent widget setting: ${error}`, "warning");
+			return false;
+		}
+
+		widgetCollapsed = collapsed;
+		tuiRef?.requestRender();
+
+		return true;
+	};
+
+	const widget = (
+		theme: Theme,
+		ui: ExtensionContext["ui"],
+	): Component & { describe(cx: NativeComponentContext): NativeNode | null; handleNativeEvent(event: NativeUiEvent): void } => ({
 		invalidate: () => {},
-		// Native (TSP) terminals: agent rows for agents no natively described live task card shows (native.ts).
-		describe: (cx: NativeComponentContext) => native.describeWidget(cx),
-		render: (width: number) => {
-			const covered = coveredByVisibleCard();
+		describe: (cx) => {
+			const node = native.describeWidget(cx, widgetCollapsed);
+			if (node && !inNativeView) {
+				inNativeView = true;
+				stopTicker();
+			}
+
+			return node;
+		},
+		handleNativeEvent: (event) => {
+			if (event.type === "action" && event.act === WIDGET_TOGGLE_ACTION) setWidgetCollapsed(!widgetCollapsed, ui);
+		},
+		render: (width) => {
+			if (inNativeView) {
+				inNativeView = false;
+				if (hub.hasActive()) startTicker();
+			}
+			const agents = widgetAgents(hub, WIDGET_MAX_ROWS, widgetCollapsed, coveredByVisibleCard);
+			if (!agents) return [];
+
 			const now = Date.now();
-			// Tree order, so nested agents follow their owner (indented); every depth counts.
-			const list = hub.tree();
-			const rows = list.filter((c) => isActive(c) && !covered.has(c.id));
-			if (rows.length === 0) return [];
 			const out: string[] = [];
-			for (const c of rows.slice(0, WIDGET_MAX_ROWS)) {
+			for (const c of agents.rows) {
 				const snap = snapshotChild(c, 0, now, false);
 				let line = formatRow(snap, theme, Number.POSITIVE_INFINITY, frame, { model: false });
 				if (c.depth > 1) line = `${theme.fg("dim", `${"  ".repeat(c.depth - 2)}└─`)} ${line}`;
@@ -339,16 +379,14 @@ export default function (pi: ExtensionAPI) {
 				if (act) line += ` ${theme.fg("dim", "↳")} ${act}`;
 				out.push(truncateToWidth(` ${line}`, width, "…"));
 			}
-			const more = rows.length - WIDGET_MAX_ROWS;
-			const idle = list.filter((c) => c.status === "idle").length;
-			const tail = [more > 0 ? `… ${more} more running` : "", idle ? `${idle} idle` : "", "ctrl+s or /agents to inspect"].filter(Boolean);
-			out.push(truncateToWidth(` ${theme.fg("dim", tail.join(" · "))}`, width, "…"));
+			out.push(truncateToWidth(` ${theme.fg("dim", agents.tail)}`, width, "…"));
 			return out;
 		},
 	});
 
 	pi.on("session_start", async (_e, ctx) => {
-		uiActive = ctx.hasUI;
+		widgetCollapsed = readConfig(agentDir, (message) => ctx.ui.notify(message, "warning")).widgetCollapsed;
+		uiActive = ctx.hasUI && ctx.mode === "tui";
 		// `^model` mentions: the source reads the live ctx on every use (models can refresh).
 		mentionSource = {
 			models: () => {
@@ -362,6 +400,8 @@ export default function (pi: ExtensionAPI) {
 			try {
 				ctx.ui.addAutocompleteProvider((current) => createMentionAutocomplete(current, () => mentionSource));
 			} catch {}
+			offMentionChips?.();
+			offMentionChips = registerEditorChipProvider("subagent.mentions", mentionChipProvider);
 			void seedMentionHistory().catch(() => {});
 			// Agent inspector: ctrl+s / alt+a, or a deliberate ←← on an empty editor (inspector.ts).
 			try {
@@ -379,14 +419,16 @@ export default function (pi: ExtensionAPI) {
 		}
 		try {
 			ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
-				tuiRef = tui;
-				return widget(theme);
+				tuiRef = tui as ScreenTui;
+				return widget(theme, ctx.ui);
 			});
 		} catch {}
 	});
 
 	pi.on("session_shutdown", async (_e, ctx) => {
 		mentionSource = undefined;
+		offMentionChips?.();
+		offMentionChips = undefined;
 		try {
 			offHubKeys?.();
 		} catch {}
@@ -395,6 +437,7 @@ export default function (pi: ExtensionAPI) {
 		if (soon) clearTimeout(soon);
 		soon = undefined;
 		cards.clear();
+		inNativeView = false;
 		uiActive = false;
 		tuiRef = undefined;
 		// Each isolated agent saves unmerged changes as a patch and removes its worktree (or keeps and
@@ -580,14 +623,16 @@ export default function (pi: ExtensionAPI) {
 				return new LinesComponent((width) => buildCardLines(snap, theme, width, expanded));
 			}
 			const snap = cardSnapshot(details, args?.context, expanded, context.isError);
-			const component = new LinesComponent((width) => buildCardLines(snap, theme, width, expanded));
 			const live = details.hub === hub.instanceId && details.ids.some((id) => subtreeActive(hub.children.get(id)));
+			const foldedIds = live && uiActive ? new Set<string>() : undefined;
+			const component = new LinesComponent((width) => buildCardLines(snap, theme, width, expanded, foldedIds));
 			if (live && uiActive) {
 				const prev = cards.get(context.toolCallId);
-				const card: LiveCard = { ids: details.ids, invalidate: context.invalidate, visible: prev?.visible ?? true, sig: prev?.sig };
+				const card: LiveCard = { ids: details.ids, invalidate: context.invalidate, visible: prev?.visible ?? true, sig: prev?.sig, foldedIds: prev?.foldedIds };
 				component.onRender = (lines) => {
 					// Blank lines stay in (they match any row) so the consecutive-line match stays aligned.
 					card.sig = lines.map((l) => stripTerminalSequences(l).trim());
+					card.foldedIds = foldedIds;
 				};
 				cards.set(context.toolCallId, card);
 				startTicker();
@@ -700,6 +745,15 @@ export default function (pi: ExtensionAPI) {
 						const ev = await hub.waitForParent(filter, timeout, signal ? AbortSignal.any([signal, interrupt.signal]) : interrupt.signal);
 						const active = ev ? [] : hub.active();
 						const running = active.map((c) => c.id);
+						let runningLabels: string[] | undefined;
+						for (let i = 0; i < active.length; i++) {
+							const c = active[i]!;
+							const percent = completionPercent(c);
+							if (percent !== undefined) {
+								runningLabels ??= [...running];
+								runningLabels[i] = `${c.id} (${percent}%${c.probe?.stage ? `: ${c.probe.stage}` : ""})`;
+							}
+						}
 						const now = Date.now();
 						// One progress row per still-active agent, so a looping one or one near its context limit shows.
 						const text = ev
@@ -710,7 +764,7 @@ export default function (pi: ExtensionAPI) {
 						// The delivered event (JSON copy) for the native view; older sessions fall back to the text.
 						const details: IrcDetails = ev
 							? { op: "wait", event: jsonCopy(ev), interrupted: interruptedBy }
-							: { op: "wait", timedOut: true, running, interrupted: interruptedBy };
+							: { op: "wait", timedOut: true, running, runningLabels, interrupted: interruptedBy };
 						return textResult(interruptedBy ? `${text}\n\n${userInputText(interruptedBy, false)}` : text, details);
 					} catch (e) {
 						if (interruptedBy && !signal?.aborted) return textResult(userInputText(interruptedBy, true), { op: "wait", interrupted: interruptedBy } satisfies IrcDetails);
@@ -835,11 +889,30 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	const agentsCompletions = (prefix: string) => {
+		const items = idCompletions(prefix) ?? [];
+		const action = widgetCollapsed ? "expand" : "collapse";
+		const value = action.startsWith(prefix) && !hub.children.has(action) ? action : `widget ${action}`;
+		if (value.startsWith(prefix)) items.push({ value, label: value, description: `${action} the list of running agents` });
+
+		return items.length ? items : null;
+	};
+
 	pi.registerCommand("agents", {
-		description: "Agent inspector: live roster and transcripts of task subagents; message or kill them (/agents <id> opens one)",
-		getArgumentCompletions: idCompletions,
+		description: "Inspect, message or kill subagents with /agents [id]. Use /agents widget collapse or /agents widget expand to change the list of running agents.",
+		getArgumentCompletions: agentsCompletions,
 		handler: async (args, ctx: ExtensionContext) => {
-			const id = args.trim().split(/\s+/)[0] ?? "";
+			const name = args.trim();
+			const widgetAction = name.replace(/^widget\s+/, "");
+			if ((widgetAction === "collapse" || widgetAction === "expand") && !hub.children.has(name)) {
+				const collapsed = widgetAction === "collapse";
+				if (setWidgetCollapsed(collapsed, ctx.ui)) {
+					ctx.ui.notify(collapsed ? "The list of running agents is collapsed." : "The list of running agents is expanded.", "info");
+				}
+				return;
+			}
+
+			const id = name.split(/\s+/)[0] ?? "";
 			if (id && !hub.children.has(id)) {
 				ctx.ui.notify(`Unknown agent "${id}". Known: ${[...hub.children.keys()].join(", ") || "none"}`, "warning");
 				return;

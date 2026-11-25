@@ -70,6 +70,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type AgentConfig, discoverAgents, resolveSpawnPolicy, type SpawnPolicy } from "./agents.ts";
+import { CompletionProbe } from "./completion-probe.ts";
 import type { Worktree } from "./isolation.ts";
 import { generateTaskName, sanitizeAgentId } from "./names.ts";
 import {
@@ -94,7 +95,7 @@ import {
 	TASK_PROMPT_SNIPPET,
 } from "./prompts.ts";
 import { formatStructuredData, type JsonSchema, YIELD_TOOL_NAME } from "./structured.ts";
-import { recordUsage, sessionUsage } from "./usage.ts";
+import { addUsage, type AttributedUsage, isZeroUsage, recordUsage, sessionUsage, zeroUsage } from "./usage.ts";
 
 export { fmtDuration };
 export type { DoneInfo };
@@ -143,6 +144,7 @@ function configuredRequestBudget(): number {
 	return Number.isFinite(n) && n >= 0 ? n : SOFT_REQUEST_BUDGET.default!;
 }
 const CONFIGURED_REQUEST_BUDGET = configuredRequestBudget();
+const COMPLETION_PROBE_ENABLED = process.env.PI_SUBAGENT_COMPLETION_PROBE !== "0";
 
 /** An agent's soft request budget: the tighter of the configured budget and its bundled entry; 0 = no guard. */
 export function resolveSoftRequestBudget(agentName: string, configured: number = CONFIGURED_REQUEST_BUDGET): number {
@@ -234,8 +236,9 @@ export interface IrcMessage {
 export type ParentEvent = { kind: "message"; msg: IrcMessage } | { kind: "done"; done: DoneInfo };
 
 /**
- * A child's own spend (its model responses, plus any compaction/summary calls of its session), as
- * mirrored into the main session's totals by `AgentHub.syncUsage`. Nested subagents keep their own.
+ * A child's own spend (its model responses, any compaction/summary calls of its session and its
+ * completion probes), as mirrored into the main session's totals by `AgentHub.recordSpend`. Nested
+ * subagents keep their own.
  */
 export interface Usage {
 	input: number;
@@ -309,6 +312,8 @@ export interface Child {
 	contextWindow?: number;
 	thinking: ThinkingLevel;
 	session?: AgentSession;
+	probe?: CompletionProbe;
+	pendingProbeUsage?: Promise<void>;
 	status: ChildStatus;
 	createdAt: number;
 	/** First time a run actually started (after queueing). */
@@ -695,6 +700,18 @@ function contextPart(c: Child): string {
 	return c.contextWindow ? `ctx ${fmtCount(tokens)}/${fmtCount(c.contextWindow)}` : `ctx ${fmtCount(tokens)}`;
 }
 
+export function completionPercent(c: Child): number | undefined {
+	return c.status === "running" ? c.probe?.percent : undefined;
+}
+
+function completionLabel(c: Child): string {
+	const percent = completionPercent(c);
+	if (percent === undefined) return "";
+	const stage = c.probe?.stage;
+
+	return stage ? `~${percent}% · stage: ${stage}` : `~${percent}%`;
+}
+
 /** One-line status of an agent (irc list, /agents). */
 export function describeChild(c: Child): string {
 	const end = c.status === "running" ? Date.now() : (c.finishedAt ?? Date.now());
@@ -702,6 +719,7 @@ export function describeChild(c: Child): string {
 	const u = c.usage;
 	const nested = nestedCost(c);
 	const stats = [
+		completionLabel(c),
 		u.toolCount ? `${u.toolCount} tools` : "",
 		u.requests ? `${u.requests} req` : "",
 		u.cost || nested ? `$${u.cost.toFixed(2)}${nested ? ` (+${nested.toFixed(2)})` : ""}` : "",
@@ -729,6 +747,7 @@ export function describeProgress(c: Child, now = Date.now()): string {
 	const u = c.usage;
 	const parts = [
 		c.status === "pending" ? "queued" : c.runStartedAt ? fmtDuration(now - c.runStartedAt) : "",
+		completionLabel(c),
 		u.requests ? `${u.requests} req` : "",
 		u.cost > 0 ? (u.cost < 0.005 ? "<$0.01" : `$${u.cost.toFixed(2)}`) : "",
 		contextPart(c),
@@ -1339,7 +1358,9 @@ export class AgentHub {
 			}
 			// pi ends the run after a batch whose every result asks for it (e.g. a lone `yield`).
 			if (!ev.parentToolCallId) {
-				child.batchTerminates = child.batchTerminates !== false && (ev.result as { terminate?: boolean } | undefined)?.terminate === true;
+				const terminates = (ev.result as { terminate?: boolean } | undefined)?.terminate === true;
+				child.batchTerminates = child.batchTerminates !== false && terminates;
+				if (terminates && ev.toolName === YIELD_TOOL_NAME && child.probe) child.probe.submitted = true;
 			}
 			if (ev.isError) this.pushActivity(child, `✗ ${ev.toolName} failed`);
 			this.changed();
@@ -1364,6 +1385,7 @@ export class AgentHub {
 				child.steered = child.steered.filter((s) => !(s.direct && s.text === text));
 			}
 		} else if (ev.type === "message_end" && (ev.message as any).role === "assistant") {
+			if (child.probe) child.probe.submitted = false;
 			const msg = ev.message as any;
 			child.usage.requests++;
 			// The run goes on after this response only when it calls tools other than the terminating `yield`.
@@ -1426,19 +1448,49 @@ export class AgentHub {
 		const batch = sessionUsage(entries, child.usageCursor, { provider: child.model?.provider ?? "unknown", model: child.model?.id ?? "unknown" });
 		child.usageCursor = entries.length;
 		if (batch.length === 0) return;
-		for (const a of batch) {
-			child.usage.input += a.usage.input;
-			child.usage.output += a.usage.output;
-			child.usage.cacheRead += a.usage.cacheRead;
-			child.usage.cacheWrite += a.usage.cacheWrite;
-			child.usage.cost += a.usage.cost.total;
-			try {
-				recordUsage(child.ctx.sessionManager, a, child.id);
-			} catch {
-				// Stale ctx (session replaced under a still-running child): nowhere left to record it.
-			}
-		}
+		for (const spend of batch) this.recordSpend(child, spend);
 		this.changed();
+	}
+
+	private recordSpend(child: Child, spend: AttributedUsage): void {
+		const { usage } = spend;
+		child.usage.input += usage.input;
+		child.usage.output += usage.output;
+		child.usage.cacheRead += usage.cacheRead;
+		child.usage.cacheWrite += usage.cacheWrite;
+		child.usage.cost += usage.cost.total;
+		try {
+			recordUsage(child.ctx.sessionManager, spend, child.id);
+		} catch {
+			// Stale ctx (session replaced under a still-running child): nowhere left to record it.
+		}
+	}
+
+	private startCompletionProbe(child: Child, session: AgentSession, ownerRun: boolean): void {
+		if (COMPLETION_PROBE_ENABLED && ownerRun && child.depth === 1 && child.ctx.mode === "tui") {
+			child.probe = new CompletionProbe({
+				session,
+				onUsage: ({ provider, responseModel, model, usage }) => {
+					const spend = addUsage(zeroUsage(), usage);
+					if (isZeroUsage(spend)) return;
+					this.recordSpend(child, { provider, model: responseModel ?? model, usage: spend });
+					this.changed();
+				},
+				onChange: () => this.changed(),
+				onError: (reason) => {
+					this.pushActivity(child, `Completion estimate: ${reason}`);
+					this.changed();
+				},
+			});
+		}
+	}
+
+	private stopCompletionProbe(child: Child): Promise<void> | undefined {
+		const pending = child.probe?.stop();
+		child.probe = undefined;
+		if (pending) child.pendingProbeUsage = pending;
+
+		return child.pendingProbeUsage;
 	}
 
 	/**
@@ -1646,6 +1698,7 @@ export class AgentHub {
 			child.runStartedAt = Date.now();
 			child.startedAt ??= child.runStartedAt;
 			child.error = undefined;
+			this.startCompletionProbe(child, session, purpose.kind === "initial" || (purpose.kind === "reply" && purpose.to === child.ownerId));
 			this.changed();
 
 			let text = firstText;
@@ -1729,6 +1782,7 @@ export class AgentHub {
 					if (resume) {
 						text = this.continuation(child, leftovers, queued);
 						this.hooks.resume?.(child);
+						if (child.probe) child.probe.submitted = false;
 						continue;
 					}
 					// Every subagent settled without reporting back (e.g. killed): settle with the output we have.
@@ -1760,6 +1814,7 @@ export class AgentHub {
 					if (o && (o.data !== undefined || o.merge)) extra = { data: o.data, merge: o.merge };
 					if (o?.notice || o?.replyNote) notice = { body: o.notice, to: o.noticeTo, replyNote: o.replyNote };
 				}
+				this.stopCompletionProbe(child);
 				this.settleRun(child, current, status, finalOutput, child.error, extra, notice);
 
 				// 3. Follow-ups that arrived during the run (or were held back from it: peer messages, broadcast
@@ -1777,6 +1832,7 @@ export class AgentHub {
 					...queued.map((m) => this.formatIncoming(child, m, firstIrc && expectsReply(m) && m.from === firstIrc.from ? "wake" : "continue")),
 				].join("\n\n");
 				current = firstIrc ? { kind: "reply", to: firstIrc.from } : { kind: "none" };
+				this.startCompletionProbe(child, session, queued.some((m) => m.from === child.ownerId && expectsReply(m)));
 				child.sentDuringRun.clear();
 				// A turn of its own is a run of its own for the budget.
 				child.budget = { limit: child.budget.limit, requests: 0 };
@@ -1785,6 +1841,7 @@ export class AgentHub {
 			child.finishedAt = Date.now();
 			this.changed();
 		} finally {
+			this.stopCompletionProbe(child);
 			this.releasePermit(child);
 		}
 	}
@@ -2183,14 +2240,16 @@ export class AgentHub {
 		child.status = "aborted";
 		child.finishedAt = Date.now();
 		child.abort.abort();
+		const pendingProbe = this.stopCompletionProbe(child);
 		child.runningTools.clear();
-		child.unblock?.();
+		this.changed();
 		for (const w of this.childWaiters.get(child.id)?.splice(0) ?? []) w.resolve(null);
 		const notes = (await Promise.all(child.owned.map((c) => this.kill(c.id, { silent: true }).catch(() => [] as string[])))).flat();
 		const output = child.session?.getLastAssistantText?.() ?? "";
 		try {
 			await child.session?.abort();
 		} catch {}
+		if (pendingProbe) await pendingProbe;
 		// Whatever the aborted run spent (the partial response is in its session by now) is mirrored before the session goes.
 		this.syncUsage(child);
 		child.unsubscribe();

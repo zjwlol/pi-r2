@@ -21,7 +21,7 @@ import * as os from "node:os";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { DEFAULT_AGENT } from "./agents.ts";
-import { type Child, type ChildStatus, firstLine } from "./hub.ts";
+import { type AgentHub, type Child, type ChildStatus, completionPercent, firstLine } from "./hub.ts";
 import {
 	type DoneInfo,
 	fmtDuration,
@@ -75,6 +75,8 @@ export interface RowSnapshot {
 	hasData?: boolean;
 	/** Hub-side work in progress (e.g. merging worktree changes). */
 	phase?: string;
+	completionPercent?: number;
+	stage?: string;
 }
 
 /** Persisted per-item spawn info (tool result details), used when live state is gone (reload/resume). */
@@ -297,6 +299,9 @@ export function formatRow(row: RowSnapshot, theme: Theme, width: number, frame: 
 	let line = `${icon} ${theme.fg(nameColor, theme.bold(row.id))}`;
 	line += agentBadge(row.agent, theme);
 	line += featureBadges(row, theme);
+	if (row.completionPercent !== undefined) {
+		line += `${theme.fg("dim", SEP)}${theme.fg("accent", `${row.completionPercent}%`)}`;
+	}
 	if (opts.model !== false) line += modelBadge(row, theme);
 	line += statusBadge(row, theme);
 	if (row.status !== "pending" && row.status !== "detached") line += statRun(row, theme);
@@ -350,6 +355,7 @@ function countActive(c: Child): number {
 
 /** Live row of `c`, including its nested subagents (recursively). */
 export function snapshotChild(c: Child, index: number, now: number, withOutput: boolean): RowSnapshot {
+	const percent = completionPercent(c);
 	let tool: RowSnapshot["tool"];
 	let latest: { name: string; args: string; startedAt: number } | undefined;
 	for (const t of c.runningTools.values()) if (!latest || t.startedAt >= latest.startedAt) latest = t;
@@ -384,6 +390,8 @@ export function snapshotChild(c: Child, index: number, now: number, withOutput: 
 		merge: c.done?.merge,
 		...(withOutput && c.status !== "running" && c.done?.data !== undefined ? { data: c.done.data, hasData: true } : {}),
 		phase: c.phase,
+		completionPercent: percent,
+		stage: percent === undefined ? undefined : c.probe?.stage,
 	};
 }
 
@@ -433,12 +441,10 @@ export function nestedTreeLines(
 	width: number,
 	frame: number,
 	expanded: boolean,
-	opts: { activity?: boolean } = {},
+	opts: { activity?: boolean; foldedIds?: Set<string> } = {},
 ): string[] {
 	if (!children?.length) return [];
-	const ordered = orderRows(children);
-	const visible = expanded ? ordered : ordered.slice(Math.max(0, ordered.length - COLLAPSED_NESTED_LIMIT));
-	const hidden = ordered.slice(0, ordered.length - visible.length);
+	const { visible, hidden } = splitCardRows(children, expanded, COLLAPSED_NESTED_LIMIT, opts.foldedIds);
 	const lines: string[] = [];
 	const glyph = (t: string) => theme.fg("dim", t);
 	if (hidden.length > 0) {
@@ -480,6 +486,31 @@ export function snapshotDetached(item: SpawnedItem, index: number): RowSnapshot 
 		isolated: item.isolated,
 		structured: item.structured,
 	};
+}
+
+export function widgetAgents(hub: AgentHub, limit: number, collapsed: boolean, coveredByVisibleCard?: () => ReadonlySet<string>): { rows: Child[]; tail: string } | undefined {
+	const agents = collapsed ? hub.children.values() : hub.tree();
+	const covered = collapsed ? undefined : coveredByVisibleCard?.();
+	const rows: Child[] = [];
+	let idle = 0;
+	let running = 0;
+	for (const c of agents) {
+		if (c.status === "idle") idle++;
+		if ((c.status === "running" || c.status === "pending") && !covered?.has(c.id)) {
+			running++;
+			if (!collapsed && rows.length < limit) rows.push(c);
+		}
+	}
+	if (!running) return undefined;
+
+	const more = running - rows.length;
+	const tail: string[] = [];
+	if (collapsed) tail.push(`${running} running`);
+	else if (more) tail.push(`… ${more} more running`);
+	if (idle) tail.push(`${idle} idle`);
+	tail.push("ctrl+s or /agents to inspect");
+
+	return { rows, tail: `${collapsed ? "▸" : "▾"} ${tail.join(SEP)}` };
 }
 
 export interface CardSnapshot {
@@ -527,7 +558,17 @@ function contextLines(context: string | undefined, width: number, expanded: bool
 	return out;
 }
 
-export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, expanded: boolean): string[] {
+function splitCardRows(rows: RowSnapshot[], expanded: boolean, limit: number, foldedIds?: Set<string>) {
+	const ordered = orderRows(rows);
+	if (expanded || ordered.length <= limit) return { visible: ordered, hidden: [] };
+	const cut = ordered.length - limit;
+	const hidden = ordered.slice(0, cut);
+	if (foldedIds) for (const row of hidden) foldedIds.add(row.id);
+
+	return { visible: ordered.slice(cut), hidden };
+}
+
+export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, expanded: boolean, foldedIds?: Set<string>): string[] {
 	const active = s.rows.filter((r) => r.status === "running" || r.status === "pending").length;
 	const failed = s.rows.filter((r) => r.status === "failed").length;
 	const aborted = s.rows.filter((r) => r.status === "aborted").length;
@@ -552,9 +593,7 @@ export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, exp
 	const lines = [clip(headerLine(s.rows.length, state, theme, nested.length), width)];
 	lines.push(...contextLines(s.context, width, expanded, theme));
 
-	const ordered = orderRows(s.rows);
-	const visible = expanded ? ordered : ordered.slice(Math.max(0, ordered.length - COLLAPSED_AGENT_LIMIT));
-	const hidden = ordered.slice(0, ordered.length - visible.length);
+	const { visible, hidden } = splitCardRows(s.rows, expanded, COLLAPSED_AGENT_LIMIT, foldedIds);
 	if (hidden.length > 0) {
 		const ok = hidden.filter((r) => r.status === "idle").length;
 		const bad = hidden.filter((r) => r.status === "failed" || r.status === "aborted").length;
@@ -563,6 +602,7 @@ export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, exp
 	}
 	for (const row of visible) {
 		lines.push(formatRow(row, theme, width, s.frame));
+		if (row.stage) lines.push(clip(`  ${theme.fg("muted", row.stage)}`, width));
 		const act = activityText(row, theme);
 		if (act) lines.push(clip(`  ${theme.fg("dim", "↳")} ${act}`, width));
 		lines.push(...mergeLine(row, "  ", theme, width));
@@ -570,7 +610,7 @@ export function buildCardLines(s: CardSnapshot, theme: Theme, width: number, exp
 			lines.push(...sectionLines("Task", row.task, "  ", width, theme, 20));
 			lines.push(...resultSection(row, "  ", width, theme, 20));
 		}
-		lines.push(...nestedTreeLines(row.children, "  ", theme, width, s.frame, expanded));
+		lines.push(...nestedTreeLines(row.children, "  ", theme, width, s.frame, expanded, { foldedIds }));
 	}
 	for (const e of s.errors) lines.push(clip(`${theme.fg("error", "✗")} ${theme.fg("error", flat(e))}`, width));
 

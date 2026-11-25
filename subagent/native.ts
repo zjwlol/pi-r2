@@ -16,7 +16,7 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { DEFAULT_AGENT } from "./agents.ts";
 import type { AgentHub, Child, ParentEvent } from "./hub.ts";
-import { activeDescendants, firstLine, isActive, PARENT_ID, subtreeActive } from "./hub.ts";
+import { activeDescendants, completionPercent, firstLine, PARENT_ID, subtreeActive } from "./hub.ts";
 import { type DoneInfo, fmtDuration, type MergeInfo, repairDoubleEncodedJsonString, type SubagentSummary } from "./prompts.ts";
 import {
 	mergeParts,
@@ -29,6 +29,7 @@ import {
 	snapshotSummary,
 	type SpawnedItem,
 	type TaskDetails,
+	widgetAgents,
 } from "./render.ts";
 import { formatStructuredData } from "./structured.ts";
 
@@ -113,6 +114,7 @@ export type IrcDetails =
 			timedOut?: boolean;
 			/** Agents still running when it timed out. */
 			running?: string[];
+			runningLabels?: string[];
 			/** The user's prompt ended the wait ("steer" | "followUp"). */
 			interrupted?: string;
 			/** Not waiting: a user prompt was already queued. */
@@ -362,8 +364,9 @@ export function agentNode(row: RowSnapshot, o: AgentOptions): NativeNode {
 	const active = row.status === "running" || row.status === "pending";
 	const settled = !active && row.status !== "detached";
 	const summary = firstLine(row.task ?? "", 200);
-	const phase = active && row.phase ? flat(row.phase) : "";
-	const task: TspText | undefined = phase ? (summary ? [span(summary), span(` · ${phase}`, "muted")] : phase) : summary || undefined;
+	let detail = active && row.phase ? flat(row.phase) : "";
+	if (row.stage) detail = detail ? `${row.stage} · ${detail}` : row.stage;
+	const task: TspText | undefined = detail ? (summary ? [span(summary), span(` · ${detail}`, "muted")] : detail) : summary || undefined;
 	const current = row.status === "running" && row.tool?.running ? row.tool : undefined;
 	const tool = current
 		? {
@@ -420,6 +423,7 @@ export function agentNode(row: RowSnapshot, o: AgentOptions): NativeNode {
 		stats: {
 			tools: row.toolCount || undefined,
 			requests: row.requests || undefined,
+			done: row.completionPercent !== undefined ? row.completionPercent / 100 : undefined,
 			...contextStats(num(row.contextTokens), row.contextWindow),
 			cost: row.cost > 0 ? row.cost : undefined,
 			...timer,
@@ -530,6 +534,8 @@ function parseTaskResult(source: string): RowSnapshot | undefined {
 // ---------------------------------------------------------------------------------------------
 // Hooks
 
+export const WIDGET_TOGGLE_ACTION = "toggle";
+
 export interface NativeDeps {
 	hub: AgentHub;
 	/** Bumped on every hub change. */
@@ -541,10 +547,7 @@ export interface NativeDeps {
 export interface NativeSubagentUI {
 	task: NativeToolHooks;
 	irc: NativeToolHooks;
-	/** A native describe ran (the terminal draws agents natively). */
-	used(): boolean;
-	/** The bottom widget's node: agents not shown by a live task card that was described natively. */
-	describeWidget(cx: NativeComponentContext): NativeNode | null;
+	describeWidget(cx: NativeComponentContext, collapsed: boolean): NativeNode | null;
 	/** A delivered `task-result` / `irc` message. */
 	describeEvent(message: { customType?: string; content?: unknown; details?: unknown }, expanded: boolean, cx: NativeComponentContext): NativeNode | null;
 }
@@ -568,15 +571,6 @@ type IrcArgs = { op?: string; to?: string; message?: string; from?: string; id?:
 
 export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 	const { hub } = deps;
-	let used = false;
-	/** Top-level agents whose live task card was described natively (their card shows them). */
-	const carded = new Set<string>();
-	let cardedVersion = 0;
-	const cover = (id: string) => {
-		if (carded.has(id)) return;
-		carded.add(id);
-		cardedVersion++;
-	};
 
 	// ---------- task ----------
 	const taskItems = (a: Record<string, any>): Record<string, any>[] =>
@@ -664,7 +658,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 			const item = items[i]!;
 			const c = live ? hub.children.get(item.id) : undefined;
 			if (c) {
-				cover(item.id);
 				if (subtreeActive(c)) anyActive = true;
 				else if (c.finishedAt) end = Math.max(end, c.finishedAt);
 			} else {
@@ -733,7 +726,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		mergeCallAndResult: true,
 		describeCall(args, options) {
 			if (!options.supports("agent")) return undefined;
-			used = true;
 			const a = asRecord(args);
 			const items = taskItems(a);
 			const last = items[items.length - 1];
@@ -743,7 +735,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		},
 		describeResult(result, options, args) {
 			if (!options.supports("agent")) return undefined;
-			used = true;
 			const details = asRecord(result.details);
 			const live = details.hub === hub.instanceId;
 			const owner = isRecord(result.details) ? result.details : result.content;
@@ -863,7 +854,8 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		if (d.idle) return { tool: ircHead(a, { note: "no running agents" }), inline: true };
 		if (interrupted) return { tool: ircHead(a, { note: "interrupted" }), body: [userNote("Interrupted")], inline: true };
 		if (d.timedOut) {
-			const running = Array.isArray(d.running) ? d.running.filter((x: unknown): x is string => typeof x === "string") : [];
+			const labels = d.runningLabels ?? d.running;
+			const running = Array.isArray(labels) ? labels.filter((x: unknown): x is string => typeof x === "string") : [];
 			return {
 				tool: ircHead(a, { note: "timed out" }),
 				body: [noteText(running.length ? `Still running: ${running.join(", ")}` : "No agents running.", "muted")],
@@ -988,14 +980,12 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		mergeCallAndResult: true,
 		describeCall(args, options) {
 			if (!options.supports("agent")) return undefined;
-			used = true;
 			const a = asRecord(args) as IrcArgs;
 			const stamp = [str(a.op), str(a.to), str(a.message).length, str(a.from), str(a.id)];
 			return ircCallMemo.get(args, [args, options.argsComplete, ...stamp], () => describeIrcCall(a));
 		},
 		describeResult(result, options, args) {
 			if (!options.supports("agent")) return undefined;
-			used = true;
 			const owner = isRecord(result.details) ? result.details : result.content;
 			return ircResultMemo.get(owner, [result.details, result.content, result.isError, args, options.expanded], () =>
 				describeIrcResult(args, result, options),
@@ -1004,39 +994,26 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 	};
 
 	// ---------- bottom widget ----------
-	let widgetMemo: { deps: readonly unknown[]; node: NativeNode } | undefined;
-	const topOf = (c: Child): Child => {
-		let cur = c;
-		for (let i = 0; i < 16 && cur.ownerId !== PARENT_ID; i++) {
-			const owner = hub.children.get(cur.ownerId);
-			if (!owner) break;
-			cur = owner;
-		}
-		return cur;
-	};
-	const describeWidget = (cx: NativeComponentContext): NativeNode | null => {
+	let widgetMemo: { version: number; collapsed: boolean; node: NativeNode } | undefined;
+	const describeWidget = (cx: NativeComponentContext, collapsed: boolean): NativeNode | null => {
 		if (!cx.supports("agent")) return null;
-		used = true;
-		const memoDeps = [deps.version(), cardedVersion];
-		if (widgetMemo && sameDeps(widgetMemo.deps, memoDeps)) return widgetMemo.node;
-		const now = Date.now();
-		const list = hub.tree();
-		// A live task card described natively updates in place (hooks read the hub): its agents (and their
-		// nested ones) are shown there, so the widget only lists agents no such card shows.
-		const rows = list.filter((c) => isActive(c) && !carded.has(topOf(c).id));
-		let out: NativeNode;
-		if (rows.length === 0) {
-			out = HIDDEN;
-		} else {
-			const nodes = rows
-				.slice(0, deps.widgetRows)
-				.map((c) => agentNode(snapshotChild(c, 0, now, false), { nowMs: now, expanded: false, depth: Math.max(0, c.depth - 1), bare: true }));
-			const more = rows.length - deps.widgetRows;
-			const idle = list.filter((c) => c.status === "idle").length;
-			const tail = [more > 0 ? `… ${more} more running` : "", idle ? `${idle} idle` : "", "ctrl+s or /agents to inspect"].filter(Boolean);
-			out = node("col", { role: "omp.subagent.widget", gap: "xs" }, [...nodes, text([span(tail.join(" · "), "muted")], { lines: 1 }, "tail")]);
+		const version = deps.version();
+		if (widgetMemo?.version === version && widgetMemo.collapsed === collapsed) return widgetMemo.node;
+
+		const agents = widgetAgents(hub, deps.widgetRows, collapsed);
+		let out = HIDDEN;
+		if (agents) {
+			const now = Date.now();
+			const nodes: NativeNode[] = [];
+			for (const c of agents.rows) {
+				const row = snapshotChild(c, 0, now, false);
+				nodes.push(agentNode(row, { nowMs: now, expanded: false, depth: Math.max(0, c.depth - 1), bare: true }));
+			}
+			nodes.push(text([span(agents.tail, "muted")], { lines: 1, actions: { click: WIDGET_TOGGLE_ACTION } }, "tail"));
+			out = node("col", { role: "omp.subagent.widget", gap: "xs" }, nodes);
 		}
-		widgetMemo = { deps: memoDeps, node: out };
+		widgetMemo = { version, collapsed, node: out };
+
 		return out;
 	};
 
@@ -1047,7 +1024,6 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		cx: NativeComponentContext,
 	): NativeNode | null => {
 		if (!cx.supports("agent")) return null;
-		used = true;
 		const ev = asRecord(message.details);
 		if (ev.kind === "done" && isRecord(ev.done)) {
 			const d = ev.done as DoneLike;
@@ -1069,7 +1045,7 @@ export function createNativeUI(deps: NativeDeps): NativeSubagentUI {
 		]));
 	};
 
-	return { task, irc, used: () => used, describeWidget, describeEvent };
+	return { task, irc, describeWidget, describeEvent };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1258,6 +1234,10 @@ export function hubPickerItem(c: Child, o: HubItemOptions): Props {
 	const badges: { text: string; tone?: TspTone; title?: string }[] = [];
 	const agent = c.agent.name?.trim();
 	if (agent && agent !== DEFAULT_AGENT) badges.push({ text: agent, title: "Agent type" });
+	const percent = completionPercent(c);
+	if (percent !== undefined) {
+		badges.push({ text: `${percent}%`, tone: "accent", title: c.probe?.stage ?? "Estimated completion" });
+	}
 	if (c.inbox.length > 0) badges.push({ text: `${c.inbox.length} unread`, tone: "warning", title: "Messages waiting for its next step" });
 	if (o.showOwner && c.ownerId !== PARENT_ID) badges.push({ text: `↳ ${c.ownerId}`, tone: "muted", title: "Spawned by" });
 	if (c.status === "pending" || c.queued) badges.push({ text: c.queued ? "queued" : "starting", tone: "muted" });
@@ -1590,6 +1570,8 @@ export function hubSignature(c: Child): string {
 		c.queued ? 1 : 0,
 		c.blocked ? 1 : 0,
 		c.phase ?? "",
+		completionPercent(c) ?? "",
+		c.probe?.stage ?? "",
 		c.error ?? "",
 		u.requests,
 		u.cost,
@@ -1713,7 +1695,7 @@ export function hubTranscript(v: HubTranscriptView): NativeUiNode {
 					cursor: v.input.cursor,
 					placeholder: `Message ${v.id} (steers it while it runs, wakes it when idle)`,
 					sendable: true,
-					...(multiline ? { maxLines: 8 } : { prompt: [span("›", "accent")] }),
+					...(multiline ? { maxLines: 8 } : {}),
 				},
 				undefined,
 				"message",

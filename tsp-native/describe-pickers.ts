@@ -28,6 +28,7 @@ import {
 	ThinkingSelectorComponent,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, getKeybindings } from "@earendil-works/pi-tui";
+import { THINKING_LEVELS } from "../shared/effort.ts";
 import type { Describer } from "./describers.ts";
 import { col, type NativeChild, type NativeNode, type NativeUiEvent, node, row, span, stripAnsi, text } from "./node.ts";
 import { lineToSpans, spansThemeId } from "./spans.ts";
@@ -844,8 +845,6 @@ function routeSelectList(list: Any | undefined, event: NativeUiEvent, onClear?: 
 	}
 }
 
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
 const thinkingCatalogues = new WeakMap<object, PickerItem[]>();
 
 const thinkingSelector: Describer = {
@@ -864,7 +863,7 @@ const thinkingSelector: Describer = {
 		let items = thinkingCatalogues.get(all);
 		if (!items) {
 			items = all.map((item) => {
-				const level = THINKING_LEVELS.indexOf(item.value);
+				const level = THINKING_LEVELS.findIndex((value) => value === item.value);
 				return {
 					id: item.value,
 					label: item.value,

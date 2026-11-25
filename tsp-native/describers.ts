@@ -454,6 +454,52 @@ function toolStatus(a: Any): TspCardStatus {
 	return "done";
 }
 
+// ── hashline (the `hashline` extension's read / edit; pi's built-ins never match these) ──
+
+const NO_PATHS: readonly string[] = [];
+/** A section header row of a hashline `edit` input: `[PATH#TAG]` or `[PATH]`. */
+const HASHLINE_HEADER_RE = /^\[(.+?)(?:#[0-9A-Fa-f]{4})?\]$/;
+
+/** The distinct files a hashline edit call names, in order: the `[PATH#TAG]` headers of `args.input`. Empty for every other edit tool. */
+function hashlineEditPaths(args: Any): readonly string[] {
+	const input: unknown = args?.input;
+	if (typeof input !== "string" || input.length === 0) return NO_PATHS;
+	const paths: string[] = [];
+	for (const row of input.split("\n")) {
+		if (!row.startsWith("[")) continue;
+		const path = HASHLINE_HEADER_RE.exec(row.trimEnd())?.[1]?.trim();
+		// `[*** Begin Patch]` and other bracketed envelope rows are not files.
+		if (path && !path.startsWith("***") && !paths.includes(path)) paths.push(path);
+	}
+	return paths;
+}
+
+/**
+ * A hashline read result (`details.hashline` + `[PATH#TAG]` / `N:TEXT` rows) as the file's own text:
+ * `text` without the header row and the `N:` prefixes (undefined when no row was shown), `start` its
+ * first line number, `notice` what follows the rows. Undefined for any other read result, and when the
+ * text does not have that shape (then the card shows it as it is).
+ */
+function hashlineReadView(result: Any | undefined, output: string): { text: string | undefined; start: number; notice: string } | undefined {
+	const mark: unknown = result?.details?.hashline;
+	if (result?.isError || mark === null || typeof mark !== "object") return undefined;
+	const first: unknown = (mark as Any).firstLine;
+	const last: unknown = (mark as Any).lastLine;
+	if (typeof first !== "number" || typeof last !== "number" || !Number.isInteger(first) || !Number.isInteger(last) || first < 1 || last < first - 1) return undefined;
+	const lines = output.split("\n");
+	if (!/^\[.+#[0-9A-F]{4}\]$/.test(lines[0] ?? "")) return undefined;
+	const count = last - first + 1;
+	if (lines.length < 1 + count) return undefined;
+	const rows: string[] = [];
+	for (let i = 0; i < count; i++) {
+		const prefix = `${first + i}:`;
+		const row = lines[1 + i];
+		if (!row.startsWith(prefix)) return undefined;
+		rows.push(row.slice(prefix.length));
+	}
+	return { text: count > 0 ? rows.join("\n") : undefined, start: first, notice: lines.slice(1 + count).join("\n").trim() };
+}
+
 function toolTarget(name: string, args: Any): string | undefined {
 	if (!args || typeof args !== "object") return undefined;
 	switch (name) {
@@ -462,9 +508,14 @@ function toolTarget(name: string, args: Any): string | undefined {
 			return typeof args.command === "string" ? firstLine(args.command) : undefined;
 		case "read":
 		case "write":
-		case "edit":
 		case "ls":
 			return typeof args.path === "string" ? args.path : undefined;
+		case "edit": {
+			if (typeof args.path === "string") return args.path;
+			// hashline edit: one file heads the call with its path, several as "N files" (omp's edit head).
+			const paths = hashlineEditPaths(args);
+			return paths.length === 0 ? undefined : paths.length === 1 ? paths[0] : `${paths.length} files`;
+		}
 		case "grep":
 			return typeof args.pattern === "string" ? args.pattern : undefined;
 		case "find":
@@ -499,7 +550,8 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 			return out;
 		}
 		case "edit": {
-			const path = typeof args.path === "string" ? args.path : undefined;
+			const sections = typeof args.path === "string" ? NO_PATHS : hashlineEditPaths(args);
+			const path = typeof args.path === "string" ? args.path : sections.length === 1 ? sections[0] : undefined;
 			// pi's standard unified patch (`--- path`, `+++ path`, `@@ -a,b +c,d @@` hunks); a patch without a hunk shows nothing.
 			const patch: unknown = result?.details?.patch;
 			if (typeof patch === "string" && /^@@ /m.test(patch)) {
@@ -519,6 +571,13 @@ function toolBody(a: Any, cx: DescribeContext, tool = false): NativeChild[] {
 			return out;
 		}
 		case "read": {
+			// hashline read: the file's own text, numbered from the first row shown; the header row and the `N:` prefixes stay out.
+			const anchored = hashlineReadView(result, output);
+			if (anchored) {
+				if (anchored.text !== undefined) out.push(code(anchored.text, { path: typeof args.path === "string" ? args.path : undefined, start: anchored.start, numbers: true, preview: preview && { lines: previewLines(anchored.text) }, role: "omp.tool.read" }, "out"));
+				if (anchored.notice) out.push(text([span(anchored.notice, "muted")], { role: "omp.tool.read.notice" }, "note"));
+				return out;
+			}
 			if (output) out.push(code(output, { path: typeof args.path === "string" ? args.path : undefined, start: typeof args.offset === "number" ? args.offset : undefined, preview, role: "omp.tool.read" }, "out"));
 			return out;
 		}
@@ -721,14 +780,16 @@ function toolLabel(a: Any, name: string): string {
 	return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-function toolTargetKind(name: string): NativeToolTargetKind {
+function toolTargetKind(name: string, args?: Any): NativeToolTargetKind {
 	switch (name) {
 		case "bash":
 		case "powershell":
 			return "command";
+		case "edit":
+			// "N files" (a hashline edit of several files) is not a path.
+			return args && typeof args.path !== "string" && hashlineEditPaths(args).length > 1 ? "text" : "path";
 		case "read":
 		case "write":
-		case "edit":
 		case "ls":
 			return "path";
 		case "grep":
@@ -816,7 +877,7 @@ function describeToolNode(c: Component, a: Any, cx: DescribeContext, view: Nativ
 	} else {
 		body = withImages(toolBody(a, cx, true), a, cx);
 		target = toolTarget(name, a.args);
-		targetKind = target === undefined ? undefined : toolTargetKind(name);
+		targetKind = target === undefined ? undefined : toolTargetKind(name, a.args);
 		const shell = name === "bash" || name === "powershell";
 		if (shell) {
 			lang = name;

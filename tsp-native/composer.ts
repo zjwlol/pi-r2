@@ -9,22 +9,26 @@
  * - the `omp.composer.line` row: the bash mode chip and the `editor` input,
  * - the autocomplete list while it is open: omp's caret-anchored overlay in
  *   `layer` (see Autocomplete below), else inline under the line,
- * - the `omp.composer.bar`: the model chip (`omp.composer.model`, the
- *   thinking level as its `effort` glyph), the facts (`omp.composer.extras`:
- *   cwd, git branch, session name, extension statuses), the session cost
+ * - the `omp.composer.bar`: the model and effort dropdowns (`omp.composer.model`
+ *   and `omp.composer.effort`), the facts (`omp.composer.extras`:
+ *   cwd, session name, extension statuses), the session cost
  *   (`omp.composer.usage`, token totals in its tooltip), then send
  *   (`omp.composer.send`) or Stop (`omp.composer.stop`) while a turn runs.
  *
  * The facts come from pi's FooterComponent (its `session`, `footerData` and
  * `getSessionStats()`); while the composer carries them the footer itself
- * describes as hidden. Clicks come back as `status.model`, `thinking.cycle`,
+ * describes as hidden. Clicks come back as `status.model`, `thinking.select`,
  * `thinking.set` (a level picked from the terminal's effort menu, as the
- * action's `value`), `submit` and `interrupt` actions (omp's names).
+ * action's `value`), `submit` and `interrupt` actions.
  *
  * No runtime imports from describers.ts (it imports this module).
  */
-import type { Component } from "@earendil-works/pi-tui";
+import * as fs from "node:fs";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { type Component, sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
 import { composerAttachments, isComposerHosted, setComposerHosted } from "../shared/composer-slots.ts";
+import { changeEffort } from "../shared/effort.ts";
 import { col, compact, type DescribeContext, type NativeChild, type NativeNode, node, row, span, text } from "./node.ts";
 import { hasStyle, lineToSpans } from "./spans.ts";
 import type { TspProps, TspSpan } from "./wire.ts";
@@ -51,6 +55,37 @@ function shortCwd(cwd: string): string {
 	if (cwd === base) return "~";
 	if (cwd.startsWith(`${base}/`) || cwd.startsWith(`${base}\\`)) return `~${cwd.slice(base.length)}`;
 	return cwd;
+}
+
+/**
+ * The shell's name for the working directory when it got there through a symlink.
+ */
+function shellCwd(cwd: string): string {
+	const pwd = process.env.PWD;
+	if (!pwd || pwd === cwd) return cwd;
+
+	try {
+		return fs.realpathSync(pwd) === cwd ? pwd : cwd;
+	} catch {
+		// PWD can name a directory that is gone
+		return cwd;
+	}
+}
+
+// The composer measures the natural width of its facts before shrinking them.
+const MAX_PATH_COLUMNS = 32;
+
+function pathLabel(cwd: string): string {
+	const path = shortCwd(shellCwd(cwd));
+	const width = visibleWidth(path);
+	if (width <= MAX_PATH_COLUMNS) return path;
+
+	const prefix = path.startsWith("~/") || path.startsWith("~\\") ? path.slice(0, 2) : "";
+	const tailWidth = MAX_PATH_COLUMNS - prefix.length - 1;
+	const tail = sliceByColumn(path, width - tailWidth, tailWidth);
+	const separator = tail.search(process.platform === "win32" ? /[\\/][^\\/]/ : /\/[^/]/);
+
+	return `${prefix}…${separator > 0 ? tail.slice(separator) : tail}`;
 }
 
 /** The model id without its region/vendor prefixes and Bedrock version tail (`us.anthropic.claude-opus-5-5` → `claude-opus-5-5`). */
@@ -113,7 +148,7 @@ export interface ComposerFacts {
 	readonly routedId: string | undefined;
 	readonly routedThinking: string | undefined;
 	/** The thinking level; undefined when the model doesn't reason. */
-	readonly thinking: string | undefined;
+	readonly thinking: ModelThinkingLevel | undefined;
 	/** Context share used (0–100); null when unknown (right after a compaction). */
 	readonly percent: number | null;
 	readonly tokens: number | null;
@@ -122,7 +157,6 @@ export interface ComposerFacts {
 	/** Tokens kept free before auto-compaction fires (pi's `compaction.reserveTokens`). */
 	readonly reserve: number | undefined;
 	readonly cwd: string;
-	readonly branch: string | undefined;
 	readonly sessionName: string | undefined;
 	/** Extension statuses (`ctx.ui.setStatus`), sorted by key. */
 	readonly statuses: readonly (readonly [key: string, text: string])[];
@@ -152,8 +186,8 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 	const session: Any | undefined = footer.session;
 	const data: Any | undefined = footer.footerData;
 	if (!session || !data) return undefined;
-	const state: Any = session.state ?? {};
-	const model: Any | undefined = state.model;
+	const state: Partial<AgentSession["state"]> = session.state ?? {};
+	const model = state.model;
 	const stats: Any = typeof footer.getSessionStats === "function" ? (footer.getSessionStats() ?? {}) : {};
 	const usage: Any = stats.usageTotals ?? {};
 	const context: Any | undefined = stats.contextUsage;
@@ -174,8 +208,6 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 	}
 	const sessionManager: Any | undefined = session.sessionManager;
 	const cwd = String(sessionManager?.getCwd?.() ?? "");
-	const branchValue: unknown = data.getGitBranch?.();
-	const branch = typeof branchValue === "string" && branchValue ? branchValue : undefined;
 	const nameValue: unknown = sessionManager?.getSessionName?.();
 	const sessionName = typeof nameValue === "string" && nameValue.trim() ? nameValue.trim() : undefined;
 	const statusMap: unknown = data.getExtensionStatuses?.();
@@ -195,7 +227,7 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 			subscription = false;
 		}
 	}
-	const thinking = model?.reasoning ? String(state.thinkingLevel || "off") : undefined;
+	const thinking = model?.reasoning ? state.thinkingLevel ?? "off" : undefined;
 	const cacheHit = typeof stats.latestCacheHitRate === "number" ? stats.latestCacheHitRate : undefined;
 	const sig: unknown[] = [
 		model?.id,
@@ -210,7 +242,6 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 		autoCompact,
 		reserve,
 		cwd,
-		branch,
 		sessionName,
 		statuses.map(([k, v]) => `${k}\u0001${v}`).join("\u0000"),
 		finite(usage.cost),
@@ -236,7 +267,6 @@ export function composerFacts(footer: Any): ComposerFacts | undefined {
 		autoCompact,
 		reserve,
 		cwd,
-		branch,
 		sessionName,
 		statuses,
 		cost: finite(usage.cost),
@@ -423,8 +453,8 @@ function call(handler: unknown): boolean {
 
 /**
  * A click on a composer control, routed the way pi's keys go: the model chip
- * opens the model selector (`app.model.select`), the effort glyph cycles the
- * thinking level (`app.thinking.cycle`), Stop interrupts like Esc (the
+ * opens the model selector (`app.model.select`), the effort chip opens the
+ * thinking level selector, Stop interrupts like Esc (the
  * editor's `onEscape`, else `app.interrupt`) while something runs.
  * `thinking.set` carries a level picked by pointer as `value`: it is set on
  * the footer's session when the model offers it, else ignored (no value, no
@@ -436,8 +466,17 @@ export function runComposerAction(editor: Any, act: string, running: boolean, va
 	switch (act) {
 		case "status.model":
 			return call(handlers?.get("app.model.select"));
-		case "thinking.cycle":
-			return call(handlers?.get("app.thinking.cycle"));
+		case "thinking.select": {
+			const session: AgentSession | undefined = footer?.session;
+			if (session?.model?.reasoning) {
+				const ctx = session.extensionRunner.createContext();
+				void changeEffort(ctx, { currentLevel: session.thinkingLevel, setLevel: (level) => session.setThinkingLevel(level), overlay: true });
+
+				return true;
+			}
+
+			return false;
+		}
 		case "thinking.set": {
 			const session: Any | undefined = footer?.session;
 			if (typeof value !== "string" || !value || typeof session?.setThinkingLevel !== "function") return false;
@@ -476,7 +515,7 @@ export interface ComposerParts {
 }
 
 /** Filled steps (of four) of the effort chip's fallback meter (terminals without `effort`), as omp's. */
-const EFFORT_STEPS: Partial<Record<string, number>> = { off: 0, minimal: 1, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
+const EFFORT_STEPS: Readonly<Record<ModelThinkingLevel, number>> = { off: 0, minimal: 1, low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
 
 /** Context share where the meter turns warning and error: pi's footer colours past 70% and 90%. */
 const CONTEXT_THRESHOLDS = { warn: 0.7, bad: 0.9 } as const;
@@ -586,12 +625,10 @@ function fact(key: string, spans: readonly TspSpan[], priority: number, extra?: 
 	return node("seg", { role: "omp.composer.fact", spans, priority, ...extra }, undefined, key);
 }
 
-/** The bar's flexible facts (omp's `omp.composer.extras` status): cwd, git branch, session name, then extension statuses. */
+/** The bar's flexible facts (omp's `omp.composer.extras` status): cwd, session name, then extension statuses. */
 function describeExtras(facts: ComposerFacts): NativeNode {
 	const segs: NativeNode[] = [];
-	// The path shrinks before anything drops; branch and session outlast the statuses.
-	if (facts.cwd) segs.push(fact("path", [span(shortCwd(facts.cwd))], 1, { icon: "folder", title: facts.cwd, min: { w: "12ch" } }));
-	if (facts.branch) segs.push(fact("git", [span(facts.branch)], 1000, { icon: "git", title: `Git branch ${facts.branch}` }));
+	if (facts.cwd) segs.push(fact("path", [span(pathLabel(facts.cwd))], 1, { icon: "folder", title: facts.cwd, min: { w: "12ch" } }));
 	if (facts.sessionName) segs.push(fact("session", [span(facts.sessionName)], 999, { icon: "session", title: `Session ${facts.sessionName}` }));
 	for (const [key, value] of facts.statuses) segs.push(fact(`status:${key}`, statusSpans(value), 0, { title: key }));
 	return node("status", { role: "omp.composer.extras", transparent: true, grow: 1 }, segs, "extras");
@@ -640,41 +677,43 @@ function modelTitle(facts: ComposerFacts, keys: ComposerKeys): string {
 	return lines.join("\n");
 }
 
-/** Model chip (the level as its `effort` glyph), or an effort chip beside it on terminals without `effort`. */
-function describeModel(facts: ComposerFacts, keys: ComposerKeys, cx: DescribeContext): NativeNode[] {
-	const thinking = facts.thinking;
-	const hint = keys.thinking ? `  ${keyLabel(keys.thinking)}` : "";
-	const glyph = thinking !== undefined && cx.supports("effort");
+interface DropdownOptions {
+	key: "model" | "effort";
+	role: "omp.composer.model" | "omp.composer.effort";
+	click: "status.model" | "thinking.select";
+	label: string;
+	title: string;
+	glyph?: NativeNode;
+}
+
+function dropdown(cx: DescribeContext, { key, role, click, label, title, glyph }: DropdownOptions): NativeNode {
+	const chevron = cx.supports("icon") ? node("icon", { name: "chev", tone: "muted" }, undefined, "chev") : text("▾", { wrap: "none", title, tone: "muted" }, "chev");
+
+	return row(
+		compact([glyph, text(label, { wrap: "none", title }, "label"), chevron]),
+		{ role, gap: "xs", align: "center", title, actions: { click } },
+		key,
+	);
+}
+
+function describeModel(facts: ComposerFacts, keys: ComposerKeys, cx: DescribeContext): NativeNode {
 	const label = facts.modelId ? shortModelId(facts.modelId) : "no model";
 	const routed = facts.routedId ? ` → ${shortModelId(facts.routedId)}` : "";
-	const chip = node(
-		"row",
-		{ role: "omp.composer.model", gap: "xs", align: "center", title: modelTitle(facts, keys), actions: { click: "status.model" } },
-		compact([
-			glyph &&
-				node(
-					"effort",
-					{ level: thinking, role: "omp.composer.model.effort", title: `Thinking effort: ${thinking}${hint}`, actions: { click: "thinking.cycle" } },
-					undefined,
-					"effort",
-				),
-			text(`${label}${routed}`, { wrap: "none" }, "name"),
-			cx.supports("icon") && node("icon", { name: "chev" }, undefined, "chev"),
-		]),
-		"model",
-	);
-	if (thinking === undefined || glyph) return [chip];
-	const steps = EFFORT_STEPS[thinking];
-	const effort = node(
-		"row",
-		{ role: "omp.composer.effort", gap: "xs", align: "center", title: `Thinking effort${hint}`, actions: { click: "thinking.cycle" } },
-		compact([
-			cx.supports("meter") && node("meter", { value: steps === undefined ? null : steps / 4, style: "blocks", steps: 4 }, undefined, "meter"),
-			text(thinking, { wrap: "none" }, "level"),
-		]),
-		"effort",
-	);
-	return [chip, effort];
+
+	return dropdown(cx, { key: "model", role: "omp.composer.model", click: "status.model", label: `${label}${routed}`, title: modelTitle(facts, keys) });
+}
+
+function describeEffort(level: ModelThinkingLevel, keys: ComposerKeys, cx: DescribeContext): NativeNode {
+	let glyph: NativeNode | undefined;
+	if (cx.supports("effort")) {
+		glyph = node("effort", { level }, undefined, "glyph");
+	} else if (cx.supports("meter")) {
+		glyph = node("meter", { value: EFFORT_STEPS[level] / 4, style: "blocks", steps: 4 }, undefined, "meter");
+	}
+
+	const hint = keys.thinking ? `\n${keyLabel(keys.thinking)} cycles thinking levels` : "";
+
+	return dropdown(cx, { key: "effort", role: "omp.composer.effort", click: "thinking.select", label: level, title: `Select thinking effort${hint}`, glyph });
 }
 
 function describeSubmit(parts: ComposerParts, cx: DescribeContext): NativeNode {
@@ -708,7 +747,8 @@ function describeBar(owner: object, parts: ComposerParts, cx: DescribeContext): 
 	const view = facts && factsView(facts, cx);
 	const bar = row(
 		compact([
-			...(facts ? describeModel(facts, parts.keys, cx) : []),
+			facts && describeModel(facts, parts.keys, cx),
+			facts?.thinking !== undefined && describeEffort(facts.thinking, parts.keys, cx),
 			// The facts are the bar's flexible space; without them a spacer keeps send at the end.
 			view ? view.extras : node("row", { grow: 1 }, [], "gap"),
 			view?.usage,

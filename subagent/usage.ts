@@ -12,8 +12,8 @@
  * so nothing a child spends reaches those totals on its own. The hub therefore mirrors every child's
  * spend into the main session as `usage` entries of kind "subagent" (attributed to the child's
  * provider/model, `note` = child id): once per batch of new child session entries (`sessionUsage`
- * applies pi's own formula to the child's entries, so a child's total is exactly what pi would show
- * for it), for any depth, run (initial, wake, reminder retry) or ending (settled, killed, shutdown).
+ * applies pi's own formula to the child's entries), for any depth, run (initial, wake, reminder retry)
+ * or ending (settled, killed, shutdown), and once per billed completion probe.
  * The entries are persisted with the session, so totals survive resume.
  */
 

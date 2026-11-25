@@ -14,6 +14,7 @@
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { patchUserMessages, setBubbleHook } from "./bubble.ts";
+import { chipStyleFor } from "./chips.ts";
 import { MagicEditor, stopAllEditors } from "./editor.ts";
 import { findKeywords } from "./keywords.ts";
 import type { PaintOptions } from "./paint.ts";
@@ -58,6 +59,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
 			const editor = new MagicEditor(tui, theme, keybindings, { embedWorkingStatus: true });
 			editor.paintOptions = paintOptions;
+			editor.chipStyle = () => chipStyleFor(ctx.ui.theme);
 			return editor;
 		});
 		if (patchUserMessages()) setBubbleHook({ paintOptions });

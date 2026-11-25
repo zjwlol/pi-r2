@@ -16,6 +16,10 @@
  *     (`qwen3:8b`). A suffix that is not a level the model supports (including
  *     `:off`), or whose full spelling is another model's id, leaves the whole
  *     tag as plain text: no notice is sent for it.
+ *   - Chip: a tag that would be honoured on submit is reported to the prompt
+ *     editor as a chip (shared/editor-chips.ts), so it shows as a selected
+ *     model once you move on from it; a tag still at the very end of the draft
+ *     is being typed and is not a chip yet.
  */
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -27,6 +31,7 @@ import {
 	type AutocompleteSuggestions,
 	fuzzyFilter,
 } from "@earendil-works/pi-tui";
+import type { EditorChip, EditorChipProvider } from "../shared/editor-chips.ts";
 import { maskNonProse } from "../shared/prose.ts";
 
 export const MENTION_NOTICE_TYPE = "model-mention-notice";
@@ -116,24 +121,107 @@ function resolveMention(
 	return { model, thinking: level };
 }
 
-/** Tags standing as prose in `text` (never inside code or markup), one per model and level, in order. */
-export function findMentions(text: string, source: MentionSource): ResolvedMention[] {
+/** One resolvable tag in a text: where it stands and what it names. */
+export interface MentionRange extends ResolvedMention {
+	/** Offset of the `^` in the text (UTF-16). */
+	from: number;
+	/** Offset just past the token's last character. */
+	to: number;
+}
+
+/**
+ * Every resolvable tag standing as prose in `text` (never inside code or
+ * markup, never in a bash-mode draft), in text order, repeats included.
+ */
+export function findMentionRanges(text: string, source: MentionSource): MentionRange[] {
 	if (!text.includes(MENTION_TRIGGER) || isBashInput(text)) return [];
 	const models = source.models();
 	if (models.length === 0) return [];
 	const current = source.current();
-	const seen = new Set<string>();
-	const out: ResolvedMention[] = [];
+	const out: MentionRange[] = [];
 	for (const match of maskNonProse(text).matchAll(MENTION_RE)) {
 		const token = match[2]!;
 		const r = resolveMention(token, models, current);
 		if (!r) continue;
-		const key = `${selectorOf(r.model)}${r.thinking ? `:${r.thinking}` : ""}`;
-		if (seen.has(key)) continue;
-		seen.add(key);
-		out.push(r.thinking ? { token, model: r.model, thinking: r.thinking } : { token, model: r.model });
+		const from = match.index + match[1]!.length;
+		const to = match.index + match[0].length;
+		out.push(r.thinking ? { from, to, token, model: r.model, thinking: r.thinking } : { from, to, token, model: r.model });
 	}
 	return out;
+}
+
+/** Tags standing as prose in `text` (never inside code or markup), one per model and level, in order. */
+export function findMentions(text: string, source: MentionSource): ResolvedMention[] {
+	const seen = new Set<string>();
+	const out: ResolvedMention[] = [];
+	for (const { token, model, thinking } of findMentionRanges(text, source)) {
+		const key = `${selectorOf(model)}${thinking ? `:${thinking}` : ""}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(thinking ? { token, model, thinking } : { token, model });
+	}
+	return out;
+}
+
+// ---------- editor chips ----------
+
+const NO_CHIPS: readonly EditorChip[] = Object.freeze([]);
+
+/**
+ * The tags of `text` the editor shows as selected: every resolvable prose tag
+ * except one that ends at the very end of the text (it is still being typed;
+ * oh-my-pi collapses a tag into its chip only once something follows it).
+ */
+export function mentionChips(text: string, source: MentionSource): EditorChip[] {
+	const out: EditorChip[] = [];
+	for (const { from, to } of findMentionRanges(text, source)) {
+		if (to < text.length) out.push({ from, to });
+	}
+	return out;
+}
+
+/**
+ * Chip provider for the prompt editor (shared/editor-chips.ts), cached because
+ * the editor asks on every render:
+ *   - a text without `^` costs one `includes` and never touches the source;
+ *   - otherwise the source's model list is read once and the last answer is
+ *     returned (the same array) while the text, every model object of the list
+ *     (compared by identity, in order) and the current model's provider are
+ *     the same as last time; anything else recomputes.
+ * Never throws: a failing source means no chips.
+ */
+export function createMentionChipProvider(getSource: () => MentionSource | undefined): EditorChipProvider {
+	let lastText: string | undefined;
+	let lastModels: readonly AnyModel[] = [];
+	let lastProvider: string | undefined;
+	let lastChips: readonly EditorChip[] = NO_CHIPS;
+	return {
+		chips(text: string): readonly EditorChip[] {
+			if (!text.includes(MENTION_TRIGGER)) return NO_CHIPS;
+			try {
+				const source = getSource();
+				if (!source) return NO_CHIPS;
+				const models = source.models();
+				const current = source.current();
+				const provider = current?.provider;
+				const same =
+					text === lastText &&
+					provider === lastProvider &&
+					models.length === lastModels.length &&
+					models.every((m, i) => m === lastModels[i]);
+				if (same) return lastChips;
+				const chips = mentionChips(text, { models: () => models, current: () => current });
+				lastText = text;
+				lastModels = models;
+				lastProvider = provider;
+				lastChips = chips.length > 0 ? chips : NO_CHIPS;
+				return lastChips;
+			} catch {
+				lastText = undefined;
+				return NO_CHIPS;
+			}
+		},
+	};
 }
 
 /** Hidden notice telling the main agent what each tag means for this message. */
